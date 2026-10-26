@@ -1,0 +1,22 @@
+{
+  "lastChangelogVersion": "1.4.0",
+  "defaultProvider": "auto",
+  "defaultModel": "auto",
+  "showHardwareCursor": true,
+  "editorPaddingX": 1,
+  "terminal": {
+    "showTerminalProgress": true
+  },
+  "theme": "system",
+  "packages": [
+    "npm:billion-context",
+    "npm:pi-subagents",
+    "npm:pi-jev",
+    "npm:@aliou/pi-guardrails",
+    "npm:@earendil-works/pi-voice"
+  ],
+  "fullscreenScrollbar": "hidden",
+  "fullscreenWheelScrollLines": "auto",
+  "treeFilterMode": "default",
+  "defaultProjectTrust": "ask"
+}

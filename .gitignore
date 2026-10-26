@@ -1,0 +1,27 @@
+# Deny by default: only the portable files un-ignored below are tracked.
+# Anything new (a new secret file, a new cache) stays out automatically.
+*
+!.gitignore
+!README.md
+!agent
+agent/*
+!agent/AGENTS.md
+!agent/settings.json
+!agent/extensions
+agent/extensions/*
+!agent/extensions/guardrails.json
+!agent/extensions/auto-model
+!agent/extensions/auto-model/**
+
+# Everything below is credentials, chat history, or machine-generated state.
+# Keep these lines even though they are redundant with the deny-all above:
+# they document what must stay private and survive future rule changes.
+**/auth.json
+**/secrets/
+**/trust.json
+**/models-store.json
+**/sessions/
+**/*.log
+**/node_modules/
+agent/install/
+agent/npm/

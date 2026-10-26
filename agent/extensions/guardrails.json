@@ -1,0 +1,319 @@
+{
+  "$schema": "https://unpkg.com/@aliou/pi-guardrails@0.20.0/schema.json",
+  "applyBuiltinDefaults": true,
+  "version": "0.20.0",
+  "enabled": true,
+  "onboarding": {
+    "completed": true,
+    "completedAt": "2026-10-23T19:29:14.367Z",
+    "version": "0.20.0"
+  },
+  "features": {
+    "policies": true,
+    "permissionGate": true,
+    "pathAccess": false
+  },
+  "pathAccess": {
+    "mode": "ask",
+    "allowedPaths": [
+      {
+        "kind": "file",
+        "path": "/dev/null"
+      }
+    ]
+  },
+  "policies": {
+    "rules": [
+      {
+        "id": "secret-files",
+        "description": "Env files are readable (e.g. DB credentials for read queries) but never modifiable",
+        "patterns": [
+          { "pattern": ".env" },
+          { "pattern": ".env.local" },
+          { "pattern": ".env.production" },
+          { "pattern": ".env.prod" },
+          { "pattern": ".dev.vars" }
+        ],
+        "allowedPatterns": [
+          { "pattern": "*.example.env" },
+          { "pattern": "*.sample.env" },
+          { "pattern": "*.test.env" },
+          { "pattern": ".env.example" },
+          { "pattern": ".env.sample" },
+          { "pattern": ".env.test" }
+        ],
+        "protection": "readOnly",
+        "onlyIfExists": true,
+        "enabled": true,
+        "blockMessage": "Modifying {file} is not allowed. It contains secrets. Read it with the read tool if you need a value, and ask the user to make any changes."
+      },
+      {
+        "id": "database-files",
+        "name": "Database files",
+        "description": "Local database files are read-only for the agent",
+        "patterns": [
+          {
+            "pattern": "*.db"
+          },
+          {
+            "pattern": "*.sqlite"
+          },
+          {
+            "pattern": "*.sqlite3"
+          },
+          {
+            "pattern": "*.db-wal"
+          },
+          {
+            "pattern": "*.db-shm"
+          }
+        ],
+        "protection": "readOnly",
+        "onlyIfExists": true,
+        "enabled": true,
+        "blockMessage": "Modifying {file} is not allowed. It is a database file. Explain the change to the user and ask them to make it."
+      }
+    ]
+  },
+  "permissionGate": {
+    "requireConfirmation": true,
+    "autoDenyPatterns": [
+      {
+        "pattern": "\\brm\\s+(?:-\\S+\\s+)*(?:/|/\\*|~|~/|~/\\*|\\$HOME/?|\\$\\{HOME\\}/?|\\.\\.?/?|\\*)(?=\\s|$|[;&|])",
+        "regex": true,
+        "description": "Deleting the filesystem root, home directory, current/parent directory or a bare wildcard is never allowed"
+      },
+      {
+        "pattern": "--no-preserve-root",
+        "description": "rm --no-preserve-root is never allowed"
+      },
+      {
+        "pattern": "\\bmkfs(?:\\.\\w+)?\\b",
+        "regex": true,
+        "description": "Formatting a filesystem is never allowed"
+      },
+      {
+        "pattern": "\\bdd\\b[^;&|\\n]*\\bof=/dev/(?!null\\b)",
+        "regex": true,
+        "description": "Writing raw data to a device is never allowed"
+      },
+      {
+        "pattern": ">\\s*/dev/(?:sd|nvme|hd|vd|xvd|mmcblk|disk)",
+        "regex": true,
+        "description": "Redirecting output onto a block device is never allowed"
+      },
+      {
+        "pattern": ":\\(\\)\\s*\\{\\s*:\\s*\\|\\s*:\\s*&\\s*\\}",
+        "regex": true,
+        "description": "Fork bomb"
+      },
+      {
+        "pattern": "(?i:\\bdrop\\s+(?:database|schema)\\b)",
+        "regex": true,
+        "description": "Dropping a database or schema is never allowed. Ask the user to do it"
+      },
+      {
+        "pattern": "\\bdropdb\\b",
+        "regex": true,
+        "description": "Dropping a database is never allowed. Ask the user to do it"
+      },
+      {
+        "pattern": "(?i:\\bflush(?:all|db)\\b)",
+        "regex": true,
+        "description": "Wiping a Redis database is never allowed. Ask the user to do it"
+      },
+      {
+        "pattern": "\\.dropDatabase\\s*\\(",
+        "regex": true,
+        "description": "Dropping a MongoDB database is never allowed. Ask the user to do it"
+      },
+      {
+        "pattern": "(?i:\\bdb:(?:drop|reset|wipe)\\b|\\bmigrate:(?:fresh|reset)\\b|\\bmigrate\\s+reset\\b|--force-reset\\b|\\bflyway\\b[^;&|\\n]*\\bclean\\b|\\bdjango-admin\\s+flush\\b|manage\\.py\\s+flush\\b)",
+        "regex": true,
+        "description": "Resetting or wiping a database through a framework/migration tool is never allowed. Ask the user to do it"
+      },
+      {
+        "pattern": "\\brm\\b[^;&|\\n]*\\.(?:db|sqlite3?|db-wal|db-shm)\\b",
+        "regex": true,
+        "description": "Deleting a database file is never allowed. Ask the user to do it"
+      },
+      {
+        "pattern": "\\bgit\\b[^;&|\\n]*\\spush\\b(?=[^;&|\\n]*(?:\\s-f\\b|\\s--force\\b|\\s--force-with-lease\\b|\\s\\+))(?=[^;&|\\n]*\\b(?:main|master)\\b)",
+        "regex": true,
+        "description": "Force-pushing main/master is never allowed"
+      },
+      {
+        "pattern": "\\bgh\\s+repo\\s+delete\\b",
+        "regex": true,
+        "description": "Deleting a GitHub repository is never allowed"
+      }
+    ],
+    "patterns": [
+      {
+        "pattern": "\\bgit\\b[^;&|\\n]*\\spush\\b[^;&|\\n]*(?:\\s-f\\b|\\s--force\\b|\\s--force-with-lease\\b|\\s\\+\\S)",
+        "regex": true,
+        "description": "git force push (rewrites remote history)"
+      },
+      {
+        "pattern": "\\bgit\\b[^;&|\\n]*\\spush\\b[^;&|\\n]*(?:\\s--delete\\b|\\s-d\\b|\\s:\\S)",
+        "regex": true,
+        "description": "git push deleting a remote branch or tag"
+      },
+      {
+        "pattern": "\\bgit\\b[^;&|\\n]*\\spush\\b",
+        "regex": true,
+        "description": "git push (publishes commits to a remote)"
+      },
+      {
+        "pattern": "\\bgit\\b[^;&|\\n]*\\sreset\\b[^;&|\\n]*--(?:hard|merge|keep)\\b",
+        "regex": true,
+        "description": "git reset that discards working tree changes"
+      },
+      {
+        "pattern": "\\bgit\\b[^;&|\\n]*\\sclean\\b[^;&|\\n]*\\s-[a-zA-Z]*f",
+        "regex": true,
+        "description": "git clean -f (deletes untracked files)"
+      },
+      {
+        "pattern": "\\bgit\\b[^;&|\\n]*\\s(?:checkout|switch)\\b[^;&|\\n]*(?:\\s--(?:\\s|$)|\\s\\.(?:\\s|$)|\\s-f\\b|\\s--force\\b|--discard-changes\\b)",
+        "regex": true,
+        "description": "git checkout/switch that discards local changes"
+      },
+      {
+        "pattern": "\\bgit\\b[^;&|\\n]*\\srestore\\b",
+        "regex": true,
+        "description": "git restore (discards local changes)"
+      },
+      {
+        "pattern": "\\bgit\\b[^;&|\\n]*\\sbranch\\b[^;&|\\n]*(?:\\s-[a-zA-Z]*D\\b|\\s--delete\\b[^;&|\\n]*\\s(?:-f|--force)\\b)",
+        "regex": true,
+        "description": "git branch force delete"
+      },
+      {
+        "pattern": "\\bgit\\b[^;&|\\n]*\\sstash\\s+(?:drop|clear)\\b",
+        "regex": true,
+        "description": "git stash drop/clear (loses stashed work)"
+      },
+      {
+        "pattern": "\\bgit\\b[^;&|\\n]*\\s(?:rebase|filter-branch|filter-repo)\\b",
+        "regex": true,
+        "description": "git history rewrite"
+      },
+      {
+        "pattern": "\\bgit\\b[^;&|\\n]*\\scommit\\b[^;&|\\n]*--amend\\b",
+        "regex": true,
+        "description": "git commit --amend (rewrites the last commit)"
+      },
+      {
+        "pattern": "\\bgit\\b[^;&|\\n]*\\s(?:reflog\\s+(?:expire|delete)|update-ref\\s+-d|gc\\b[^;&|\\n]*--prune|worktree\\s+remove\\b[^;&|\\n]*(?:-f|--force)|tag\\b[^;&|\\n]*\\s-d\\b)",
+        "regex": true,
+        "description": "git command that permanently drops refs or objects"
+      },
+      {
+        "pattern": "(?i:\\bdrop\\s+(?:table|index|view|user|role|collection|column)\\b)",
+        "regex": true,
+        "description": "SQL DROP statement"
+      },
+      {
+        "pattern": "(?i:\\btruncate\\s+table\\b)|(?:^|[;&|]\\s*)truncate\\s",
+        "regex": true,
+        "description": "truncate (SQL table wipe or file truncation)"
+      },
+      {
+        "pattern": "(?i:\\bdelete\\s+from\\b)",
+        "regex": true,
+        "description": "SQL DELETE"
+      },
+      {
+        "pattern": "(?i:\\bupdate\\s+\\S+\\s+set\\b)",
+        "regex": true,
+        "description": "SQL UPDATE"
+      },
+      {
+        "pattern": "\\.(?:drop|deleteMany|remove)\\s*\\(",
+        "regex": true,
+        "description": "MongoDB collection drop/delete"
+      },
+      {
+        "pattern": "\\bredis-cli\\b[^;&|\\n]*\\s(?:del|unlink|config\\s+set)\\b",
+        "regex": true,
+        "description": "Redis key deletion or config change"
+      },
+      {
+        "pattern": "\\bdocker\\b[^;&|\\n]*\\s(?:volume\\s+(?:rm|prune)|system\\s+prune|container\\s+prune|image\\s+prune|compose\\s+down\\b[^;&|\\n]*(?:-v\\b|--volumes))",
+        "regex": true,
+        "description": "Docker command that deletes volumes, containers or images (may contain database data)"
+      },
+      {
+        "pattern": "\\b(?:kubectl|helm)\\s+(?:delete|uninstall|drain)\\b",
+        "regex": true,
+        "description": "Kubernetes resource deletion"
+      },
+      {
+        "pattern": "\\b(?:terraform|tofu|pulumi)\\s+(?:destroy|apply|up)\\b",
+        "regex": true,
+        "description": "Infrastructure change"
+      },
+      {
+        "pattern": "\\baws\\s+s3\\s+(?:rm|rb)\\b|\\b(?:aws|gcloud|az)\\b[^;&|\\n]*\\s(?:delete|delete-\\S+|terminate-\\S+)\\b",
+        "regex": true,
+        "description": "Cloud resource deletion"
+      },
+      {
+        "pattern": "\\bgh\\s+(?:release|secret|variable)\\s+delete\\b|\\bgh\\s+pr\\s+merge\\b",
+        "regex": true,
+        "description": "GitHub destructive or publishing action"
+      },
+      {
+        "pattern": "\\b(?:npm|pnpm|yarn|bun)\\s+publish\\b|\\bcargo\\s+publish\\b|\\btwine\\s+upload\\b|\\bgem\\s+push\\b",
+        "regex": true,
+        "description": "Package publishing"
+      },
+      {
+        "pattern": "\\brm\\s+(?:\\S+\\s+)*?(?:-[a-zA-Z]*[rR][a-zA-Z]*|--recursive)\\b",
+        "regex": true,
+        "description": "recursive delete"
+      },
+      {
+        "pattern": "\\bfind\\b[^;&|\\n]*(?:\\s-delete\\b|-exec(?:dir)?\\s+rm\\b)|\\bxargs\\b[^;&|\\n]*\\brm\\b",
+        "regex": true,
+        "description": "bulk file deletion"
+      },
+      {
+        "pattern": "\\b(?:curl|wget)\\b[^|]*\\|\\s*(?:sudo\\s+)?(?:ba|z|da|k|fi)?sh\\b",
+        "regex": true,
+        "description": "piping a downloaded script into a shell"
+      },
+      {
+        "pattern": "(?:^|[;&|]\\s*)su(?:\\s|$)",
+        "regex": true,
+        "description": "switch user"
+      },
+      {
+        "pattern": "\\bchmod\\s+(?:-\\S+\\s+)*[0-7]?777\\b",
+        "regex": true,
+        "description": "world-writable permissions"
+      },
+      {
+        "pattern": "(?:^|[;&|]\\s*)(?:sudo\\s+)?(?:shutdown|reboot|halt|poweroff)\\b",
+        "regex": true,
+        "description": "power off or reboot the machine"
+      },
+      {
+        "pattern": "\\bsystemctl\\s+(?:stop|disable|mask|kill|restart)\\b",
+        "regex": true,
+        "description": "stopping or disabling a system service"
+      },
+      {
+        "pattern": "\\bkill\\s+-(?:9|KILL)\\b|\\b(?:killall|pkill)\\b",
+        "regex": true,
+        "description": "force killing processes"
+      },
+      {
+        "pattern": "\\bcrontab\\s+-r\\b",
+        "regex": true,
+        "description": "deleting the crontab"
+      }
+    ]
+  }
+}
