@@ -11,6 +11,7 @@ Deliberately **not** in this repo: credentials, chat history, and generated inst
 | `agent/settings.json` | Preferences, default model, and the `packages` list |
 | `agent/extensions/auto-model/` | Custom extension: rates task difficulty and routes model + thinking level |
 | `agent/extensions/guardrails.json` | Guardrails policy config |
+| `install.sh` | Copies the above into `~/.pi/agent` and installs declared packages |
 
 | Excluded | Why |
 |---|---|
@@ -36,20 +37,28 @@ so clone next to it and copy the portable files across.
 # 1. Install Pi (creates ~/.pi/agent, agent/bin/pi, agent/install/)
 curl -fsSL https://pi.dev/install.sh | sh
 
-# 2. Clone this repo next to the agent dir (never over it — the installer already populated it)
+# 2. Clone next to the agent dir (never over it, the installer already populated it)
 git clone git@github.com:DinicaMadalin/pi-config.git ~/pi-config
 
-# 3. Copy the portable files in place
-cp ~/pi-config/agent/AGENTS.md ~/pi-config/agent/settings.json ~/.pi/agent/
-mkdir -p ~/.pi/agent/extensions
-cp -r ~/pi-config/agent/extensions/auto-model ~/pi-config/agent/extensions/guardrails.json ~/.pi/agent/extensions/
+# 3. Copy config + auto-model extension, then install the npm extensions from settings.json
+~/pi-config/install.sh
 
-# 4. Install the packages declared in settings.json
-pi update --extensions
-
-# 5. Authenticate per provider — this stays local and is never committed
+# 4. Authenticate per provider; this stays local and is never committed
 pi        # then /login for each provider you use
 ```
+
+`install.sh` is safe to re-run; it overwrites the tracked files and replaces
+`extensions/auto-model/` wholesale so files deleted upstream disappear too.
+
+### Extensions that come along
+
+| Extension | How it syncs |
+|---|---|
+| `auto-model` (yours) | Source copied from `agent/extensions/auto-model/` |
+| `billion-context`, `pi-subagents`, `pi-jev`, `@aliou/pi-guardrails`, `@earendil-works/pi-voice` | Declared in `settings.json` `packages`, installed by `pi update --extensions` |
+
+`settings.json` sets `defaultProvider`/`defaultModel` to `auto`, which the
+auto-model extension provides; it needs the Jev key below to rate tasks.
 
 ## Machine-local secrets the extensions need
 
@@ -69,6 +78,6 @@ On the machine where you change config:
 cd ~/.pi && git add -A && git commit -m "update settings" && git push
 ```
 
-On the other machines, pull in `~/pi-config` and copy the files as in step 3.
+On the other machines: `cd ~/pi-config && git pull && ./install.sh`.
 Because `.gitignore` denies everything by default, a newly added file only syncs
 after you un-ignore it there — check `git status` after adding config.
