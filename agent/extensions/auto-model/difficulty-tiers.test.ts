@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import type { Api, Model } from "@earendil-works/pi-ai";
-import { applyQualityBias, pickModelForTier, type TierPolicy } from "./difficulty-tiers.ts";
+import { applyQualityBias, applyThinkingFloor, pickModelForTier, type TierPolicy } from "./difficulty-tiers.ts";
 
 function fakeModel(provider: string, id: string, outputPrice: number, readsImages = true): Model<Api> {
 	return {
@@ -44,4 +44,13 @@ test("quality bias shifts one tier and clamps at the ends", () => {
 	assert.equal(applyQualityBias("complex", "high"), "expert");
 	assert.equal(applyQualityBias("trivial", "low"), "trivial");
 	assert.equal(applyQualityBias("expert", "high"), "expert");
+});
+
+test("raises thinking below the tier floor and keeps levels at or above it", () => {
+	const flooredPolicy: TierPolicy = { ...policy, minThinkingLevel: "medium" };
+	assert.equal(applyThinkingFloor("low", flooredPolicy), "medium");
+	assert.equal(applyThinkingFloor("minimal", flooredPolicy), "medium");
+	assert.equal(applyThinkingFloor("medium", flooredPolicy), "medium");
+	assert.equal(applyThinkingFloor("high", flooredPolicy), "high");
+	assert.equal(applyThinkingFloor("low", policy), "low");
 });

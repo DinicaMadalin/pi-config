@@ -13,7 +13,8 @@
     "npm:pi-subagents",
     "npm:pi-jev",
     "npm:@aliou/pi-guardrails",
-    "npm:@earendil-works/pi-voice"
+    "npm:@earendil-works/pi-voice",
+    "npm:@rahularya01/pi-cursor"
   ],
   "fullscreenScrollbar": "hidden",
   "fullscreenWheelScrollLines": "auto",

@@ -7,13 +7,16 @@ import type { Api, Model } from "@earendil-works/pi-ai";
 export const DIFFICULTY_TIERS = ["trivial", "standard", "complex", "expert"] as const;
 export type DifficultyTier = (typeof DIFFICULTY_TIERS)[number];
 
-export type RoutedThinkingLevel = "off" | "minimal" | "low" | "medium" | "high" | "xhigh";
+export const ROUTED_THINKING_LEVELS = ["off", "minimal", "low", "medium", "high", "xhigh"] as const;
+export type RoutedThinkingLevel = (typeof ROUTED_THINKING_LEVELS)[number];
 
 export interface TierPolicy {
 	/** Preferred models as "provider/id", best first. Unavailable ones are skipped. */
 	models: string[];
 	/** Used only when Jev cannot rate thinking depth, and for compaction summaries. */
 	thinkingLevel: RoutedThinkingLevel;
+	/** Floor for Jev's thinking choice; a lower pick is raised to this. */
+	minThinkingLevel?: RoutedThinkingLevel;
 }
 
 export type TierPolicies = Record<DifficultyTier, TierPolicy>;
@@ -22,14 +25,16 @@ export type TierPolicies = Record<DifficultyTier, TierPolicy>;
 export const DEFAULT_TIER_POLICIES: TierPolicies = {
 	trivial: {
 		models: ["opencode-go/deepseek-v4.1-flash", "opencode-go/glm-5.3-flash"],
-		thinkingLevel: "low",
+		thinkingLevel: "medium",
+		minThinkingLevel: "medium",
 	},
 	standard: {
 		models: ["opencode-go/gpt-6-luna", "anthropic/claude-sonnet-5-5", "opencode-go/glm-5.3"],
 		thinkingLevel: "medium",
+		minThinkingLevel: "medium",
 	},
 	complex: {
-		models: ["anthropic/claude-opus-5-5", "xai/grok-4.7"],
+		models: ["anthropic/claude-opus-5-5"],
 		thinkingLevel: "high",
 	},
 	expert: {
@@ -48,6 +53,13 @@ export function applyQualityBias(classifiedTier: DifficultyTier, selectedLevel: 
 	const index = DIFFICULTY_TIERS.indexOf(classifiedTier) + shift;
 	const clampedIndex = Math.min(Math.max(index, 0), DIFFICULTY_TIERS.length - 1);
 	return DIFFICULTY_TIERS[clampedIndex];
+}
+
+/** Raises a thinking level to the tier's floor; levels at or above it are kept. */
+export function applyThinkingFloor(level: RoutedThinkingLevel, policy: TierPolicy): RoutedThinkingLevel {
+	if (!policy.minThinkingLevel) return level;
+	const isBelowFloor = ROUTED_THINKING_LEVELS.indexOf(level) < ROUTED_THINKING_LEVELS.indexOf(policy.minThinkingLevel);
+	return isBelowFloor ? policy.minThinkingLevel : level;
 }
 
 export function modelKey(model: Pick<Model<Api>, "provider" | "id">): string {

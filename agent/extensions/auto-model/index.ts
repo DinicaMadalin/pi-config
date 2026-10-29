@@ -8,6 +8,7 @@
  * - Tool follow-ups and retries stay on the model and thinking level of the turn (keeps the prompt cache).
  * - No footer status of its own: Pi's footer already shows the routed model and thinking level.
  *   It also clears pi-jev's idle "jev: ready" status so the footer stays two lines.
+ * - A tier's minThinkingLevel raises Jev's thinking pick (trivial and standard: at least medium).
  * - Selected thinking level is a quality bias: low = one tier cheaper, high = one tier stronger.
  *
  * Usage: /model auto/auto   or   pi --model auto/auto
@@ -18,6 +19,7 @@ import type { ExtensionAPI, ExtensionContext, ModelRoute, ModelRouteRequest } fr
 import { hasTypesafeApiKey, latestUserMessageHasImage, rateTaskDifficulty } from "./classify-difficulty.ts";
 import {
 	applyQualityBias,
+	applyThinkingFloor,
 	DIFFICULTY_TIERS,
 	type DifficultyTier,
 	modelKey,
@@ -69,7 +71,8 @@ async function routeNewTask(request: AutoRouteRequest, ctx: ExtensionContext): P
 	}
 	const classifiedTier = rating.kind === "rated" ? rating.tier : (request.state?.tier ?? FALLBACK_TIER);
 	const tier = applyQualityBias(classifiedTier, request.thinkingLevel);
-	const thinkingLevel = rating.kind === "rated" ? rating.thinkingLevel : policies[tier].thinkingLevel;
+	const ratedOrFallbackLevel = rating.kind === "rated" ? rating.thinkingLevel : policies[tier].thinkingLevel;
+	const thinkingLevel = applyThinkingFloor(ratedOrFallbackLevel, policies[tier]);
 
 	// Same tier as the running model: keep it instead of paying a cache miss for an equal model.
 	const previous = request.previous?.model;
@@ -108,7 +111,9 @@ function describeTierAvailability(ctx: ExtensionContext): string {
 		const models = policies[tier].models
 			.map((key) => (availableKeys.has(key) ? key : `${key} (not logged in)`))
 			.join(", ");
-		return `${tier} [fallback thinking: ${policies[tier].thinkingLevel}]: ${models}`;
+		const floor = policies[tier].minThinkingLevel;
+		const floorNote = floor ? `, min thinking: ${floor}` : "";
+		return `${tier} [fallback thinking: ${policies[tier].thinkingLevel}${floorNote}]: ${models}`;
 	});
 	return [`Auto model tiers (override in ${TIER_CONFIG_PATH}):`, ...lines].join("\n");
 }

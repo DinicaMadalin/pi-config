@@ -4,6 +4,7 @@ import { join } from "node:path";
 import {
 	DEFAULT_TIER_POLICIES,
 	DIFFICULTY_TIERS,
+	ROUTED_THINKING_LEVELS,
 	type RoutedThinkingLevel,
 	type TierPolicies,
 	type TierPolicy,
@@ -11,27 +12,35 @@ import {
 
 export const TIER_CONFIG_PATH = join(homedir(), ".pi", "agent", "auto-model.json");
 
-const THINKING_LEVELS: readonly RoutedThinkingLevel[] = ["off", "minimal", "low", "medium", "high", "xhigh"];
+function parseThinkingLevel(tierName: string, field: string, raw: unknown): RoutedThinkingLevel | undefined {
+	if (raw === undefined) return undefined;
+	if (!ROUTED_THINKING_LEVELS.includes(raw as RoutedThinkingLevel)) {
+		throw new Error(`${TIER_CONFIG_PATH}: tier "${tierName}".${field} must be one of ${ROUTED_THINKING_LEVELS.join(", ")}`);
+	}
+	return raw as RoutedThinkingLevel;
+}
 
 function parseTierPolicy(tierName: string, raw: unknown, fallback: TierPolicy): TierPolicy {
 	if (raw === undefined) return fallback;
 	if (typeof raw !== "object" || raw === null) {
 		throw new Error(`${TIER_CONFIG_PATH}: tier "${tierName}" must be an object`);
 	}
-	const { models, thinkingLevel } = raw as { models?: unknown; thinkingLevel?: unknown };
+	const { models, thinkingLevel, minThinkingLevel } = raw as {
+		models?: unknown;
+		thinkingLevel?: unknown;
+		minThinkingLevel?: unknown;
+	};
 	if (models !== undefined && !(Array.isArray(models) && models.every((key) => typeof key === "string"))) {
 		throw new Error(`${TIER_CONFIG_PATH}: tier "${tierName}".models must be an array of "provider/id" strings`);
 	}
-	if (thinkingLevel !== undefined && !THINKING_LEVELS.includes(thinkingLevel as RoutedThinkingLevel)) {
-		throw new Error(`${TIER_CONFIG_PATH}: tier "${tierName}".thinkingLevel must be one of ${THINKING_LEVELS.join(", ")}`);
-	}
 	return {
 		models: (models as string[] | undefined) ?? fallback.models,
-		thinkingLevel: (thinkingLevel as RoutedThinkingLevel | undefined) ?? fallback.thinkingLevel,
+		thinkingLevel: parseThinkingLevel(tierName, "thinkingLevel", thinkingLevel) ?? fallback.thinkingLevel,
+		minThinkingLevel: parseThinkingLevel(tierName, "minThinkingLevel", minThinkingLevel) ?? fallback.minThinkingLevel,
 	};
 }
 
-/** Defaults merged with the optional user file `{ "tiers": { "<tier>": { models, thinkingLevel } } }`. */
+/** Defaults merged with the optional user file `{ "tiers": { "<tier>": { models, thinkingLevel, minThinkingLevel } } }`. */
 export function loadTierPolicies(): TierPolicies {
 	if (!existsSync(TIER_CONFIG_PATH)) return DEFAULT_TIER_POLICIES;
 	let parsed: unknown;
