@@ -9,7 +9,9 @@ Deliberately **not** in this repo: credentials, chat history, and generated inst
 |---|---|
 | `agent/AGENTS.md` | User-level coding instructions applied in every project |
 | `agent/settings.json` | Preferences, default model, and the `packages` list |
-| `agent/extensions/auto-model/` | Custom extension: rates task difficulty and routes model + thinking level |
+| `agent/extensions/auto-model/` | Custom extension: rates task difficulty and routes model + thinking level, fails over to the next model, learns from your reactions to its answers |
+| `agent/extensions/quality-gate/` | Custom extension: runs typecheck/lint/test after the agent changes files, `/checks`, `/ship` |
+| `agent/extensions/project-memory/` | Custom extension: per-repo notes and agreed plans in `.scratch/`, `/note`, `/notes`, `/handoff` |
 | `agent/extensions/guardrails.json` | Guardrails policy config |
 | `install.sh` | Copies the above into `~/.pi/agent` and installs declared packages |
 
@@ -40,7 +42,7 @@ curl -fsSL https://pi.dev/install.sh | sh
 # 2. Clone next to the agent dir (never over it, the installer already populated it)
 git clone git@github.com:DinicaMadalin/pi-config.git ~/pi-config
 
-# 3. Copy config + auto-model extension, then install the npm extensions from settings.json
+# 3. Copy config + custom extensions, then install the npm extensions from settings.json
 ~/pi-config/install.sh
 
 # 4. Authenticate per provider; this stays local and is never committed
@@ -48,13 +50,13 @@ pi        # then /login for each provider you use
 ```
 
 `install.sh` is safe to re-run; it overwrites the tracked files and replaces
-`extensions/auto-model/` wholesale so files deleted upstream disappear too.
+each custom extension directory wholesale so files deleted upstream disappear too.
 
 ### Extensions that come along
 
 | Extension | How it syncs |
 |---|---|
-| `auto-model` (yours) | Source copied from `agent/extensions/auto-model/` |
+| `auto-model`, `quality-gate`, `project-memory` (yours) | Source copied from `agent/extensions/<name>/` |
 | `billion-context`, `pi-subagents`, `pi-jev`, `@aliou/pi-guardrails`, `@earendil-works/pi-voice` | Declared in `settings.json` `packages`, installed by `pi update --extensions` |
 
 `settings.json` sets `defaultProvider`/`defaultModel` to `auto`, which the

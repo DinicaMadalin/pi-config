@@ -49,8 +49,12 @@ export const DEFAULT_TIER_POLICIES: TierPolicies = {
  */
 export function applyQualityBias(classifiedTier: DifficultyTier, selectedLevel: string): DifficultyTier {
 	const tierShiftByLevel: Record<string, number> = { low: -1, medium: 0, high: 1 };
-	const shift = tierShiftByLevel[selectedLevel] ?? 0;
-	const index = DIFFICULTY_TIERS.indexOf(classifiedTier) + shift;
+	return shiftTier(classifiedTier, tierShiftByLevel[selectedLevel] ?? 0);
+}
+
+/** Moves a tier up (positive steps) or down, stopping at trivial and expert. */
+export function shiftTier(tier: DifficultyTier, steps: number): DifficultyTier {
+	const index = DIFFICULTY_TIERS.indexOf(tier) + steps;
 	const clampedIndex = Math.min(Math.max(index, 0), DIFFICULTY_TIERS.length - 1);
 	return DIFFICULTY_TIERS[clampedIndex];
 }
@@ -79,7 +83,7 @@ function outputPrice(model: Model<Api>): number {
  * Fallback when no preferred model of a tier is logged in: rank the logged-in models by price
  * and take the one at the tier's position (trivial = cheapest, expert = most expensive).
  */
-function pickByPriceRank(candidates: Model<Api>[], tier: DifficultyTier): Model<Api> | undefined {
+function pickByPriceRank(candidates: readonly Model<Api>[], tier: DifficultyTier): Model<Api> | undefined {
 	if (candidates.length === 0) return undefined;
 	const byPrice = [...candidates].sort((left, right) => outputPrice(left) - outputPrice(right));
 	const tierPosition = DIFFICULTY_TIERS.indexOf(tier) / (DIFFICULTY_TIERS.length - 1);
@@ -94,7 +98,7 @@ export interface ModelChoice {
 
 /** First logged-in preferred model of the tier, else the price-ranked fallback. */
 export function pickModelForTier(
-	availableModels: Model<Api>[],
+	availableModels: readonly Model<Api>[],
 	policy: TierPolicy,
 	tier: DifficultyTier,
 	needsImageInput: boolean,

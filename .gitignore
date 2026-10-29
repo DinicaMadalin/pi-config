@@ -13,6 +13,10 @@ agent/extensions/*
 !agent/extensions/guardrails.json
 !agent/extensions/auto-model
 !agent/extensions/auto-model/**
+!agent/extensions/quality-gate
+!agent/extensions/quality-gate/**
+!agent/extensions/project-memory
+!agent/extensions/project-memory/**
 
 # Everything below is credentials, chat history, or machine-generated state.
 # Keep these lines even though they are redundant with the deny-all above:
