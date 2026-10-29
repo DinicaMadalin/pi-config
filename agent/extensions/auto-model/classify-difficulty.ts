@@ -29,9 +29,14 @@ export type DifficultyRating =
 			tier: DifficultyTier;
 			thinkingLevel: RoutedThinkingLevel;
 			confidence: number;
+			/** Planning or GitHub issue investigation; routed to IMPORTANT_TASK_ROUTE. */
+			isImportant: boolean;
 			previousTierFit?: { fit: PreviousTierFit; confidence: number };
 	  }
 	| { kind: "unavailable"; reason: string };
+
+/** Bool answers are probabilities; above this the prompt counts as important work. */
+const IMPORTANT_TASK_PROBABILITY = 0.5;
 
 const TIER_FIT_CRITERIA: Record<PreviousTierFit, string> = {
 	too_weak:
@@ -152,6 +157,18 @@ export async function rateTaskDifficulty(
 			},
 			questions: {
 				...(previousExchange ? { previousTierFit: tierFitQuestion } : {}),
+				isImportant: {
+					type: "bool",
+					instructions:
+						"Is `prompt` asking for planning or for investigating a GitHub issue? `earlierPrompts` are previous " +
+						"requests in the same session; a follow-up that continues such a planning or investigation discussion counts too.",
+					criteria: {
+						true:
+							"Asks to plan, design, or propose an approach for work before implementing it, or to investigate, " +
+							"triage, reproduce, or find the root cause of a GitHub issue (a link, an issue number, or pasted issue text)",
+						false: "Anything else: implementing an already agreed plan, ordinary coding, questions, or chit-chat",
+					},
+				},
 				difficulty: {
 					type: "choice",
 					instructions:
@@ -189,11 +206,13 @@ export async function rateTaskDifficulty(
 		fitAnswer?.type === "choice" && PREVIOUS_TIER_FITS.includes(fitAnswer.choice as PreviousTierFit)
 			? { fit: fitAnswer.choice as PreviousTierFit, confidence: fitAnswer.confidence }
 			: undefined;
+	const importantAnswer = result.answers.isImportant;
 	return {
 		kind: "rated",
 		tier: answer.choice as DifficultyTier,
 		thinkingLevel: thinkingAnswer.choice as RoutedThinkingLevel,
 		confidence: answer.confidence,
+		isImportant: importantAnswer?.type === "bool" && importantAnswer.probability > IMPORTANT_TASK_PROBABILITY,
 		previousTierFit,
 	};
 }

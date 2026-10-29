@@ -44,6 +44,15 @@ export const DEFAULT_TIER_POLICIES: TierPolicies = {
 };
 
 /**
+ * Important work always gets the strongest tier at high thinking, whatever its rated difficulty:
+ * planning decides everything built after it, and issue investigation is where shallow answers cost most.
+ */
+export const IMPORTANT_TASK_ROUTE = { tier: "expert", thinkingLevel: "high" } as const satisfies {
+	tier: DifficultyTier;
+	thinkingLevel: RoutedThinkingLevel;
+};
+
+/**
  * The virtual thinking level the user selects acts as a quality bias:
  * "low" routes one tier cheaper, "medium" as classified, "high" one tier stronger.
  */

@@ -9,6 +9,7 @@
  * - No footer status of its own: Pi's footer already shows the routed model and thinking level.
  *   It also clears pi-jev's idle "jev: ready" status so the footer stays two lines.
  * - A tier's minThinkingLevel raises Jev's thinking pick (trivial and standard: at least medium).
+ * - Planning and GitHub issue investigation always go to the expert tier at high thinking.
  * - Selected thinking level is a quality bias: low = one tier cheaper, high = one tier stronger.
  * - Failover: a failed response Pi will not retry benches that model for 5 minutes and resends
  *   the request, so the router picks the next model of the tier (at most twice per prompt).
@@ -35,6 +36,7 @@ import {
 	applyThinkingFloor,
 	DIFFICULTY_TIERS,
 	type DifficultyTier,
+	IMPORTANT_TASK_ROUTE,
 	modelKey,
 	pickModelForTier,
 	type RoutedThinkingLevel,
@@ -147,6 +149,7 @@ async function rateTier(
 			? learnFromPreviousTask(previousExchange.prompt, previousExchange.routedTier, rating.previousTierFit, ctx)
 			: undefined;
 	const classifiedTier = rating.kind === "rated" ? rating.tier : (request.state?.tier ?? FALLBACK_TIER);
+	if (rating.kind === "rated" && rating.isImportant) return IMPORTANT_TASK_ROUTE;
 	const isRedoOfWeakAnswer = rating.kind === "rated" && rating.previousTierFit?.fit === "too_weak";
 	const tierAfterLearning = isRedoOfWeakAnswer ? raiseToCorrectedTier(classifiedTier, correctedPreviousTier) : classifiedTier;
 	const tier = applyQualityBias(tierAfterLearning, request.thinkingLevel);

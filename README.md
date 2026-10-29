@@ -9,7 +9,7 @@ Deliberately **not** in this repo: credentials, chat history, and generated inst
 |---|---|
 | `agent/AGENTS.md` | User-level coding instructions applied in every project |
 | `agent/settings.json` | Preferences, default model, and the `packages` list |
-| `agent/extensions/auto-model/` | Custom extension: rates task difficulty and routes model + thinking level, fails over to the next model, learns from your reactions to its answers |
+| `agent/extensions/auto-model/` | Custom extension: rates task difficulty and routes model + thinking level (planning and GitHub issue investigation always go to the expert tier at high thinking), fails over to the next model, learns from your reactions to its answers |
 | `agent/extensions/quality-gate/` | Custom extension: runs typecheck/lint/test after the agent changes files, `/checks`, `/ship` |
 | `agent/extensions/project-memory/` | Custom extension: per-repo notes and agreed plans in `.scratch/`, `/note`, `/notes`, `/handoff` |
 | `agent/extensions/guardrails.json` | Guardrails policy config |
