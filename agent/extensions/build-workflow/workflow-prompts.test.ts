@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { fixPrompt, implementationBrief, planningPrompt, reviewPrompt } from "./workflow-prompts.ts";
+import { fixPrompt, implementationBrief, issueInvestigationPrompt, planningPrompt, reviewPrompt } from "./workflow-prompts.ts";
 
 test("the planner is told not to edit and to save the plan only after agreement", () => {
 	const prompt = planningPrompt("add rate limiting");
@@ -31,4 +31,16 @@ test("the fix request quotes the review findings", () => {
 	const prompt = fixPrompt("Must fix\n1. price.js:4 rounds wrong\nREVIEW_VERDICT: fix");
 	assert.match(prompt, /price\.js:4 rounds wrong/);
 	assert.match(prompt, /IMPLEMENTATION: done`\.$/);
+});
+
+test("issue prompts carry the issue to the investigator, implementer and reviewer", () => {
+	const githubIssue = { number: 42, title: "Crash", url: "https://x/42", body: "Steps...", labels: ["bug"], comments: [{ author: "ann", body: "Me too" }] };
+	const investigation = issueInvestigationPrompt(githubIssue, "issue-42-crash");
+	for (const expected of ["#42: Crash", "Steps...", "Labels: bug", "Comment by ann", "issue-42-crash", "save_agreed_plan"]) {
+		assert.ok(investigation.includes(expected), expected);
+	}
+	const issueRef = { number: 42, title: "Crash", url: "https://x/42", branch: "issue-42-crash", baseBranch: "main" };
+	assert.ok(implementationBrief("/p.md", "# plan", [], issueRef).includes("GitHub issue #42"));
+	assert.ok(reviewPrompt("/p.md", "abc", [], issueRef).includes("a test reproduces the issue"));
+	assert.ok(!reviewPrompt("/p.md", "abc", []).includes("GitHub issue"));
 });

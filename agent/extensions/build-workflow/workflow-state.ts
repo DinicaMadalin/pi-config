@@ -1,6 +1,7 @@
 /**
  * Pure state machine of the /build workflow: plan (expert) -> implement (fresh session, model picked by
  * difficulty) -> review (expert) -> at most one fix (picked by difficulty) and re-review (expert).
+ * Work started from a GitHub issue (/issue) waits for the user to open a draft PR after a passing review.
  * No Pi runtime imports, so every transition can be unit tested.
  */
 import type { RoutePin } from "../auto-model/route-pin.ts";
@@ -13,20 +14,32 @@ export const IMPLEMENTATION_BLOCKED_MARKER = "IMPLEMENTATION: blocked";
 export const REVIEW_PASS_MARKER = "REVIEW_VERDICT: pass";
 export const REVIEW_FIX_MARKER = "REVIEW_VERDICT: fix";
 
+/** The GitHub issue a workflow fixes, and the branch created for it from the default branch. */
+export interface IssueRef {
+	number: number;
+	title: string;
+	url: string;
+	branch: string;
+	/** Default branch the work branched from and the PR targets, e.g. "main". */
+	baseBranch: string;
+}
+
 export interface FeatureWork {
 	planPath: string;
 	/** HEAD when implementation started; the reviewer diffs against it. Undefined outside a git repo. */
 	baseCommit?: string;
+	issue?: IssueRef;
 }
 
 export type WorkflowState =
 	| { phase: "idle" }
-	| { phase: "plan"; task: string }
-	| { phase: "awaiting-implementation"; task: string; planPath: string }
+	| { phase: "plan"; task: string; issue?: IssueRef }
+	| { phase: "awaiting-implementation"; task: string; planPath: string; issue?: IssueRef }
 	| ({ phase: "implement" } & FeatureWork)
 	| ({ phase: "review" } & FeatureWork)
 	| ({ phase: "fix" } & FeatureWork)
-	| ({ phase: "re-review" } & FeatureWork);
+	| ({ phase: "re-review" } & FeatureWork)
+	| ({ phase: "awaiting-pr" } & FeatureWork & { issue: IssueRef });
 
 export type WorkflowPhase = WorkflowState["phase"];
 
@@ -44,13 +57,14 @@ export function routeForPhase(phase: WorkflowPhase): RoutePin {
 		case "fix":
 			return { route: "difficulty" };
 		case "idle":
+		case "awaiting-pr":
 			return { route: "normal" };
 	}
 }
 
 /** Planning and reviewing must not change files; only the implementer edits. */
 export function canEditFiles(phase: WorkflowPhase): boolean {
-	return phase === "idle" || phase === "implement" || phase === "fix";
+	return phase === "idle" || phase === "implement" || phase === "fix" || phase === "awaiting-pr";
 }
 
 interface SessionEntryLike {
@@ -83,30 +97,42 @@ export type WorkflowStep =
 	| { kind: "advance"; next: WorkflowState }
 	| { kind: "finish"; summary: string };
 
+function featureWorkOf(state: FeatureWork): FeatureWork {
+	const work: FeatureWork = { planPath: state.planPath, baseCommit: state.baseCommit };
+	return state.issue ? { ...work, issue: state.issue } : work;
+}
+
+/** A passing review finishes plain work; issue work waits for the user to open the PR. */
+function stepAfterPassingReview(work: FeatureWork, summary: string): WorkflowStep {
+	if (!work.issue) return { kind: "finish", summary };
+	return { kind: "advance", next: { phase: "awaiting-pr", ...featureWorkOf(work), issue: work.issue } };
+}
+
 export function stepAfterTurn(state: WorkflowState, lastAnswer: string): WorkflowStep {
 	switch (state.phase) {
 		case "idle":
 		case "plan":
 		case "awaiting-implementation":
 			return { kind: "wait", reason: "the plan needs your agreement" };
+		case "awaiting-pr":
+			return { kind: "wait", reason: "run /issue pr to open the draft pull request" };
 		case "implement":
 		case "fix": {
 			const marker = lastMarker(lastAnswer, [IMPLEMENTATION_DONE_MARKER, IMPLEMENTATION_BLOCKED_MARKER]);
 			if (marker !== IMPLEMENTATION_DONE_MARKER) return { kind: "wait", reason: "the implementer needs your answer" };
-			const work: FeatureWork = { planPath: state.planPath, baseCommit: state.baseCommit };
-			return { kind: "advance", next: { phase: state.phase === "implement" ? "review" : "re-review", ...work } };
+			return { kind: "advance", next: { phase: state.phase === "implement" ? "review" : "re-review", ...featureWorkOf(state) } };
 		}
 		case "review": {
 			const verdict = lastMarker(lastAnswer, [REVIEW_PASS_MARKER, REVIEW_FIX_MARKER]);
-			if (verdict === REVIEW_PASS_MARKER) return { kind: "finish", summary: "the review passed" };
+			if (verdict === REVIEW_PASS_MARKER) return stepAfterPassingReview(state, "the review passed");
 			if (verdict === REVIEW_FIX_MARKER) {
-				return { kind: "advance", next: { phase: "fix", planPath: state.planPath, baseCommit: state.baseCommit } };
+				return { kind: "advance", next: { phase: "fix", ...featureWorkOf(state) } };
 			}
 			return { kind: "wait", reason: "the review ended without a verdict" };
 		}
 		case "re-review": {
 			const verdict = lastMarker(lastAnswer, [REVIEW_PASS_MARKER, REVIEW_FIX_MARKER]);
-			if (verdict === REVIEW_PASS_MARKER) return { kind: "finish", summary: "the re-review passed" };
+			if (verdict === REVIEW_PASS_MARKER) return stepAfterPassingReview(state, "the re-review passed");
 			return { kind: "finish", summary: "the re-review still has findings; the fix round is used up, over to you" };
 		}
 	}

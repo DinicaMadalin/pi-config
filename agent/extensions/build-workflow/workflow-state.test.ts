@@ -70,3 +70,29 @@ test("review findings get exactly one fix round and a re-review", () => {
 test("a review without a verdict waits instead of guessing", () => {
 	assert.equal(stepAfterTurn({ phase: "review", ...work }, "Looks mostly fine").kind, "wait");
 });
+
+const issue = { number: 42, title: "Crash on empty cart", url: "https://github.com/o/r/issues/42", branch: "issue-42-crash-on-empty-cart", baseBranch: "main" };
+
+test("a passing review of issue work waits for the user to open the PR", () => {
+	assert.deepEqual(stepAfterTurn({ phase: "review", ...work, issue }, "REVIEW_VERDICT: pass"), {
+		kind: "advance",
+		next: { phase: "awaiting-pr", ...work, issue },
+	});
+	assert.equal(stepAfterTurn({ phase: "re-review", ...work, issue }, "REVIEW_VERDICT: pass").kind, "advance");
+});
+
+test("issue work keeps its issue through implement, review and fix", () => {
+	const reviewStep = stepAfterTurn({ phase: "implement", ...work, issue }, "IMPLEMENTATION: done");
+	assert.deepEqual(reviewStep, { kind: "advance", next: { phase: "review", ...work, issue } });
+	const fixStep = stepAfterTurn({ phase: "review", ...work, issue }, "REVIEW_VERDICT: fix");
+	assert.deepEqual(fixStep, { kind: "advance", next: { phase: "fix", ...work, issue } });
+});
+
+test("issue work whose re-review still fails does not open a PR", () => {
+	assert.equal(stepAfterTurn({ phase: "re-review", ...work, issue }, "REVIEW_VERDICT: fix").kind, "finish");
+});
+
+test("awaiting the PR lets the user still ask for edits", () => {
+	assert.equal(canEditFiles("awaiting-pr"), true);
+	assert.deepEqual(routeForPhase("awaiting-pr"), { route: "normal" });
+});
