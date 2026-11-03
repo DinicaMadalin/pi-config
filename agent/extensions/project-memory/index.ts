@@ -8,7 +8,6 @@
  *   `.scratch/handoffs/` with `save_agreed_plan`. /handoff [focus] opens that plan for review (or
  *   writes it from the conversation if none was saved) and offers a fresh session to execute it.
  */
-import { StringEnum } from "@earendil-works/pi-ai";
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import { BorderedLoader, type ExtensionAPI, type ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
@@ -16,6 +15,7 @@ import {
 	formatNoteLine,
 	MAX_NOTES_PROMPT_CHARS,
 	NOTE_KINDS,
+	type NoteKind,
 	NOTES_RELATIVE_PATH,
 	parseNoteCommand,
 	projectRootFor,
@@ -63,7 +63,8 @@ export default function (pi: ExtensionAPI) {
 			"When you discover a non-obvious fact about this repo, make a decision with the user, or the user states a lasting rule, save it with save_project_note in one self-contained sentence.",
 		],
 		parameters: Type.Object({
-			kind: StringEnum(NOTE_KINDS, { description: "decision, gotcha, rule, or fact" }),
+			// A plain string enum (not anyOf/const) so every provider accepts the schema.
+			kind: Type.Unsafe<NoteKind>({ type: "string", enum: [...NOTE_KINDS], description: "decision, gotcha, rule, or fact" }),
 			text: Type.String({ description: "One self-contained sentence; include the reason for decisions" }),
 		}),
 		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {

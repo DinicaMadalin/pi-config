@@ -29,7 +29,7 @@ export type DifficultyRating =
 			tier: DifficultyTier;
 			thinkingLevel: RoutedThinkingLevel;
 			confidence: number;
-			/** Planning or GitHub issue investigation; routed to IMPORTANT_TASK_ROUTE. */
+			/** Feature or architecture planning, code review, or GitHub issue investigation; routed to IMPORTANT_TASK_ROUTE. */
 			isImportant: boolean;
 			previousTierFit?: { fit: PreviousTierFit; confidence: number };
 	  }
@@ -160,13 +160,16 @@ export async function rateTaskDifficulty(
 				isImportant: {
 					type: "bool",
 					instructions:
-						"Is `prompt` asking for planning or for investigating a GitHub issue? `earlierPrompts` are previous " +
-						"requests in the same session; a follow-up that continues such a planning or investigation discussion counts too.",
+						"Is `prompt` asking for planning, a code review, or investigating a GitHub issue? `earlierPrompts` are " +
+						"previous requests in the same session; a follow-up that continues such a discussion counts too.",
 					criteria: {
 						true:
-							"Asks to plan, design, or propose an approach for work before implementing it, or to investigate, " +
-							"triage, reproduce, or find the root cause of a GitHub issue (a link, an issue number, or pasted issue text)",
-						false: "Anything else: implementing an already agreed plan, ordinary coding, questions, or chit-chat",
+							"Asks to plan, design, or propose an approach for a feature or an architecture change of medium or larger " +
+							"size before implementing it; or to review code (a code review of a diff, branch, PR, or files); or to " +
+							"investigate, triage, reproduce, or find the root cause of a GitHub issue (a link, an issue number, or pasted issue text)",
+						false:
+							"Anything else: planning a tiny change (a rename, a one-line fix), implementing an already agreed plan, " +
+							"ordinary coding, questions, or chit-chat",
 					},
 				},
 				difficulty: {

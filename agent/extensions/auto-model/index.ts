@@ -9,7 +9,7 @@
  * - No footer status of its own: Pi's footer already shows the routed model and thinking level.
  *   It also clears pi-jev's idle "jev: ready" status so the footer stays two lines.
  * - A tier's minThinkingLevel raises Jev's thinking pick (trivial and standard: at least medium).
- * - Planning and GitHub issue investigation always go to the expert tier at high thinking.
+ * - Feature/architecture planning, code review, and GitHub issue investigation always go to the expert tier at high thinking.
  * - Selected thinking level is a quality bias: low = one tier cheaper, high = one tier stronger.
  * - Failover: a failed response Pi will not retry benches that model for 5 minutes and resends
  *   the request, so the router picks the next model of the tier (at most twice per prompt).
