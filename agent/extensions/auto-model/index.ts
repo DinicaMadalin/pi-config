@@ -11,7 +11,7 @@
  * - A tier's minThinkingLevel raises Jev's thinking pick (trivial and standard: at least medium, expert: at least high).
  * - Feature/architecture planning, code review, and GitHub issue investigation always go to the expert tier
  *   (thinking high, or xhigh when Jev rates the task that deep).
- * - Route pin: a session entry (see route-pin.ts) fixes a tier, or difficulty-only rating, for new prompts; /feature uses it.
+ * - Route pin: a session entry (see route-pin.ts) fixes a tier, or difficulty-only rating, for new prompts; /build uses it.
  * - Selected thinking level is a quality bias: low = one tier cheaper, high = one tier stronger.
  * - Failover: a failed response Pi will not retry benches that model for 5 minutes and resends
  *   the request, so the router picks the next model of the tier (at most twice per prompt).

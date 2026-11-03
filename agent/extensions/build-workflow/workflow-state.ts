@@ -1,11 +1,11 @@
 /**
- * Pure state machine of the /feature workflow: plan (expert) -> implement (fresh session, model picked by
+ * Pure state machine of the /build workflow: plan (expert) -> implement (fresh session, model picked by
  * difficulty) -> review (expert) -> at most one fix (picked by difficulty) and re-review (expert).
  * No Pi runtime imports, so every transition can be unit tested.
  */
 import type { RoutePin } from "../auto-model/route-pin.ts";
 
-export const WORKFLOW_STATE_ENTRY_TYPE = "feature-workflow-state";
+export const WORKFLOW_STATE_ENTRY_TYPE = "build-workflow-state";
 
 /** Marker lines the agent ends a turn with; the workflow reads them to move to the next phase. */
 export const IMPLEMENTATION_DONE_MARKER = "IMPLEMENTATION: done";

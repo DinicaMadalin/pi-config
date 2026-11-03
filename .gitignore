@@ -15,8 +15,8 @@ agent/extensions/*
 !agent/extensions/auto-model/**
 !agent/extensions/quality-gate
 !agent/extensions/quality-gate/**
-!agent/extensions/feature-workflow
-!agent/extensions/feature-workflow/**
+!agent/extensions/build-workflow
+!agent/extensions/build-workflow/**
 !agent/extensions/project-memory
 !agent/extensions/project-memory/**
 

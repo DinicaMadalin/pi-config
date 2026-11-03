@@ -1,5 +1,5 @@
 /**
- * Route pin: another extension (the /feature workflow) can fix how new prompts in a session are routed,
+ * Route pin: another extension (the /build workflow) can fix how new prompts in a session are routed,
  * so each phase gets its intended route. Stored as a session entry, so it survives reloads and can be
  * written into a fresh session before its first prompt.
  */

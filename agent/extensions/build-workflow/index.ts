@@ -1,13 +1,13 @@
 /**
- * /feature: plan with the expert tier, implement in a fresh session on the model and thinking level Jev picks
+ * /build: plan with the expert tier, implement in a fresh session on the model and thinking level Jev picks
  * from the task's difficulty, then have the expert review, with at most one fix round and re-review.
  *
- * - /feature <task>: the expert investigates and plans; nothing is edited until you agree and it saves the plan.
- * - /feature implement: a fresh session gets the plan as a brief (what and how to implement, the rule files,
+ * - /build <task>: the expert investigates and plans; nothing is edited until you agree and it saves the plan.
+ * - /build implement: a fresh session gets the plan as a brief (what and how to implement, the rule files,
  *   how to write the code). When the implementer ends with IMPLEMENTATION: done, the expert reviews.
  * - A review ending with REVIEW_VERDICT: fix sends the findings to an implementer (again picked by difficulty)
  *   once, then the expert re-reviews.
- * - /feature status, /feature stop. The router also suggests /feature when a prompt looks like a medium+ feature.
+ * - /build status, /build stop. The router also suggests /build when a prompt looks like a medium+ feature.
  *
  * Phase routes reach the auto model through its route pin (auto-model/route-pin.ts), so tier lists,
  * login checks and failover still apply.
@@ -29,7 +29,7 @@ import {
 	stepAfterTurn,
 } from "./workflow-state.ts";
 
-const STATUS_KEY = "feature";
+const STATUS_KEY = "build";
 const AUTO_MODEL = { provider: "auto", id: "auto" } as const;
 const SAVE_PLAN_TOOL_NAME = "save_agreed_plan";
 const FILE_EDITING_TOOLS = new Set(["edit", "write"]);
@@ -37,17 +37,17 @@ const RULE_FILE_NAMES = ["AGENTS.md", "CLAUDE.md"];
 const GLOBAL_RULE_FILE = join(homedir(), ".pi", "agent", "AGENTS.md");
 const FEATURE_TASK_KINDS: ReadonlySet<TaskKind> = new Set(["feature_planning", "feature_build"]);
 const WORKFLOW_SUGGESTION =
-	"Tip: this looks like a feature. /feature <task> has the expert plan it, a model fit for its difficulty implement it, and the expert review it";
-const USAGE = "Usage: /feature <task> | /feature implement | /feature status | /feature stop";
+	"Tip: this looks like a feature. /build <task> has the expert plan it, a model fit for its difficulty implement it, and the expert review it";
+const USAGE = "Usage: /build <task> | /build implement | /build status | /build stop";
 
 const PHASE_LABELS: Record<WorkflowState["phase"], string> = {
 	idle: "",
-	plan: "feature: plan (expert)",
-	"awaiting-implementation": "feature: plan agreed, /feature implement",
-	implement: "feature: implement",
-	review: "feature: review (expert)",
-	fix: "feature: fix",
-	"re-review": "feature: re-review (expert)",
+	plan: "build: plan (expert)",
+	"awaiting-implementation": "build: plan agreed, /build implement",
+	implement: "build: implement",
+	review: "build: review (expert)",
+	fix: "build: fix",
+	"re-review": "build: re-review (expert)",
 };
 
 function lastAssistantText(ctx: ExtensionContext): string {
@@ -102,7 +102,7 @@ export default function (pi: ExtensionAPI) {
 		if (ctx.model?.provider === AUTO_MODEL.provider && ctx.model.id === AUTO_MODEL.id) return true;
 		const autoModel = ctx.modelRegistry.find(AUTO_MODEL.provider, AUTO_MODEL.id);
 		if (!autoModel || !(await pi.setModel(autoModel))) {
-			ctx.ui.notify("/feature needs the auto model (auto/auto) to switch tiers per phase; it is not available", "error");
+			ctx.ui.notify("/build needs the auto model (auto/auto) to switch tiers per phase; it is not available", "error");
 			return false;
 		}
 		return true;
@@ -116,7 +116,7 @@ export default function (pi: ExtensionAPI) {
 
 	async function startImplementation(ctx: ExtensionCommandContext): Promise<void> {
 		if (workflow.phase !== "awaiting-implementation") {
-			const hint = workflow.phase === "plan" ? "agree on the plan first, so the planner saves it" : "start with /feature <task>";
+			const hint = workflow.phase === "plan" ? "agree on the plan first, so the planner saves it" : "start with /build <task>";
 			ctx.ui.notify(`No agreed plan to implement yet: ${hint}`, "warning");
 			return;
 		}
@@ -148,7 +148,7 @@ export default function (pi: ExtensionAPI) {
 
 	function stopWorkflow(ctx: ExtensionContext, summary: string): void {
 		enterPhase(IDLE_WORKFLOW, ctx);
-		if (ctx.hasUI) ctx.ui.notify(`Feature workflow finished: ${summary}. Back to normal auto routing.`, "info");
+		if (ctx.hasUI) ctx.ui.notify(`Build workflow finished: ${summary}. Back to normal auto routing.`, "info");
 	}
 
 	function continueWorkflow(ctx: ExtensionContext): void {
@@ -160,7 +160,7 @@ export default function (pi: ExtensionAPI) {
 		}
 		if (step.kind === "wait") {
 			const isWaitingOnPlan = workflow.phase === "plan" || workflow.phase === "awaiting-implementation";
-			if (!isWaitingOnPlan && ctx.hasUI) ctx.ui.notify(`Feature workflow paused: ${step.reason}. Reply to continue.`, "info");
+			if (!isWaitingOnPlan && ctx.hasUI) ctx.ui.notify(`Build workflow paused: ${step.reason}. Reply to continue.`, "info");
 			return;
 		}
 		const ruleFilesPromise = findRuleFiles(pi, ctx.cwd);
@@ -189,7 +189,7 @@ export default function (pi: ExtensionAPI) {
 
 	pi.on("tool_call", (event) => {
 		if (canEditFiles(workflow.phase) || !FILE_EDITING_TOOLS.has(event.toolName)) return undefined;
-		return { block: true, reason: `/feature ${workflow.phase} phase: only the implementer edits files` };
+		return { block: true, reason: `/build ${workflow.phase} phase: only the implementer edits files` };
 	});
 
 	pi.on("tool_execution_end", (event, ctx) => {
@@ -204,7 +204,7 @@ export default function (pi: ExtensionAPI) {
 		if (event.aborted || workflow.phase === "idle") return;
 		if (workflow.phase === "awaiting-implementation") {
 			if (!ctx.hasUI) return;
-			ctx.ui.setEditorText("/feature implement");
+			ctx.ui.setEditorText("/build implement");
 			ctx.ui.notify(`Plan saved at ${workflow.planPath}. Press Enter to implement it in a fresh session.`, "info");
 			return;
 		}
@@ -219,12 +219,12 @@ export default function (pi: ExtensionAPI) {
 		sessionCtx.ui.notify(WORKFLOW_SUGGESTION, "info");
 	});
 
-	pi.registerCommand("feature", {
-		description: "Plan (expert) -> implement (fresh session, model by difficulty) -> review (expert): /feature <task> | implement | status | stop",
+	pi.registerCommand("build", {
+		description: "Plan (expert) -> implement (fresh session, model by difficulty) -> review (expert): /build <task> | implement | status | stop",
 		handler: async (args, ctx) => {
 			const argument = args.trim();
 			if (!ctx.isIdle()) {
-				ctx.ui.notify("Wait for the agent to finish, then run /feature again", "warning");
+				ctx.ui.notify("Wait for the agent to finish, then run /build again", "warning");
 				return;
 			}
 			switch (argument) {
@@ -232,10 +232,10 @@ export default function (pi: ExtensionAPI) {
 					ctx.ui.notify(USAGE, "info");
 					return;
 				case "status":
-					ctx.ui.notify(workflow.phase === "idle" ? "No feature workflow running" : PHASE_LABELS[workflow.phase], "info");
+					ctx.ui.notify(workflow.phase === "idle" ? "No build workflow running" : PHASE_LABELS[workflow.phase], "info");
 					return;
 				case "stop":
-					if (workflow.phase === "idle") ctx.ui.notify("No feature workflow running", "info");
+					if (workflow.phase === "idle") ctx.ui.notify("No build workflow running", "info");
 					else stopWorkflow(ctx, "stopped");
 					return;
 				case "implement":
@@ -243,7 +243,7 @@ export default function (pi: ExtensionAPI) {
 					return;
 				default:
 					if (workflow.phase !== "idle") {
-						ctx.ui.notify(`A feature workflow is running (${PHASE_LABELS[workflow.phase]}); /feature stop first`, "warning");
+						ctx.ui.notify(`A build workflow is running (${PHASE_LABELS[workflow.phase]}); /build stop first`, "warning");
 						return;
 					}
 					await startWorkflow(argument, ctx);

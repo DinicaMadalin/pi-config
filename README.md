@@ -11,7 +11,7 @@ Deliberately **not** in this repo: credentials, chat history, and generated inst
 | `agent/settings.json` | Preferences, default model, and the `packages` list |
 | `agent/extensions/auto-model/` | Custom extension: rates task difficulty and routes model + thinking level (feature/architecture planning, code review, and GitHub issue investigation always go to the expert tier at high or xhigh thinking), fails over to the next model, learns from your reactions to its answers |
 | `agent/extensions/quality-gate/` | Custom extension: runs typecheck/lint/test after the agent changes files, `/checks`, `/ship` |
-| `agent/extensions/feature-workflow/` | Custom extension: `/feature <task>` plans with the expert tier, implements in a fresh session on the model and thinking Jev picks by difficulty, then the expert reviews (one fix round); needs `auto-model` and `project-memory` |
+| `agent/extensions/build-workflow/` | Custom extension: `/build <task>` plans with the expert tier, implements in a fresh session on the model and thinking Jev picks by difficulty, then the expert reviews (one fix round); needs `auto-model` and `project-memory` |
 | `agent/extensions/project-memory/` | Custom extension: per-repo notes and agreed plans in `.scratch/`, `/note`, `/notes`, `/handoff` |
 | `agent/extensions/guardrails.json` | Guardrails policy config |
 | `install.sh` | Copies the above into `~/.pi/agent` and installs declared packages |
@@ -57,7 +57,7 @@ each custom extension directory wholesale so files deleted upstream disappear to
 
 | Extension | How it syncs |
 |---|---|
-| `auto-model`, `quality-gate`, `project-memory`, `feature-workflow` (yours) | Source copied from `agent/extensions/<name>/` |
+| `auto-model`, `quality-gate`, `project-memory`, `build-workflow` (yours) | Source copied from `agent/extensions/<name>/` |
 | `billion-context`, `pi-subagents`, `pi-jev`, `@aliou/pi-guardrails`, `@earendil-works/pi-voice` | Declared in `settings.json` `packages`, installed by `pi update --extensions` |
 
 `settings.json` sets `defaultProvider`/`defaultModel` to `auto`, which the

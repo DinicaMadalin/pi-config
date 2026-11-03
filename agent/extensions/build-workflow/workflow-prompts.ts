@@ -1,5 +1,5 @@
 /**
- * The messages each /feature phase sends. Pure text builders, so they can be read and tested in one place.
+ * The messages each /build phase sends. Pure text builders, so they can be read and tested in one place.
  */
 import {
 	IMPLEMENTATION_BLOCKED_MARKER,
@@ -17,7 +17,7 @@ function listRuleFiles(ruleFilePaths: readonly string[]): string {
 
 export function planningPrompt(task: string): string {
 	return [
-		"[/feature, phase 1 of 3: PLAN] You are the expert planner. Another model will implement your plan in a fresh",
+		"[/build, phase 1 of 3: PLAN] You are the expert planner. Another model will implement your plan in a fresh",
 		"session with no access to this conversation, and you will review its work afterwards.",
 		"",
 		`Task: ${task}`,
@@ -34,13 +34,13 @@ export function planningPrompt(task: string): string {
 		"     test style), each with an existing file to copy the style from.",
 		"   - Acceptance criteria: the observable behavior plus the exact typecheck, lint and test commands.",
 		"   - Files: every file to create or change, one line each.",
-		"5. After saving, tell me the plan path and that `/feature implement` starts the implementation.",
+		"5. After saving, tell me the plan path and that `/build implement` starts the implementation.",
 	].join("\n");
 }
 
 export function implementationBrief(planPath: string, plan: string, ruleFilePaths: readonly string[]): string {
 	return [
-		"[/feature, phase 2 of 3: IMPLEMENT] You are the implementer. An expert planned this work with me and I agreed to the",
+		"[/build, phase 2 of 3: IMPLEMENT] You are the implementer. An expert planned this work with me and I agreed to the",
 		`plan below (saved at ${planPath}). Implement exactly this plan. An expert reviews your work against it afterwards.`,
 		"",
 		"## What to implement",
@@ -90,7 +90,7 @@ function diffCommand(baseCommit: string | undefined): string {
 
 export function reviewPrompt(planPath: string, baseCommit: string | undefined, ruleFilePaths: readonly string[]): string {
 	return [
-		"[/feature, phase 3 of 3: REVIEW] You are the expert reviewer. The implementer says the work is done.",
+		"[/build, phase 3 of 3: REVIEW] You are the expert reviewer. The implementer says the work is done.",
 		`Review it against the agreed plan at ${planPath}. Do not edit any file.`,
 		"",
 		`1. Read the plan. Run \`git status\` and ${diffCommand(baseCommit)}, and read new untracked files and every changed`,
@@ -114,7 +114,7 @@ export function reviewPrompt(planPath: string, baseCommit: string | undefined, r
 /** Quotes the review so the fix request is self-contained: the router rates its difficulty from this prompt. */
 export function fixPrompt(reviewReport: string): string {
 	return [
-		"[/feature: FIX] You are the implementer again. Fix every must-fix finding of this review:",
+		"[/build: FIX] You are the implementer again. Fix every must-fix finding of this review:",
 		"",
 		reviewReport.trim(),
 		"",
@@ -127,7 +127,7 @@ export function fixPrompt(reviewReport: string): string {
 
 export function reReviewPrompt(baseCommit: string | undefined): string {
 	return [
-		"[/feature: RE-REVIEW] You are the expert reviewer again. The implementer addressed your review.",
+		"[/build: RE-REVIEW] You are the expert reviewer again. The implementer addressed your review.",
 		`Check each must-fix finding is resolved (or rightly rejected), using ${diffCommand(baseCommit)} and the changed files,`,
 		"rerun the checks, and look for new problems the fixes introduced. Do not edit any file.",
 		"Use the same report format as your review.",
