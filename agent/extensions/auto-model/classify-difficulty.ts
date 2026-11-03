@@ -29,14 +29,31 @@ export type DifficultyRating =
 			tier: DifficultyTier;
 			thinkingLevel: RoutedThinkingLevel;
 			confidence: number;
-			/** Feature or architecture planning, code review, or GitHub issue investigation; routed to IMPORTANT_TASK_ROUTE. */
-			isImportant: boolean;
+			taskKind: TaskKind;
 			previousTierFit?: { fit: PreviousTierFit; confidence: number };
 	  }
 	| { kind: "unavailable"; reason: string };
 
-/** Bool answers are probabilities; above this the prompt counts as important work. */
-const IMPORTANT_TASK_PROBABILITY = 0.5;
+export const TASK_KINDS = ["feature_planning", "code_review", "issue_investigation", "feature_build", "other"] as const;
+export type TaskKind = (typeof TASK_KINDS)[number];
+
+/** Routed to IMPORTANT_TASK_TIER whatever their rated difficulty. */
+export const IMPORTANT_TASK_KINDS: ReadonlySet<TaskKind> = new Set(["feature_planning", "code_review", "issue_investigation"]);
+
+const TASK_KIND_CRITERIA: Record<TaskKind, string> = {
+	feature_planning:
+		"Asks to plan, design, or propose an approach for a feature or an architecture change of medium or larger size " +
+		"before implementing it, or continues such a planning discussion",
+	code_review: "Asks to review code: a code review of a diff, branch, PR, or files, or continues such a review",
+	issue_investigation:
+		"Asks to investigate, triage, reproduce, or find the root cause of a GitHub issue (a link, an issue number, " +
+		"or pasted issue text), or continues such an investigation",
+	feature_build:
+		"Asks to directly implement a new feature or an architecture change of medium or larger size, with no agreed plan yet",
+	other:
+		"Anything else: planning or making a small change (a rename, a one-line fix), implementing an already agreed plan, " +
+		"ordinary coding, questions, or chit-chat",
+};
 
 const TIER_FIT_CRITERIA: Record<PreviousTierFit, string> = {
 	too_weak:
@@ -157,20 +174,12 @@ export async function rateTaskDifficulty(
 			},
 			questions: {
 				...(previousExchange ? { previousTierFit: tierFitQuestion } : {}),
-				isImportant: {
-					type: "bool",
+				taskKind: {
+					type: "choice",
 					instructions:
-						"Is `prompt` asking for planning, a code review, or investigating a GitHub issue? `earlierPrompts` are " +
-						"previous requests in the same session; a follow-up that continues such a discussion counts too.",
-					criteria: {
-						true:
-							"Asks to plan, design, or propose an approach for a feature or an architecture change of medium or larger " +
-							"size before implementing it; or to review code (a code review of a diff, branch, PR, or files); or to " +
-							"investigate, triage, reproduce, or find the root cause of a GitHub issue (a link, an issue number, or pasted issue text)",
-						false:
-							"Anything else: planning a tiny change (a rename, a one-line fix), implementing an already agreed plan, " +
-							"ordinary coding, questions, or chit-chat",
-					},
+						"What kind of work does `prompt` ask for? `earlierPrompts` are previous requests in the same session; " +
+						"a follow-up that continues a planning, review, or investigation discussion keeps that kind.",
+					criteria: TASK_KIND_CRITERIA,
 				},
 				difficulty: {
 					type: "choice",
@@ -209,13 +218,17 @@ export async function rateTaskDifficulty(
 		fitAnswer?.type === "choice" && PREVIOUS_TIER_FITS.includes(fitAnswer.choice as PreviousTierFit)
 			? { fit: fitAnswer.choice as PreviousTierFit, confidence: fitAnswer.confidence }
 			: undefined;
-	const importantAnswer = result.answers.isImportant;
+	const taskKindAnswer = result.answers.taskKind;
+	const taskKind =
+		taskKindAnswer?.type === "choice" && TASK_KINDS.includes(taskKindAnswer.choice as TaskKind)
+			? (taskKindAnswer.choice as TaskKind)
+			: "other";
 	return {
 		kind: "rated",
 		tier: answer.choice as DifficultyTier,
 		thinkingLevel: thinkingAnswer.choice as RoutedThinkingLevel,
 		confidence: answer.confidence,
-		isImportant: importantAnswer?.type === "bool" && importantAnswer.probability > IMPORTANT_TASK_PROBABILITY,
+		taskKind,
 		previousTierFit,
 	};
 }

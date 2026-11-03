@@ -8,8 +8,10 @@
  * - Tool follow-ups and retries stay on the model and thinking level of the turn (keeps the prompt cache).
  * - No footer status of its own: Pi's footer already shows the routed model and thinking level.
  *   It also clears pi-jev's idle "jev: ready" status so the footer stays two lines.
- * - A tier's minThinkingLevel raises Jev's thinking pick (trivial and standard: at least medium).
- * - Feature/architecture planning, code review, and GitHub issue investigation always go to the expert tier at high thinking.
+ * - A tier's minThinkingLevel raises Jev's thinking pick (trivial and standard: at least medium, expert: at least high).
+ * - Feature/architecture planning, code review, and GitHub issue investigation always go to the expert tier
+ *   (thinking high, or xhigh when Jev rates the task that deep).
+ * - Route pin: a session entry (see route-pin.ts) fixes a tier, or difficulty-only rating, for new prompts; /feature uses it.
  * - Selected thinking level is a quality bias: low = one tier cheaper, high = one tier stronger.
  * - Failover: a failed response Pi will not retry benches that model for 5 minutes and resends
  *   the request, so the router picks the next model of the tier (at most twice per prompt).
@@ -30,13 +32,20 @@ import type {
 	ModelRouteRequest,
 	ProjectedSessionEntry,
 } from "@earendil-works/pi-coding-agent";
-import { findPreviousExchange, hasTypesafeApiKey, latestUserMessageHasImage, rateTaskDifficulty } from "./classify-difficulty.ts";
+import {
+	findPreviousExchange,
+	hasTypesafeApiKey,
+	IMPORTANT_TASK_KINDS,
+	latestUserMessageHasImage,
+	rateTaskDifficulty,
+	type TaskKind,
+} from "./classify-difficulty.ts";
 import {
 	applyQualityBias,
 	applyThinkingFloor,
 	DIFFICULTY_TIERS,
 	type DifficultyTier,
-	IMPORTANT_TASK_ROUTE,
+	IMPORTANT_TASK_TIER,
 	modelKey,
 	pickModelForTier,
 	type RoutedThinkingLevel,
@@ -52,6 +61,7 @@ import {
 	recordRoutingCorrection,
 } from "./routing-feedback.ts";
 import { loadTierPolicies, TIER_CONFIG_PATH } from "./tier-config.ts";
+import { findRoutePin, TASK_KIND_EVENT } from "./route-pin.ts";
 
 const FALLBACK_TIER: DifficultyTier = "standard";
 /** Compaction summaries and other out-of-loop requests need solid but not top-tier quality. */
@@ -69,10 +79,11 @@ interface AutoRouteState {
 
 type AutoRouteRequest = ModelRouteRequest<AutoRouteState>;
 
-/** Runtime memory of one extension instance: which models failed and how many failovers this prompt used. */
+/** Runtime state of one extension instance: failed models, failovers this prompt, and where task kinds are announced. */
 interface RouterMemory {
 	benchedModels: BenchedModels;
 	failoversThisPrompt: number;
+	announceTaskKind: (taskKind: TaskKind) => void;
 }
 
 function usableModels(memory: RouterMemory, ctx: ExtensionContext): Model<Api>[] {
@@ -136,10 +147,14 @@ function learnFromPreviousTask(
 async function rateTier(
 	request: AutoRouteRequest,
 	policies: TierPolicies,
+	announceTaskKind: (taskKind: TaskKind) => void,
+	isDifficultyOnly: boolean,
 	ctx: ExtensionContext,
 ): Promise<{ tier: DifficultyTier; thinkingLevel: RoutedThinkingLevel }> {
 	const calibration = pickCalibrationExamples(loadRoutingCorrections(), ctx.cwd);
-	const previousExchange = request.state ? findPreviousExchange(request.messages, request.state.tier) : undefined;
+	// A pinned workflow phase is not a reaction to the previous answer, so there is nothing to learn from.
+	const previousExchange =
+		request.state && !isDifficultyOnly ? findPreviousExchange(request.messages, request.state.tier) : undefined;
 	const rating = await rateTaskDifficulty(request.messages, calibration, previousExchange, ctx, request.signal);
 	if (rating.kind === "unavailable" && ctx.hasUI) {
 		ctx.ui.notify(`Auto model: difficulty rating failed (${rating.reason}); using previous or "${FALLBACK_TIER}" tier`, "warning");
@@ -149,7 +164,12 @@ async function rateTier(
 			? learnFromPreviousTask(previousExchange.prompt, previousExchange.routedTier, rating.previousTierFit, ctx)
 			: undefined;
 	const classifiedTier = rating.kind === "rated" ? rating.tier : (request.state?.tier ?? FALLBACK_TIER);
-	if (rating.kind === "rated" && rating.isImportant) return IMPORTANT_TASK_ROUTE;
+	if (rating.kind === "rated" && !isDifficultyOnly) {
+		announceTaskKind(rating.taskKind);
+		if (IMPORTANT_TASK_KINDS.has(rating.taskKind)) {
+			return { tier: IMPORTANT_TASK_TIER, thinkingLevel: applyThinkingFloor(rating.thinkingLevel, policies[IMPORTANT_TASK_TIER]) };
+		}
+	}
 	const isRedoOfWeakAnswer = rating.kind === "rated" && rating.previousTierFit?.fit === "too_weak";
 	const tierAfterLearning = isRedoOfWeakAnswer ? raiseToCorrectedTier(classifiedTier, correctedPreviousTier) : classifiedTier;
 	const tier = applyQualityBias(tierAfterLearning, request.thinkingLevel);
@@ -163,7 +183,14 @@ async function routeNewTask(
 	ctx: ExtensionContext,
 ): Promise<ModelRoute<AutoRouteState>> {
 	const policies = loadTierPolicies();
-	const { tier, thinkingLevel } = await rateTier(request, policies, ctx);
+	const pin = findRoutePin(ctx.sessionManager.getBranch());
+	const isDifficultyOnly = pin.route !== "normal";
+	const rated = await rateTier(request, policies, memory.announceTaskKind, isDifficultyOnly, ctx);
+	// A pinned tier keeps Jev's thinking depth, raised to that tier's minimum.
+	const { tier, thinkingLevel } =
+		pin.route === "tier"
+			? { tier: pin.tier, thinkingLevel: applyThinkingFloor(rated.thinkingLevel, policies[pin.tier]) }
+			: rated;
 
 	// Same tier as the running model: keep it instead of paying a cache miss for an equal model.
 	const previous = request.previous?.model;
@@ -255,7 +282,11 @@ function describeTierAvailability(memory: RouterMemory, ctx: ExtensionContext): 
 }
 
 export default function (pi: ExtensionAPI) {
-	const memory: RouterMemory = { benchedModels: new BenchedModels(), failoversThisPrompt: 0 };
+	const memory: RouterMemory = {
+		benchedModels: new BenchedModels(),
+		failoversThisPrompt: 0,
+		announceTaskKind: (taskKind) => pi.events.emit(TASK_KIND_EVENT, taskKind),
+	};
 
 	pi.registerVirtualModel<AutoRouteState>({
 		provider: "auto",

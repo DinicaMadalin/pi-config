@@ -40,17 +40,17 @@ export const DEFAULT_TIER_POLICIES: TierPolicies = {
 	expert: {
 		models: ["anthropic/claude-opus-5-5"],
 		thinkingLevel: "high",
+		// Jev may still pick xhigh for the hardest tasks.
+		minThinkingLevel: "high",
 	},
 };
 
 /**
- * Important work always gets the strongest tier at high thinking, whatever its rated difficulty:
- * planning decides everything built after it, and reviews and issue investigation are where shallow answers cost most.
+ * Important work always gets the strongest tier, whatever its rated difficulty, with at least that tier's
+ * minimum thinking: planning decides everything built after it, and reviews and issue investigation are
+ * where shallow answers cost most.
  */
-export const IMPORTANT_TASK_ROUTE = { tier: "expert", thinkingLevel: "high" } as const satisfies {
-	tier: DifficultyTier;
-	thinkingLevel: RoutedThinkingLevel;
-};
+export const IMPORTANT_TASK_TIER: DifficultyTier = "expert";
 
 /**
  * The virtual thinking level the user selects acts as a quality bias:

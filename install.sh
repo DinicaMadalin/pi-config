@@ -22,7 +22,7 @@ mkdir -p "$agent_dir/extensions"
 cp "$repo_dir/agent/AGENTS.md" "$repo_dir/agent/settings.json" "$agent_dir/"
 cp "$repo_dir/agent/extensions/guardrails.json" "$agent_dir/extensions/"
 # Replace each directory whole so files deleted upstream disappear here too.
-for extension_name in auto-model quality-gate project-memory; do
+for extension_name in auto-model quality-gate project-memory feature-workflow; do
 	rm -rf "$agent_dir/extensions/$extension_name"
 	cp -R "$repo_dir/agent/extensions/$extension_name" "$agent_dir/extensions/"
 done
