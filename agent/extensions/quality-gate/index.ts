@@ -2,7 +2,8 @@
  * Quality gate: the project's typecheck, lint, and test commands guard "done" and "ship".
  *
  * - Auto-verify: when the agent finishes a prompt that changed files, the checks run. A failure
- *   goes back to the agent to fix (at most two fix rounds per prompt); a pass is a short notice.
+ *   goes back to the agent to fix what its changes broke (at most two fix rounds per prompt); errors
+ *   already in the repo are only reported, unless the user asked for them to be fixed. A pass is a short notice.
  * - /checks: show and run the checks now. /checks off|on toggles auto-verify for this session.
  * - /ship: run the checks, then have the agent review the diff, commit in the repo's style, and push.
  *
@@ -10,6 +11,7 @@
  */
 import { createHash } from "node:crypto";
 import type { AgentBeforeSettleEvent, BoundaryResult, ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { checkFailureMessage } from "./check-failure-report.ts";
 import { type CheckRun, describeFailedCheck, runProjectChecks } from "./check-runner.ts";
 import { CHECKS_CONFIG_RELATIVE_PATH, findProjectChecks, type ProjectChecks } from "./project-checks.ts";
 
@@ -22,6 +24,11 @@ const FAILURE_MESSAGE_TYPE = "quality-gate-failure";
 interface PromptCycle {
 	/** Hash of `git status` + `git diff HEAD` when the prompt arrived; undefined outside a git repo. */
 	workingTreeAtStart?: string;
+	/** Commit holding the tracked files as they were when the prompt arrived (HEAD when clean); undefined outside git. */
+	commitAtStart?: string;
+	untrackedFilesAtStart: ReadonlySet<string>;
+	/** Working tree hash when the last failure went back to the agent; unchanged since means it chose not to fix. */
+	workingTreeAtLastFailureReport?: string;
 	editedFilesWithTools: boolean;
 	fixRounds: number;
 	/** A /ship prompt commits files; verifying its own commit would be noise. */
@@ -43,6 +50,27 @@ async function snapshotWorkingTree(pi: ExtensionAPI, cwd: string): Promise<strin
 	if (status.code !== 0) return undefined;
 	const diff = await pi.exec("git", ["diff", "HEAD", "--no-ext-diff"], { cwd });
 	return createHash("sha256").update(status.stdout).update(diff.stdout).digest("hex");
+}
+
+/** `git stash create` records the working tree as a commit without touching it; it prints nothing for a clean tree. */
+async function snapshotCommit(pi: ExtensionAPI, cwd: string): Promise<string | undefined> {
+	const stash = await pi.exec("git", ["stash", "create"], { cwd });
+	if (stash.code === 0 && stash.stdout.trim()) return stash.stdout.trim();
+	const head = await pi.exec("git", ["rev-parse", "HEAD"], { cwd });
+	return head.code === 0 ? head.stdout.trim() : undefined;
+}
+
+async function listUntrackedFiles(pi: ExtensionAPI, cwd: string): Promise<Set<string>> {
+	const untracked = await pi.exec("git", ["ls-files", "--others", "--exclude-standard"], { cwd });
+	return new Set(untracked.code === 0 ? untracked.stdout.split("\n").filter(Boolean) : []);
+}
+
+async function listFilesChangedSince(pi: ExtensionAPI, cycle: PromptCycle, cwd: string): Promise<string[]> {
+	if (!cycle.commitAtStart) return [];
+	const tracked = await pi.exec("git", ["diff", "--name-only", cycle.commitAtStart], { cwd });
+	const trackedChanges = tracked.code === 0 ? tracked.stdout.split("\n").filter(Boolean) : [];
+	const newUntracked = [...(await listUntrackedFiles(pi, cwd))].filter((path) => !cycle.untrackedFilesAtStart.has(path));
+	return [...new Set([...trackedChanges, ...newUntracked])];
 }
 
 async function hasChangedFiles(pi: ExtensionAPI, cycle: PromptCycle, cwd: string): Promise<boolean> {
@@ -85,12 +113,21 @@ export default function (pi: ExtensionAPI) {
 			return undefined;
 		}
 		const failure = describeFailedCheck(run, projectChecks.timeoutMs);
+		const workingTreeNow = await snapshotWorkingTree(pi, ctx.cwd);
+		const agentLeftFailureAsIs =
+			cycle.workingTreeAtLastFailureReport !== undefined && workingTreeNow === cycle.workingTreeAtLastFailureReport;
+		if (agentLeftFailureAsIs) {
+			ctx.ui.notify(`Checks still fail, left as is (the agent reports it as pre-existing): ${failure}`, "warning");
+			return undefined;
+		}
 		if (cycle.fixRounds >= MAX_FIX_ROUNDS_PER_PROMPT) {
 			ctx.ui.notify(`Checks still failing after ${MAX_FIX_ROUNDS_PER_PROMPT} fix rounds: ${failure}`, "error");
 			return undefined;
 		}
 		cycle.fixRounds++;
-		const content = `Project checks failed after your changes: ${failure}. Fix the cause (never skip or loosen the check), then stop.\n\n\`\`\`\n${run.outputTail}\n\`\`\``;
+		cycle.workingTreeAtLastFailureReport = workingTreeNow;
+		const changedFiles = await listFilesChangedSince(pi, cycle, ctx.cwd);
+		const content = checkFailureMessage({ description: failure, outputTail: run.outputTail, changedFiles });
 		return { entries: [{ type: "custom_message", customType: FAILURE_MESSAGE_TYPE, content, display: true }], continue: true };
 	}
 
@@ -98,6 +135,8 @@ export default function (pi: ExtensionAPI) {
 		if (cycle) return; // a steer or follow-up joins the running prompt
 		cycle = {
 			workingTreeAtStart: await snapshotWorkingTree(pi, ctx.cwd),
+			commitAtStart: await snapshotCommit(pi, ctx.cwd),
+			untrackedFilesAtStart: await listUntrackedFiles(pi, ctx.cwd),
 			editedFilesWithTools: false,
 			fixRounds: 0,
 			isShipping: isShipRequested,
