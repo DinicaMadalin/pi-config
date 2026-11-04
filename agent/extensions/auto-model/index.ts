@@ -61,6 +61,7 @@ import {
 	recordRoutingCorrection,
 } from "./routing-feedback.ts";
 import { loadTierPolicies, TIER_CONFIG_PATH } from "./tier-config.ts";
+import { describeTierBasis, ROUTE_DECISION_ENTRY_TYPE, type RouteDecision, type TierBasis } from "./route-decision.ts";
 import { findRoutePin, TASK_KIND_EVENT } from "./route-pin.ts";
 
 const FALLBACK_TIER: DifficultyTier = "standard";
@@ -84,6 +85,7 @@ interface RouterMemory {
 	benchedModels: BenchedModels;
 	failoversThisPrompt: number;
 	announceTaskKind: (taskKind: TaskKind) => void;
+	recordRouteDecision: (decision: RouteDecision) => void;
 }
 
 function usableModels(memory: RouterMemory, ctx: ExtensionContext): Model<Api>[] {
@@ -150,7 +152,7 @@ async function rateTier(
 	announceTaskKind: (taskKind: TaskKind) => void,
 	isDifficultyOnly: boolean,
 	ctx: ExtensionContext,
-): Promise<{ tier: DifficultyTier; thinkingLevel: RoutedThinkingLevel }> {
+): Promise<{ tier: DifficultyTier; thinkingLevel: RoutedThinkingLevel; basis: TierBasis }> {
 	const calibration = pickCalibrationExamples(loadRoutingCorrections(), ctx.cwd);
 	// A pinned workflow phase is not a reaction to the previous answer, so there is nothing to learn from.
 	const previousExchange =
@@ -167,14 +169,22 @@ async function rateTier(
 	if (rating.kind === "rated" && !isDifficultyOnly) {
 		announceTaskKind(rating.taskKind);
 		if (IMPORTANT_TASK_KINDS.has(rating.taskKind)) {
-			return { tier: IMPORTANT_TASK_TIER, thinkingLevel: applyThinkingFloor(rating.thinkingLevel, policies[IMPORTANT_TASK_TIER]) };
+			return {
+				tier: IMPORTANT_TASK_TIER,
+				thinkingLevel: applyThinkingFloor(rating.thinkingLevel, policies[IMPORTANT_TASK_TIER]),
+				basis: { kind: "important-task", taskKind: rating.taskKind },
+			};
 		}
 	}
 	const isRedoOfWeakAnswer = rating.kind === "rated" && rating.previousTierFit?.fit === "too_weak";
 	const tierAfterLearning = isRedoOfWeakAnswer ? raiseToCorrectedTier(classifiedTier, correctedPreviousTier) : classifiedTier;
 	const tier = applyQualityBias(tierAfterLearning, request.thinkingLevel);
 	const ratedOrFallbackLevel = rating.kind === "rated" ? rating.thinkingLevel : policies[tier].thinkingLevel;
-	return { tier, thinkingLevel: applyThinkingFloor(ratedOrFallbackLevel, policies[tier]) };
+	const basis: TierBasis =
+		rating.kind === "rated"
+			? { kind: "rated", ratedTier: rating.tier, confidence: rating.confidence }
+			: { kind: "rating-unavailable" };
+	return { tier, thinkingLevel: applyThinkingFloor(ratedOrFallbackLevel, policies[tier]), basis };
 }
 
 async function routeNewTask(
@@ -187,10 +197,15 @@ async function routeNewTask(
 	const isDifficultyOnly = pin.route !== "normal";
 	const rated = await rateTier(request, policies, memory.announceTaskKind, isDifficultyOnly, ctx);
 	// A pinned tier keeps Jev's thinking depth, raised to that tier's minimum.
-	const { tier, thinkingLevel } =
+	const { tier, thinkingLevel, basis } =
 		pin.route === "tier"
-			? { tier: pin.tier, thinkingLevel: applyThinkingFloor(rated.thinkingLevel, policies[pin.tier]) }
+			? {
+					tier: pin.tier,
+					thinkingLevel: applyThinkingFloor(rated.thinkingLevel, policies[pin.tier]),
+					basis: { kind: "pinned" } as const,
+				}
 			: rated;
+	memory.recordRouteDecision({ tier, thinkingLevel, reason: describeTierBasis(basis, tier) });
 
 	// Same tier as the running model: keep it instead of paying a cache miss for an equal model.
 	const previous = request.previous?.model;
@@ -286,6 +301,7 @@ export default function (pi: ExtensionAPI) {
 		benchedModels: new BenchedModels(),
 		failoversThisPrompt: 0,
 		announceTaskKind: (taskKind) => pi.events.emit(TASK_KIND_EVENT, taskKind),
+		recordRouteDecision: (decision) => pi.appendEntry<RouteDecision>(ROUTE_DECISION_ENTRY_TYPE, decision),
 	};
 
 	pi.registerVirtualModel<AutoRouteState>({

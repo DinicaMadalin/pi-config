@@ -7,7 +7,7 @@
  *   how to write the code). When the implementer ends with IMPLEMENTATION: done, the expert reviews.
  * - A review ending with REVIEW_VERDICT: fix sends the findings to an implementer (again picked by difficulty)
  *   once, then the expert re-reviews.
- * - /build status, /build stop. The router also suggests /build when a prompt looks like a medium+ feature.
+ * - /build status, /build stop. Alt+A or /agents shows the agents overview (agents-overview-panel.ts). The router also suggests /build when a prompt looks like a medium+ feature.
  * - /issue <url | #123>: same workflow for a GitHub issue, on a new branch from the default branch; the expert
  *   investigates instead of planning, and after a passing review /issue pr (prefilled, you confirm) commits,
  *   pushes and opens a draft PR that fixes the issue.
@@ -21,6 +21,7 @@ import { join } from "node:path";
 import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import type { TaskKind } from "../auto-model/classify-difficulty.ts";
 import { ROUTE_PIN_ENTRY_TYPE, type RoutePin, TASK_KIND_EVENT } from "../auto-model/route-pin.ts";
+import { registerAgentsOverview } from "./agents-overview-panel.ts";
 import { createIssueBranch, fetchIssue, openDraftPullRequest, parseIssueArgument, type RunCommand } from "./github-issue.ts";
 import {
 	fixPrompt,
@@ -105,6 +106,7 @@ export default function (pi: ExtensionAPI) {
 	let workflow: WorkflowState = IDLE_WORKFLOW;
 	let hasSuggestedWorkflow = false;
 	let sessionCtx: ExtensionContext | undefined;
+	registerAgentsOverview(pi);
 
 	function showPhase(ctx: ExtensionContext): void {
 		if (ctx.hasUI) ctx.ui.setStatus(STATUS_KEY, phaseLabel(workflow) || undefined);
