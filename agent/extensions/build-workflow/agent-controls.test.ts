@@ -37,8 +37,10 @@ test("a failed re-review offers fix again, review again and accept, where accept
 	assert.ok(controls[2].confirmation);
 });
 
-test("passed work waiting to ship or for its PR can be reviewed again", () => {
-	assert.deepEqual(keysOf(controlsFor(timeline("awaiting-ship", []), { kind: "none" })), ["R"]);
+test("passed work waiting to ship or for its PR can be reviewed again, after a second R so a stray key starts nothing", () => {
+	const shipControls = controlsFor(timeline("awaiting-ship", []), { kind: "none" });
+	assert.deepEqual(keysOf(shipControls), ["R"]);
+	assert.ok(shipControls[0].confirmation);
 	assert.deepEqual(keysOf(controlsFor(timeline("awaiting-pr", []), { kind: "none" })), ["R"]);
 });
 

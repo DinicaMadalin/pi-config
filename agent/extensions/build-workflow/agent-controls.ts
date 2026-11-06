@@ -52,7 +52,12 @@ function agentControls(timeline: BuildTimeline, agent: BuildAgentKey): ControlKe
 
 function runControls(timeline: BuildTimeline): ControlKey[] {
 	if (timeline.isFinished) return [];
-	const reReview: ControlKey = { key: "R", label: "review again", command: { kind: "run", control: "re-review" } };
+	const reReview: ControlKey = {
+		key: "R",
+		label: "review again",
+		confirmation: "run both reviewers again",
+		command: { kind: "run", control: "re-review" },
+	};
 	switch (timeline.phase) {
 		case "review-failed":
 			return [

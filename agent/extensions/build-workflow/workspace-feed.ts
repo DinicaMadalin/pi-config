@@ -138,11 +138,13 @@ export class WorkspaceFeed {
 		);
 	}
 
-	/** A run in progress or an agent at work: worth a pane beside the chat. */
+	/**
+	 * A subagent working or waiting for the planner, or a delegate running: worth a pane beside the chat.
+	 * A run that waits on you (to ship, or after a failed re-review) is not; the strip and Alt+A show it.
+	 */
 	get hasAgentsAtWork(): boolean {
 		return (
-			(this.timeline !== undefined && !this.timeline.isFinished) ||
-			this.orchestrator.liveStages().length > 0 ||
+			this.orchestrator.liveStages().some((live) => live.process.isWorking || live.condition === "waiting-for-planner") ||
 			this.delegates.some((delegate) => delegate.status === "running")
 		);
 	}
