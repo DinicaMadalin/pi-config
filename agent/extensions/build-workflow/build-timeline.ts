@@ -233,6 +233,7 @@ function statusOfRow(
 	if (stage === "plan") return plannerStatus(run.phase, isPlannerRunning);
 	if (stage === "pr") return run.phase === "awaiting-pr" ? "your-turn" : "waiting";
 	if (stage === "ship") return run.phase === "awaiting-ship" ? "your-turn" : "waiting";
+	if (stage === "re-review" && run.phase === "review-failed") return "your-turn";
 	if (stage === run.phase) {
 		const isWorking = live.some((view) => view.stage === stage && view.reviewer === reviewer && view.isWorking);
 		if (isWorking) return "working";

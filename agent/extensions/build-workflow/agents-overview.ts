@@ -669,6 +669,8 @@ export class AgentsOverview implements Component, Focusable {
 				return "press Enter on /issue pr to open the draft PR";
 			case "ship":
 				return "confirm shipping, or run /build ship";
+			case "re-review":
+				return "still has findings: /build implement to fix again, accept, or review again";
 			default:
 				return "agree on the plan; the implementer then starts";
 		}

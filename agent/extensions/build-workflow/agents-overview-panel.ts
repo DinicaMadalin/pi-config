@@ -18,7 +18,7 @@ import {
 	type RepoLocation,
 	SPINNER_FRAME_MS,
 } from "./agents-overview.ts";
-import { type BuildOrchestrator, type SubagentRole, stageStats } from "./build-orchestrator.ts";
+import { type AgentCondition, type BuildOrchestrator, type SubagentRole, stageStats } from "./build-orchestrator.ts";
 import { type BuildTimeline, buildTimeline, type LiveStageView, type TimelineEntry } from "./build-timeline.ts";
 import {
 	cancelDelegate,
@@ -30,7 +30,8 @@ import {
 } from "./delegate-runs.ts";
 import { loadFileDiff } from "./file-diff.ts";
 import type { HighlightCode } from "./file-diff-view.ts";
-import type { RunCommand } from "./github-issue.ts";
+import type { PlannerSession } from "./planner-session.ts";
+import { findRepoRoot } from "./repo-files.ts";
 import { loadWorkChanges } from "./work-changes.ts";
 import { REVIEWER_VENDORS, reviewerRole, WORKFLOW_STATE_ENTRY_TYPE } from "./workflow-state.ts";
 
@@ -72,15 +73,26 @@ const highlightForPath: HighlightCode = (codeLines, path) => {
 	return highlightCode(codeLines.join("\n"), language);
 };
 
+/** The widget's word for a subagent that is not working right now. */
+function conditionText(condition: AgentCondition, name: string, theme: ExtensionContext["ui"]["theme"]): string {
+	switch (condition) {
+		case "waiting-for-planner":
+			return theme.fg("warning", `${name} waits for the planner`);
+		case "answered":
+			return theme.fg("success", `${name} done`);
+		case "crashed":
+			return theme.fg("error", `${name} stopped, Alt+A r restarts`);
+		case "running":
+		case "stopped":
+			return theme.fg("warning", `${name} paused`);
+	}
+}
+
 function hasWorkflowEntries(entries: readonly TimelineEntry[]): boolean {
 	return entries.some((entry) => entry.type === "custom" && entry.customType === WORKFLOW_STATE_ENTRY_TYPE);
 }
 
-export function registerAgentsOverview(
-	pi: ExtensionAPI,
-	orchestrator: BuildOrchestrator,
-	sendToPlanner: (message: string) => void,
-): void {
+export function registerAgentsOverview(pi: ExtensionAPI, session: PlannerSession, orchestrator: BuildOrchestrator): void {
 	let sessionCtx: ExtensionContext | undefined;
 	let planner = new AgentTracker();
 	let openOverview: OpenOverview | undefined;
@@ -115,9 +127,7 @@ export function registerAgentsOverview(
 		if (!baseCommit || isLoadingChanges || !sessionCtx) return;
 		if (changes.kind === "not-started") changes = { kind: "loading" };
 		isLoadingChanges = true;
-		const cwd = sessionCtx.cwd;
-		const run: RunCommand = (command, args) => pi.exec(command, args, { cwd });
-		void loadWorkChanges(run, baseCommit)
+		void loadWorkChanges(session.run, baseCommit)
 			.then((result) => {
 				changes = { kind: "loaded", result };
 			})
@@ -192,7 +202,7 @@ export function registerAgentsOverview(
 			result[role] = {
 				activity: subagent.tracker.activity.recent(50),
 				runningTool: subagent.tracker.stats.runningTool,
-				messageBlocker: subagent.isRunning ? undefined : `The ${subagent.name} is not running; /build implement restarts it`,
+				messageBlocker: subagent.isRunning ? undefined : `The ${subagent.name} is not running; /build implement resumes the run`,
 			};
 		}
 		return result;
@@ -203,24 +213,26 @@ export function registerAgentsOverview(
 		const subagentRole = SUBAGENT_ROLES.find((role) => role === agent);
 		if (subagentRole) return orchestrator.sendToSubagent(subagentRole, text);
 		planner.activity.add("you", text, Date.now());
-		sendToPlanner(text);
+		session.sendToPlanner(text);
 		return undefined;
 	}
 
-	async function readRepoLocation(cwd: string): Promise<RepoLocation | undefined> {
-		const topLevel = await pi.exec("git", ["rev-parse", "--show-toplevel"], { cwd });
-		if (topLevel.code !== 0) return undefined;
-		const branch = await pi.exec("git", ["branch", "--show-current"], { cwd });
-		const repoName = topLevel.stdout.trim().split("/").at(-1) ?? topLevel.stdout.trim();
+	async function readRepoLocation(): Promise<RepoLocation | undefined> {
+		const repoRoot = await findRepoRoot(session.run);
+		if (!repoRoot) return undefined;
+		const branch = await session.run("git", ["branch", "--show-current"]);
+		const repoName = repoRoot.split("/").at(-1) ?? repoRoot;
 		return { repoName, branch: branch.code === 0 && branch.stdout.trim() !== "" ? branch.stdout.trim() : undefined };
 	}
 
 	function showOverview(ctx: ExtensionContext): void {
+		// The overlay asks for its options before the card exists; the terminal's width comes in with the card.
+		let terminalColumns = process.stdout.columns ?? MAX_OVERVIEW_WIDTH;
 		let timeline = readTimeline(ctx);
 		let delegates = readDelegates(ctx);
 		let repo: RepoLocation | undefined;
 		const refreshRepo = (): void => {
-			void readRepoLocation(ctx.cwd)
+			void readRepoLocation()
 				.then((location) => {
 					repo = location;
 				})
@@ -253,7 +265,7 @@ export function registerAgentsOverview(
 					openOverview = undefined;
 					done();
 				};
-				const run: RunCommand = (command, args) => pi.exec(command, args, { cwd: ctx.cwd });
+				terminalColumns = tui.terminal.columns;
 				const overview = new AgentsOverview(
 					theme,
 					readSnapshot,
@@ -263,7 +275,7 @@ export function registerAgentsOverview(
 						loadFileDiff: async (file) => {
 							const baseCommit = timeline?.baseCommit;
 							if (!baseCommit) return { ok: false, error: "The run has no base commit to diff against yet" };
-							return loadFileDiff(run, baseCommit, file);
+							return loadFileDiff(session.run, baseCommit, file);
 						},
 						cancelDelegate: (runId) => {
 							delegateProcessesReadAtMs = 0;
@@ -301,7 +313,7 @@ export function registerAgentsOverview(
 					anchor: "center",
 					width: Math.min(
 						timeline || delegates.length > 0 ? MAX_OVERVIEW_WIDTH : NO_BUILD_WIDTH,
-						Math.max(40, Math.floor((process.stdout.columns ?? MAX_OVERVIEW_WIDTH) * OVERVIEW_WIDTH_SHARE)),
+						Math.max(40, Math.floor(terminalColumns * OVERVIEW_WIDTH_SHARE)),
 					),
 					maxHeight: `${OVERVIEW_HEIGHT_SHARE * 100}%`,
 				}),
@@ -332,7 +344,7 @@ export function registerAgentsOverview(
 			const name = live.process.name;
 			const state = live.process.isWorking
 				? theme.fg("accent", `${name} working ${formatDuration(activeMsOf(stats, nowMs))}`)
-				: theme.fg("warning", orchestrator.isWaitingForPlanner ? `${name} waits for the planner` : `${name} paused`);
+				: conditionText(live.condition, name, theme);
 			const model = stats.model ? theme.fg("muted", ` ${stats.model}`) : "";
 			const tool =
 				liveStages.length === 1 && stats.runningTool

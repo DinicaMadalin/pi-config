@@ -1,9 +1,11 @@
 /**
  * Pure state machine of the /build workflow: plan (expert, in your session) -> implement (a subagent, model
  * picked by difficulty) -> review (two expert subagents, one on Claude and one on OpenAI, in parallel) -> at
- * most one fix (the implementer again) and re-review (both reviewers again). The implementer's questions go to the planner, which answers or asks you.
+ * most one fix (the implementer again) and re-review (both reviewers again). The implementer's questions go to
+ * the planner, which answers or asks you. A re-review that still has findings waits for your decision.
  * Work started from a GitHub issue (/issue) waits for the user to open a draft PR after a passing review;
  * other /build work waits for the user to ship it (new branch, commit, push).
+ * A plan saved again during a run is a plan change; planChangeReaction says what each phase does with it.
  * No Pi runtime imports, so every transition can be unit tested.
  */
 import type { RoutePin } from "../auto-model/route-pin.ts";
@@ -45,6 +47,12 @@ export type SubagentRole = "implementer" | `${ReviewerVendor}-reviewer`;
 
 export const REVIEWER_NAMES: Record<ReviewerVendor, string> = { anthropic: "Claude reviewer", openai: "OpenAI reviewer" };
 
+export const SUBAGENT_NAMES: Record<SubagentRole, string> = {
+	implementer: "Implementer",
+	"anthropic-reviewer": REVIEWER_NAMES.anthropic,
+	"openai-reviewer": REVIEWER_NAMES.openai,
+};
+
 export function reviewerRole(vendor: ReviewerVendor): SubagentRole {
 	return `${vendor}-reviewer`;
 }
@@ -59,39 +67,71 @@ export interface FeatureWork {
 	/** Session files of the subagents, so a reload can resume them with their context. */
 	implementerSession?: string;
 	reviewerSessions?: Partial<Record<ReviewerVendor, string>>;
+	/** The plan's version since implementation started: missing for the first, 2 after the first change. */
+	planRevision?: number;
+	/** Shipping committed the work on this branch but has not pushed it yet; shipping again only pushes. */
+	committedBranch?: string;
 }
+
+/** Phases where the subagents work. */
+export type DelegatedPhase = "implement" | "review" | "fix" | "re-review";
+export const DELEGATED_PHASES: readonly DelegatedPhase[] = ["implement", "review", "fix", "re-review"];
+
+export type ReviewPhase = "review" | "re-review";
 
 export type WorkflowState =
 	| { phase: "idle" }
 	| { phase: "plan"; task: string; issue?: IssueRef }
 	| { phase: "awaiting-implementation"; task: string; planPath: string; issue?: IssueRef }
-	| ({ phase: "implement" } & FeatureWork)
-	| ({ phase: "review" } & FeatureWork)
-	| ({ phase: "fix" } & FeatureWork)
-	| ({ phase: "re-review" } & FeatureWork)
+	| ({ phase: "implement" | "fix" } & FeatureWork)
+	/** planChangeAfterReview: the plan changed during the review; its outcome goes into a change round. */
+	| ({ phase: ReviewPhase; planChangeAfterReview?: boolean } & FeatureWork)
+	/** The re-review still has findings and the fix round is used up: you decide what happens next. */
+	| ({ phase: "review-failed"; findings: string } & FeatureWork)
 	| ({ phase: "awaiting-pr" } & FeatureWork & { issue: IssueRef })
 	| ({ phase: "awaiting-ship" } & FeatureWork);
 
 export type WorkflowPhase = WorkflowState["phase"];
+export type DelegatedState = Extract<WorkflowState, { phase: DelegatedPhase }>;
+/** States once implementation started: they carry the run's plan, commit and subagent sessions. */
+export type FeatureState = Extract<WorkflowState, { phase: DelegatedPhase | "review-failed" | "awaiting-pr" | "awaiting-ship" }>;
+
+const WORKFLOW_PHASES: readonly WorkflowPhase[] = [
+	"idle",
+	"plan",
+	"awaiting-implementation",
+	...DELEGATED_PHASES,
+	"review-failed",
+	"awaiting-pr",
+	"awaiting-ship",
+];
 
 export const IDLE_WORKFLOW: WorkflowState = { phase: "idle" };
 
+/** The run is in a subagent's hands: implementing, reviewing or fixing. */
+export function isDelegatedState(state: WorkflowState): state is DelegatedState {
+	return (DELEGATED_PHASES as readonly WorkflowPhase[]).includes(state.phase);
+}
+
+export function isDelegatedPhase(phase: WorkflowPhase): phase is DelegatedPhase {
+	return (DELEGATED_PHASES as readonly WorkflowPhase[]).includes(phase);
+}
+
+/** Implementation started: the state carries the run's plan, commit and subagent sessions. */
+export function isFeatureState(state: WorkflowState): state is FeatureState {
+	return isDelegatedState(state) || isAwaitingUser(state.phase);
+}
+
+/** The run waits for you: a decision after a failed re-review, a draft PR for /issue, shipping for /build. */
+export function isAwaitingUser(phase: WorkflowPhase): phase is "review-failed" | "awaiting-pr" | "awaiting-ship" {
+	return phase === "review-failed" || phase === "awaiting-pr" || phase === "awaiting-ship";
+}
+
 /** Route of a subagent's session: the reviewer uses the expert; Jev picks the implementer's model by difficulty. */
 export function routeForPhase(phase: WorkflowPhase): RoutePin {
-	switch (phase) {
-		case "plan":
-		case "awaiting-implementation":
-		case "review":
-		case "re-review":
-			return { route: "tier", tier: "expert" };
-		case "implement":
-		case "fix":
-			return { route: "difficulty" };
-		case "idle":
-		case "awaiting-pr":
-		case "awaiting-ship":
-			return { route: "normal" };
-	}
+	if (phase === "implement" || phase === "fix") return { route: "difficulty" };
+	if (phase === "review" || phase === "re-review") return { route: "tier", tier: "expert" };
+	return plannerRouteForPhase(phase);
 }
 
 /** A reviewer's route: the expert tier with its vendor's models first, the other vendor's as fallback. */
@@ -99,29 +139,22 @@ export function reviewerRoute(vendor: ReviewerVendor): RoutePin {
 	return { route: "tier", tier: "expert", preferredProvider: vendor };
 }
 
-/** The run's work is reviewed and waits for the user: a draft PR for /issue, shipping for /build. */
-export function isAwaitingUserRelease(phase: WorkflowPhase): phase is "awaiting-pr" | "awaiting-ship" {
-	return phase === "awaiting-pr" || phase === "awaiting-ship";
-}
-
 /** Route of the planner's session: the expert for the whole run, since it answers the implementer's questions. */
 export function plannerRouteForPhase(phase: WorkflowPhase): RoutePin {
-	return phase === "idle" || isAwaitingUserRelease(phase) ? { route: "normal" } : { route: "tier", tier: "expert" };
+	return phase === "idle" || isAwaitingUser(phase) ? { route: "normal" } : { route: "tier", tier: "expert" };
 }
 
-/** In a subagent's session: only the implementer edits; the reviewer must not change files. */
+/** In a subagent's session: only the implementer edits; the reviewers must not change files. */
 export function canEditFiles(phase: WorkflowPhase): boolean {
-	return phase === "idle" || phase === "implement" || phase === "fix" || isAwaitingUserRelease(phase);
+	return phase === "idle" || phase === "implement" || phase === "fix";
 }
 
-/** In the planner's session: no edits while a run is on, so the planner never races the implementer. */
+/**
+ * In the planner's session: no edits during a run, so the planner never races the implementer and nothing
+ * unreviewed gets shipped. Changes go through the plan: saving it again starts a change round.
+ */
 export function canPlannerEditFiles(phase: WorkflowPhase): boolean {
-	return phase === "idle" || isAwaitingUserRelease(phase);
-}
-
-/** The run is in a subagent's hands: implementing, reviewing or fixing. */
-export function isDelegatedPhase(phase: WorkflowPhase): phase is "implement" | "review" | "fix" | "re-review" {
-	return phase === "implement" || phase === "review" || phase === "fix" || phase === "re-review";
+	return phase === "idle";
 }
 
 interface SessionEntryLike {
@@ -130,12 +163,33 @@ interface SessionEntryLike {
 	data?: unknown;
 }
 
+/** A stored state, or undefined when the entry data is not one (e.g. written by an older version). */
+function parseWorkflowState(data: unknown): WorkflowState | undefined {
+	if (typeof data !== "object" || data === null) return undefined;
+	const phase = (data as { phase?: unknown }).phase;
+	if (!WORKFLOW_PHASES.includes(phase as WorkflowPhase)) return undefined;
+	if (phase !== "idle" && phase !== "plan" && typeof (data as { planPath?: unknown }).planPath !== "string") return undefined;
+	return data as WorkflowState;
+}
+
 export function findWorkflowState(branchEntries: readonly SessionEntryLike[]): WorkflowState {
 	for (let index = branchEntries.length - 1; index >= 0; index--) {
 		const entry = branchEntries[index];
-		if (entry.type === "custom" && entry.customType === WORKFLOW_STATE_ENTRY_TYPE) return entry.data as WorkflowState;
+		if (entry.type !== "custom" || entry.customType !== WORKFLOW_STATE_ENTRY_TYPE) continue;
+		return parseWorkflowState(entry.data) ?? IDLE_WORKFLOW;
 	}
 	return IDLE_WORKFLOW;
+}
+
+/** The plan of the session's last run that got as far as an agreed plan, e.g. to start a new run from it. */
+export function findLastRunPlan(branchEntries: readonly SessionEntryLike[]): { task: string; planPath: string } | undefined {
+	for (let index = branchEntries.length - 1; index >= 0; index--) {
+		const entry = branchEntries[index];
+		if (entry.type !== "custom" || entry.customType !== WORKFLOW_STATE_ENTRY_TYPE) continue;
+		const state = parseWorkflowState(entry.data);
+		if (state?.phase === "awaiting-implementation") return { task: state.task, planPath: state.planPath };
+	}
+	return undefined;
 }
 
 /** Last marker line wins, so a quoted marker earlier in the answer does not count. */
@@ -148,59 +202,88 @@ function lastMarker(answer: string, markers: readonly string[]): string | undefi
 	return markers.find((marker) => lastLine?.startsWith(marker));
 }
 
+export function hasReviewVerdict(answer: string): boolean {
+	return lastMarker(answer, [REVIEW_PASS_MARKER, REVIEW_FIX_MARKER]) !== undefined;
+}
+
 /** What the workflow does after an agent turn settles in a phase. */
 export type WorkflowStep =
 	| { kind: "wait"; reason: string }
 	| { kind: "ask-planner"; implementerAnswer: string }
-	| { kind: "advance"; next: WorkflowState }
-	| { kind: "finish"; summary: string };
+	| { kind: "advance"; next: WorkflowState };
 
-function featureWorkOf(state: FeatureWork): FeatureWork {
+/** The run's lasting facts, without the fields that only belong to one phase. */
+export function featureWorkOf(state: FeatureWork): FeatureWork {
 	const work: FeatureWork = { planPath: state.planPath, baseCommit: state.baseCommit };
 	if (state.issue) work.issue = state.issue;
 	if (state.planIssue) work.planIssue = state.planIssue;
 	if (state.implementerSession) work.implementerSession = state.implementerSession;
 	if (state.reviewerSessions) work.reviewerSessions = state.reviewerSessions;
+	if (state.planRevision) work.planRevision = state.planRevision;
+	if (state.committedBranch) work.committedBranch = state.committedBranch;
 	return work;
 }
 
 /** After a passing review the user releases the work: /issue opens a draft PR, /build ships a branch. */
-function stepAfterPassingReview(work: FeatureWork): WorkflowStep {
-	if (!work.issue) return { kind: "advance", next: { phase: "awaiting-ship", ...featureWorkOf(work) } };
-	return { kind: "advance", next: { phase: "awaiting-pr", ...featureWorkOf(work), issue: work.issue } };
+export function releaseStateOf(work: FeatureWork): WorkflowState {
+	if (!work.issue) return { phase: "awaiting-ship", ...featureWorkOf(work) };
+	return { phase: "awaiting-pr", ...featureWorkOf(work), issue: work.issue };
 }
 
-/** What a subagent's settled turn means for the run; the implementer's questions and stalls go to the planner. */
-export function stepAfterTurn(state: WorkflowState, lastAnswer: string): WorkflowStep {
+/** What a subagent stage's settled turn means for the run; the implementer's questions and stalls go to the planner. */
+export function stepAfterTurn(state: DelegatedState, stageAnswer: string): WorkflowStep {
 	switch (state.phase) {
-		case "idle":
-		case "plan":
-		case "awaiting-implementation":
-			return { kind: "wait", reason: "the plan needs your agreement" };
-		case "awaiting-pr":
-			return { kind: "wait", reason: "run /issue pr to open the draft pull request" };
-		case "awaiting-ship":
-			return { kind: "wait", reason: "run /build ship to commit and push the work on a new branch" };
 		case "implement":
 		case "fix": {
-			const marker = lastMarker(lastAnswer, [IMPLEMENTATION_DONE_MARKER, IMPLEMENTATION_BLOCKED_MARKER]);
-			if (marker !== IMPLEMENTATION_DONE_MARKER) return { kind: "ask-planner", implementerAnswer: lastAnswer };
+			const marker = lastMarker(stageAnswer, [IMPLEMENTATION_DONE_MARKER, IMPLEMENTATION_BLOCKED_MARKER]);
+			if (marker !== IMPLEMENTATION_DONE_MARKER) return { kind: "ask-planner", implementerAnswer: stageAnswer };
 			return { kind: "advance", next: { phase: state.phase === "implement" ? "review" : "re-review", ...featureWorkOf(state) } };
 		}
-		case "review": {
-			const verdict = lastMarker(lastAnswer, [REVIEW_PASS_MARKER, REVIEW_FIX_MARKER]);
-			if (verdict === REVIEW_PASS_MARKER) return stepAfterPassingReview(state);
-			if (verdict === REVIEW_FIX_MARKER) {
-				return { kind: "advance", next: { phase: "fix", ...featureWorkOf(state) } };
-			}
-			return { kind: "wait", reason: "the review ended without a verdict" };
-		}
+		case "review":
 		case "re-review": {
-			const verdict = lastMarker(lastAnswer, [REVIEW_PASS_MARKER, REVIEW_FIX_MARKER]);
-			if (verdict === REVIEW_PASS_MARKER) return stepAfterPassingReview(state);
-			return { kind: "finish", summary: "the re-review still has findings; the fix round is used up, over to you" };
+			if (state.planChangeAfterReview) return { kind: "advance", next: { phase: "implement", ...featureWorkOf(state) } };
+			const verdict = lastMarker(stageAnswer, [REVIEW_PASS_MARKER, REVIEW_FIX_MARKER]);
+			if (verdict === REVIEW_PASS_MARKER) return { kind: "advance", next: releaseStateOf(state) };
+			if (verdict === undefined) return { kind: "wait", reason: "a reviewer ended without a verdict" };
+			if (state.phase === "review") return { kind: "advance", next: { phase: "fix", ...featureWorkOf(state) } };
+			return { kind: "advance", next: { phase: "review-failed", ...featureWorkOf(state), findings: stageAnswer } };
 		}
 	}
+}
+
+/**
+ * What saving the plan again means in each phase:
+ * - ask-to-start: still planning, so you are asked how to start (again)
+ * - tell-implementer: the implementer gets the change right away
+ * - ask-about-review: the reviewers check the old plan; you choose to stop them or apply the change after them
+ * - change-round: the work was reviewed; the implementer applies the change and both reviewers review again
+ * - offer-new-run: no run is on; you may start a new one from the saved plan
+ */
+export type PlanChangeReaction = "ask-to-start" | "tell-implementer" | "ask-about-review" | "change-round" | "offer-new-run";
+
+export function planChangeReaction(phase: WorkflowPhase): PlanChangeReaction {
+	switch (phase) {
+		case "plan":
+		case "awaiting-implementation":
+			return "ask-to-start";
+		case "implement":
+		case "fix":
+			return "tell-implementer";
+		case "review":
+		case "re-review":
+			return "ask-about-review";
+		case "review-failed":
+		case "awaiting-pr":
+		case "awaiting-ship":
+			return "change-round";
+		case "idle":
+			return "offer-new-run";
+	}
+}
+
+/** The run's state once a plan change was counted. */
+export function withPlanRevision<State extends FeatureWork>(state: State): State {
+	return { ...state, planRevision: (state.planRevision ?? 1) + 1 };
 }
 
 export interface ReviewerAnswer {
@@ -249,7 +332,7 @@ export const BUILD_STAGE_ENTRY_TYPE = "build-workflow-stage";
 
 /** A subagent stage that finished, stored in the planner's session for the agents overview and the report. */
 export interface StageRecord {
-	stage: "implement" | "review" | "fix" | "re-review";
+	stage: DelegatedPhase;
 	/** Which reviewer, in the review stages. */
 	reviewer?: ReviewerVendor;
 	model?: string;
@@ -259,4 +342,21 @@ export interface StageRecord {
 	costUsd: number;
 	/** The subagent's last answer: its report, or the review's findings. */
 	report: string;
+}
+
+/**
+ * Stage records stored after the latest state for which isBefore holds, oldest first. E.g. the run's records
+ * stop at its plan phase; the current review's records stop at the first state of another phase.
+ */
+export function stageRecordsSince(branchEntries: readonly SessionEntryLike[], isBefore: (state: WorkflowState) => boolean): StageRecord[] {
+	const records: StageRecord[] = [];
+	for (let index = branchEntries.length - 1; index >= 0; index--) {
+		const entry = branchEntries[index];
+		if (entry.type !== "custom") continue;
+		if (entry.customType === BUILD_STAGE_ENTRY_TYPE) records.unshift(entry.data as StageRecord);
+		if (entry.customType !== WORKFLOW_STATE_ENTRY_TYPE) continue;
+		const state = parseWorkflowState(entry.data);
+		if (state && isBefore(state)) break;
+	}
+	return records;
 }

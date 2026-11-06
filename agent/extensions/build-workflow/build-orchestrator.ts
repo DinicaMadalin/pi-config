@@ -1,16 +1,18 @@
 /**
- * Runs the delegated part of a /build run: the implementer and the two reviewers (one on Claude, one on
- * OpenAI, reviewing in parallel) are subagent processes, the planner stays in your session. Moves the run along when a subagent settles, sends the implementer's
- * questions to the planner and its answers back, and posts a report when the run ends.
+ * Runs the delegated part of a /build run: the implementer and the two reviewers (one on Claude, one on OpenAI,
+ * reviewing in parallel) are subagent processes, the planner stays in your session. Moves the run along when a
+ * subagent settles, sends the implementer's questions to the planner and its answers back, applies plan changes,
+ * lets you stop, restart or message each agent, and posts a report when the run ends.
  */
 import { randomUUID } from "node:crypto";
 import { existsSync } from "node:fs";
 import { join } from "node:path";
 import { ROUTE_PIN_ENTRY_TYPE } from "../auto-model/route-pin.ts";
 import { activeMsOf } from "./agent-activity.ts";
-import { createSubagentSessionFile, type SubagentDialogs, SubagentProcess } from "./subagent-process.ts";
+import { createSubagentSessionFile, type LaunchSubagent, launchSubagentProcess, type Subagent, type SubagentDialogs } from "./subagent-process.ts";
 import {
 	fixPrompt,
+	planChangePrompt,
 	plannerAnswerPrompt,
 	plannerQuestionPrompt,
 	reReviewPrompt,
@@ -19,11 +21,18 @@ import {
 	runReport,
 } from "./workflow-prompts.ts";
 import {
+	type DelegatedPhase,
+	type DelegatedState,
+	type FeatureState,
 	type FeatureWork,
-	isDelegatedPhase,
+	featureWorkOf,
+	hasReviewVerdict,
+	isAwaitingUser,
+	isDelegatedState,
+	isFeatureState,
 	mergeReviews,
 	readPlannerAnswer,
-	REVIEWER_NAMES,
+	releaseStateOf,
 	REVIEWER_VENDORS,
 	type ReviewerVendor,
 	reviewerRole,
@@ -31,15 +40,16 @@ import {
 	routeForPhase,
 	type StageRecord,
 	stepAfterTurn,
+	SUBAGENT_NAMES,
 	type SubagentRole,
 	WORKFLOW_STATE_ENTRY_TYPE,
 	type WorkflowState,
+	withPlanRevision,
 } from "./workflow-state.ts";
 
 export type { SubagentRole };
-type DelegatedState = Extract<WorkflowState, { phase: StageRecord["stage"] }>;
 
-/** What the orchestrator needs from the planner's session; index.ts implements it with the Pi API. */
+/** What the orchestrator needs from the planner's session; planner-seat.ts implements it with the Pi API. */
 export interface PlannerSeat {
 	cwd(): string;
 	/** Directory for the subagents' session files, next to the planner's. */
@@ -49,33 +59,37 @@ export interface PlannerSeat {
 	enterPhase(next: WorkflowState): void;
 	appendStage(record: StageRecord): void;
 	/** Stages of the current run already stored in the planner's session. */
-	stageRecords(): StageRecord[];
+	runStageRecords(): StageRecord[];
+	/** Stages stored since the current phase began; a resumed review keeps the verdicts it already has. */
+	currentStageRecords(): StageRecord[];
+	readPlan(planPath: string): string | undefined;
 	ruleFiles(): Promise<string[]>;
 	/** "+120 −8 in 5 files" since the base commit, or undefined when it cannot be counted. */
 	describeChanges(baseCommit: string | undefined): Promise<string | undefined>;
 	askPlanner(prompt: string): void;
 	postReport(report: string): void;
 	notify(message: string, level: "info" | "warning" | "error"): void;
-	/** The run ended: idle, or awaiting the user's PR for issue work. */
+	/** The subagents are done: the run waits for the user (decision, PR, ship) or is idle. */
 	finish(next: WorkflowState, summary: string): void;
 	dialogs: SubagentDialogs;
 }
 
-/** A subagent's stage in progress; its numbers are the process totals minus those at the stage's start. */
+/**
+ * How a subagent of the current stage stands. running: it works or will on its next prompt; answered: a reviewer
+ * gave its report and waits for the other; stopped: you stopped its turn; crashed: its process is gone.
+ */
+export type AgentCondition = "running" | "waiting-for-planner" | "answered" | "stopped" | "crashed";
+
+/** A subagent's part in the current stage; its numbers are the process totals minus those at the stage's start. */
 export interface LiveStage {
-	stage: StageRecord["stage"];
+	stage: DelegatedPhase;
 	role: SubagentRole;
 	reviewer?: ReviewerVendor;
-	process: SubagentProcess;
+	process: Subagent;
+	condition: AgentCondition;
 	startCostUsd: number;
 	startActiveMs: number;
 }
-
-const ROLE_NAMES: Record<SubagentRole, string> = {
-	implementer: "Implementer",
-	"anthropic-reviewer": REVIEWER_NAMES.anthropic,
-	"openai-reviewer": REVIEWER_NAMES.openai,
-};
 
 /** One subagent per stage of the implementer; a review stage runs a reviewer of each vendor. */
 interface StageSeat {
@@ -83,7 +97,7 @@ interface StageSeat {
 	reviewer?: ReviewerVendor;
 }
 
-function seatsOfStage(stage: StageRecord["stage"]): StageSeat[] {
+function seatsOfStage(stage: DelegatedPhase): StageSeat[] {
 	if (stage === "implement" || stage === "fix") return [{ role: "implementer" }];
 	return REVIEWER_VENDORS.map((vendor) => ({ role: reviewerRole(vendor), reviewer: vendor }));
 }
@@ -100,30 +114,35 @@ export function stageStats(live: LiveStage, nowMs: number): { activeMs: number; 
 	};
 }
 
+/** A refusal shown to the user, or undefined when the action was taken. */
+export type ActionRefusal = string | undefined;
+
 export class BuildOrchestrator {
 	private readonly seat: PlannerSeat;
-	private readonly processes = new Map<SubagentRole, SubagentProcess>();
-	private readonly live = new Map<SubagentRole, LiveStage>();
+	private readonly launchSubagent: LaunchSubagent;
+	private readonly processes = new Map<SubagentRole, Subagent>();
+	private readonly agents = new Map<SubagentRole, LiveStage>();
 	/** Latest answer of each reviewer in the current review stage; the stage moves on once both answered. */
 	private readonly reviewAnswers = new Map<ReviewerVendor, string>();
-	/** The implementer waits for the planner's answer. */
-	private isAwaitingPlanner = false;
+	/** Bumped by stop(): a step of a stopped run that was waiting on I/O sees the change and drops out. */
+	private generation = 0;
 
-	constructor(seat: PlannerSeat) {
+	constructor(seat: PlannerSeat, launchSubagent: LaunchSubagent = launchSubagentProcess) {
 		this.seat = seat;
+		this.launchSubagent = launchSubagent;
 	}
 
-	process(role: SubagentRole): SubagentProcess | undefined {
+	process(role: SubagentRole): Subagent | undefined {
 		return this.processes.get(role);
 	}
 
 	/** The subagents of the current stage: the implementer, or both reviewers. */
 	liveStages(): LiveStage[] {
-		return [...this.live.values()];
+		return [...this.agents.values()];
 	}
 
 	get isWaitingForPlanner(): boolean {
-		return this.isAwaitingPlanner;
+		return this.agents.get("implementer")?.condition === "waiting-for-planner";
 	}
 
 	/** Plan agreed: start the implementer on the brief, with the planner's session left as it is. */
@@ -135,54 +154,168 @@ export class BuildOrchestrator {
 		this.beginStage(state, () => brief);
 	}
 
-	/** After a reload: restart the subagents of the current phase on their sessions and let them continue. */
-	resume(): boolean {
+	/** After a reload: restart the subagents of the current phase that still owe an answer, and let them continue. */
+	resume(): ActionRefusal {
 		const state = this.seat.state();
-		if (!isDelegatedPhase(state.phase)) return false;
-		const delegated = state as DelegatedState;
-		const missing = seatsOfStage(delegated.phase).find((seat) => {
-			const sessionPath = sessionOfSeat(delegated, seat);
+		if (!isDelegatedState(state)) return "No subagent stage to resume";
+		if (this.agents.size > 0) return "The run is already going; Alt+A shows it";
+		const missing = seatsOfStage(state.phase).find((seat) => {
+			const sessionPath = sessionOfSeat(state, seat);
 			return !sessionPath || !existsSync(sessionPath);
 		});
-		if (missing) {
-			this.seat.notify(
-				`Cannot resume: the ${ROLE_NAMES[missing.role]}'s session file is missing. /build stop, then start again.`,
-				"error",
-			);
-			return false;
-		}
-		this.beginStage(delegated, () => resumePrompt());
-		return true;
+		if (missing) return `Cannot resume: the ${SUBAGENT_NAMES[missing.role]}'s session file is missing. /build stop, then start again.`;
+		const answered = this.answeredReviews(state);
+		this.beginStage(state, () => resumePrompt(), answered);
+		if (this.liveStages().every((live) => live.condition === "answered")) this.moveOnFromReviews(state);
+		return undefined;
 	}
 
 	/** The planner's turn settled; if it answered the implementer, pass the answer on. */
 	handlePlannerReply(reply: string): void {
-		if (!this.isAwaitingPlanner) return;
+		if (!this.isWaitingForPlanner) return;
 		const plannerAnswer = readPlannerAnswer(reply);
 		if (plannerAnswer.kind === "none") return;
 		if (plannerAnswer.kind === "needs-user") {
 			this.seat.notify("The implementer is waiting: answer the planner's question, and it passes your answer on", "info");
 			return;
 		}
-		this.isAwaitingPlanner = false;
-		const implementer = this.ensureProcess({ role: "implementer" }, this.seat.state() as DelegatedState);
-		implementer?.prompt(plannerAnswerPrompt(plannerAnswer.answer));
+		this.promptAgent("implementer", plannerAnswerPrompt(plannerAnswer.answer));
 	}
 
-	/** A message typed in the agents overview. */
-	sendToSubagent(role: SubagentRole, text: string): string | undefined {
+	/** The planner's turn was aborted while the implementer waited on it. */
+	handlePlannerAborted(): void {
+		if (!this.isWaitingForPlanner) return;
+		this.seat.notify("The implementer still waits for the planner's answer: reply to the planner, or message the implementer (Alt+A)", "warning");
+	}
+
+	/** A message you typed in the agents overview. */
+	sendToSubagent(role: SubagentRole, text: string): ActionRefusal {
 		const subagent = this.processes.get(role);
-		if (!subagent?.isRunning) return `The ${ROLE_NAMES[role]} is not running`;
+		if (!subagent?.isRunning) return `The ${SUBAGENT_NAMES[role]} is not running; r restarts it`;
 		subagent.sendUserMessage(text);
+		this.setCondition(role, "running");
 		return undefined;
 	}
 
+	/** Stops the agent's current turn; it keeps its process and context, waiting for a message or a restart. */
+	stopAgentTurn(role: SubagentRole): ActionRefusal {
+		const subagent = this.processes.get(role);
+		if (!subagent?.isRunning || !subagent.isWorking) return `The ${SUBAGENT_NAMES[role]} is not working`;
+		subagent.abortTurn();
+		this.setCondition(role, "stopped");
+		return undefined;
+	}
+
+	/** A fresh process on the agent's session, told to check the work and continue; also brings back a crashed agent. */
+	async restartAgent(role: SubagentRole): Promise<ActionRefusal> {
+		const live = this.agents.get(role);
+		const state = this.seat.state();
+		if (!live || !isDelegatedState(state)) return `The ${SUBAGENT_NAMES[role]} has no work in this stage`;
+		const generation = this.generation;
+		const previous = this.processes.get(role);
+		if (previous) {
+			this.recordUnfinishedStage(live, "(restarted by you)");
+			this.processes.delete(role);
+			await previous.stop();
+		}
+		if (generation !== this.generation) return "The run was stopped";
+		const restarted = this.ensureProcess(live, state);
+		if (!restarted) return `No session file for the ${SUBAGENT_NAMES[role]}`;
+		if (live.reviewer) this.reviewAnswers.delete(live.reviewer);
+		this.agents.set(role, this.liveStageOf(live.stage, live, restarted));
+		restarted.prompt(resumePrompt());
+		return undefined;
+	}
+
+	/** The plan changed while the implementer works on it: it gets the new plan right away. */
+	tellImplementerAboutPlanChange(): ActionRefusal {
+		const state = this.seat.state();
+		if (state.phase !== "implement" && state.phase !== "fix") return "The implementer is not working on the plan now";
+		const plan = this.seat.readPlan(state.planPath);
+		if (plan === undefined) return `Cannot read the plan ${state.planPath}`;
+		this.seat.enterPhase(withPlanRevision(state));
+		this.promptAgent("implementer", planChangePrompt(state.planPath, plan, state.planIssue));
+		return undefined;
+	}
+
+	/** The plan changed during a review: the review finishes, then its findings go into a change round. */
+	applyPlanChangeAfterReview(): ActionRefusal {
+		const state = this.seat.state();
+		if (state.phase !== "review" && state.phase !== "re-review") return "No review is running";
+		this.seat.enterPhase(withPlanRevision({ ...state, planChangeAfterReview: true }));
+		return undefined;
+	}
+
+	/**
+	 * The implementer applies the changed plan now, then both reviewers review again: from a running review
+	 * (which is stopped), after a failed re-review, or from work waiting to ship or for its PR.
+	 */
+	async startChangeRound(): Promise<ActionRefusal> {
+		const state = this.seat.state();
+		if (!isFeatureState(state) || state.phase === "implement" || state.phase === "fix") return "No reviewed work to change";
+		const plan = this.seat.readPlan(state.planPath);
+		if (plan === undefined) return `Cannot read the plan ${state.planPath}`;
+		const generation = await this.stopProcesses();
+		if (generation !== this.generation) return "The run was stopped";
+		const next: DelegatedState = withPlanRevision({ phase: "implement", ...featureWorkOf(state) });
+		this.seat.enterPhase(next);
+		this.beginStage(next, () => planChangePrompt(state.planPath, plan, state.planIssue));
+		return undefined;
+	}
+
+	/** Both reviewers check the work again: after a failed re-review, or before shipping. */
+	async reReview(): Promise<ActionRefusal> {
+		const state = this.seat.state();
+		if (!isAwaitingUser(state.phase) || !isFeatureState(state)) return "Re-review works once a review has finished";
+		const next: DelegatedState = { phase: "re-review", ...featureWorkOf(state) };
+		if (!next.reviewerSessions) return "This run has no reviewer sessions to continue";
+		this.seat.enterPhase(next);
+		this.beginStage(next, () => reReviewPrompt(next.baseCommit));
+		return undefined;
+	}
+
+	/** After a failed re-review: one more fix round on the remaining findings, then a re-review. */
+	fixAgain(): ActionRefusal {
+		const state = this.seat.state();
+		if (state.phase !== "review-failed") return "Another fix round works after a failed re-review";
+		const next: DelegatedState = { phase: "fix", ...featureWorkOf(state) };
+		this.seat.enterPhase(next);
+		this.beginStage(next, () => fixPrompt(state.findings));
+		return undefined;
+	}
+
+	/** After a failed re-review: you accept the work as it is, and it goes on to shipping or its PR. */
+	acceptAnyway(): ActionRefusal {
+		const state = this.seat.state();
+		if (state.phase !== "review-failed") return "Accepting works after a failed re-review";
+		this.seat.finish(releaseStateOf(state), "you accepted the work despite the re-review's findings");
+		return undefined;
+	}
+
+	/** Ends every subagent; steps of this run still waiting on I/O drop out. */
 	stop(): void {
-		for (const subagent of this.processes.values()) subagent.stop();
+		void this.stopProcesses();
+	}
+
+	private async stopProcesses(): Promise<number> {
+		this.generation++;
+		const generation = this.generation;
+		const running = [...this.processes.values()];
 		this.processes.clear();
-		this.live.clear();
+		this.agents.clear();
 		this.reviewAnswers.clear();
-		this.isAwaitingPlanner = false;
+		await Promise.all(running.map((subagent) => subagent.stop()));
+		return generation;
+	}
+
+	/** Reviews of this phase that already ended with a verdict before a reload; those reviewers are not asked again. */
+	private answeredReviews(state: DelegatedState): Map<ReviewerVendor, string> {
+		const answered = new Map<ReviewerVendor, string>();
+		if (state.phase !== "review" && state.phase !== "re-review") return answered;
+		for (const record of this.seat.currentStageRecords()) {
+			if (record.reviewer && record.stage === state.phase && hasReviewVerdict(record.report)) answered.set(record.reviewer, record.report);
+		}
+		return answered;
 	}
 
 	private createSession(state: DelegatedState, seat: StageSeat): string {
@@ -196,20 +329,23 @@ export class BuildOrchestrator {
 		return sessionPath;
 	}
 
-	private ensureProcess(seat: StageSeat, state: DelegatedState): SubagentProcess | undefined {
+	private ensureProcess(seat: StageSeat, state: FeatureWork): Subagent | undefined {
 		const running = this.processes.get(seat.role);
 		if (running?.isRunning) return running;
 		const sessionPath = sessionOfSeat(state, seat);
 		if (!sessionPath) return undefined;
-		const name = ROLE_NAMES[seat.role];
-		const subagent: SubagentProcess = new SubagentProcess({
+		const name = SUBAGENT_NAMES[seat.role];
+		const subagent: Subagent = this.launchSubagent({
 			name,
 			cwd: this.seat.cwd(),
 			sessionPath,
 			dialogs: this.seat.dialogs,
-			onSettled: (lastAnswer, isAborted) => this.handleSubagentSettled(subagent, lastAnswer, isAborted),
+			onSettled: (lastAnswer, isAborted) => {
+				if (this.processes.get(seat.role) === subagent) this.handleSubagentSettled(seat.role, lastAnswer, isAborted);
+			},
 			onExit: (reason) => {
-				this.seat.notify(`/build ${name} stopped (${reason}). /build implement restarts it.`, "error");
+				if (this.processes.get(seat.role) !== subagent) return;
+				this.handleSubagentCrash(seat.role, reason);
 			},
 		});
 		subagent.start();
@@ -217,31 +353,72 @@ export class BuildOrchestrator {
 		return subagent;
 	}
 
-	/** Starts every subagent of the state's stage on the prompt made for it. */
-	private beginStage(state: DelegatedState, promptFor: (seat: StageSeat) => string): void {
-		this.live.clear();
+	private handleSubagentCrash(role: SubagentRole, reason: string): void {
+		this.processes.delete(role);
+		const live = this.agents.get(role);
+		if (!live) return;
+		this.recordUnfinishedStage(live, `(the process stopped: ${reason})`);
+		this.setCondition(role, "crashed");
+		this.seat.notify(`/build: the ${SUBAGENT_NAMES[role]} stopped (${reason}). Alt+A, then r restarts it.`, "error");
+	}
+
+	/** Prompts an agent of the current stage, restarting its process when it is gone. */
+	private promptAgent(role: SubagentRole, prompt: string): void {
+		const live = this.agents.get(role);
+		const state = this.seat.state();
+		if (!live || !isFeatureState(state)) return;
+		const subagent = this.ensureProcess(live, state);
+		if (!subagent) {
+			this.seat.notify(`/build: no session file for the ${SUBAGENT_NAMES[role]}`, "error");
+			return;
+		}
+		if (live.process !== subagent) this.agents.set(role, this.liveStageOf(live.stage, live, subagent));
+		this.setCondition(role, "running");
+		subagent.prompt(prompt);
+	}
+
+	/** Starts the subagents of the state's stage on the prompt made for each; answered reviewers keep their answers. */
+	private beginStage(
+		state: DelegatedState,
+		promptFor: (seat: StageSeat) => string,
+		answered: ReadonlyMap<ReviewerVendor, string> = new Map(),
+	): void {
+		this.agents.clear();
 		this.reviewAnswers.clear();
 		for (const seat of seatsOfStage(state.phase)) {
 			const subagent = this.ensureProcess(seat, state);
 			if (!subagent) {
-				this.seat.notify(`/build: no session for the ${ROLE_NAMES[seat.role]}`, "error");
+				this.seat.notify(`/build: no session file for the ${SUBAGENT_NAMES[seat.role]}`, "error");
 				continue;
 			}
-			this.live.set(seat.role, this.liveStageOf(state.phase, seat, subagent));
+			const live = this.liveStageOf(state.phase, seat, subagent);
+			this.agents.set(seat.role, live);
+			const answer = seat.reviewer ? answered.get(seat.reviewer) : undefined;
+			if (seat.reviewer && answer !== undefined) {
+				this.reviewAnswers.set(seat.reviewer, answer);
+				live.condition = "answered";
+				continue;
+			}
 			subagent.prompt(promptFor(seat));
 		}
 	}
 
-	private liveStageOf(stage: StageRecord["stage"], seat: StageSeat, subagent: SubagentProcess): LiveStage {
+	private liveStageOf(stage: DelegatedPhase, seat: StageSeat, subagent: Subagent): LiveStage {
 		const stats = subagent.tracker.stats;
 		return {
 			stage,
 			role: seat.role,
 			reviewer: seat.reviewer,
 			process: subagent,
+			condition: "running",
 			startCostUsd: stats.costUsd,
 			startActiveMs: activeMsOf(stats, Date.now()),
 		};
+	}
+
+	private setCondition(role: SubagentRole, condition: AgentCondition): void {
+		const live = this.agents.get(role);
+		if (live) live.condition = condition;
 	}
 
 	/** Stores what the subagent did since its stage (or its last record) began; it stays live until the stage ends. */
@@ -257,70 +434,88 @@ export class BuildOrchestrator {
 		};
 		if (live.reviewer) record.reviewer = live.reviewer;
 		this.seat.appendStage(record);
-		this.live.set(live.role, this.liveStageOf(live.stage, live, live.process));
+		this.agents.set(live.role, { ...this.liveStageOf(live.stage, live, live.process), condition: live.condition });
 	}
 
-	private handleSubagentSettled(subagent: SubagentProcess, lastAnswer: string, isAborted: boolean): void {
-		const live = [...this.live.values()].find((stage) => stage.process === subagent);
+	/** Keeps the cost and time of a turn that ended without an answer, so a restart does not lose them. */
+	private recordUnfinishedStage(live: LiveStage, note: string): void {
+		const stats = stageStats(live, Date.now());
+		if (stats.costUsd > 0 || stats.activeMs > 0) this.recordStage(live, note);
+	}
+
+	private handleSubagentSettled(role: SubagentRole, lastAnswer: string, isAborted: boolean): void {
+		const live = this.agents.get(role);
 		const state = this.seat.state();
-		if (isAborted || !live || !isDelegatedPhase(state.phase)) return;
+		if (!live || !isDelegatedState(state) || state.phase !== live.stage) return;
+		if (isAborted) {
+			this.setCondition(role, "stopped");
+			return;
+		}
 		if (!live.reviewer) {
-			this.moveOn(state as DelegatedState, live, lastAnswer, lastAnswer);
+			this.moveOn(state, lastAnswer, () => this.recordStage(live, lastAnswer));
 			return;
 		}
 		this.recordStage(live, lastAnswer);
+		this.setCondition(role, "answered");
 		this.reviewAnswers.set(live.reviewer, lastAnswer);
-		const pendingReviewer = [...this.live.values()].find(
-			(stage) => stage.reviewer && !this.reviewAnswers.has(stage.reviewer),
-		);
+		const pendingReviewer = this.liveStages().find((stage) => stage.reviewer && !this.reviewAnswers.has(stage.reviewer));
 		if (pendingReviewer) {
 			this.seat.notify(`${live.process.name} finished; waiting for the ${pendingReviewer.process.name}`, "info");
 			return;
 		}
-		const reviews = [...this.reviewAnswers].map(([vendor, answer]) => ({ vendor, answer }));
-		this.moveOn(state as DelegatedState, live, mergeReviews(reviews), undefined);
+		this.moveOnFromReviews(state);
 	}
 
-	/**
-	 * Applies the stage's outcome. implementerReport is the implementer's answer to record; reviewers record
-	 * theirs as they settle, since a stage of two reviewers ends with whichever settles last.
-	 */
-	private moveOn(state: DelegatedState, live: LiveStage, stageAnswer: string, implementerReport: string | undefined): void {
+	private moveOnFromReviews(state: DelegatedState): void {
+		const reviews = [...this.reviewAnswers].map(([vendor, answer]) => ({ vendor, answer }));
+		this.moveOn(state, mergeReviews(reviews), () => undefined);
+	}
+
+	/** Applies the stage's outcome; recordImplementer stores the implementer's turn once the stage ends with it. */
+	private moveOn(state: DelegatedState, stageAnswer: string, recordImplementer: () => void): void {
 		const step = stepAfterTurn(state, stageAnswer);
 		switch (step.kind) {
 			case "ask-planner":
-				this.isAwaitingPlanner = true;
+				this.setCondition("implementer", "waiting-for-planner");
 				this.seat.notify("The implementer has a question; the planner answers it", "info");
 				this.seat.askPlanner(plannerQuestionPrompt(step.implementerAnswer));
 				return;
 			case "wait":
-				this.seat.notify(`/build paused: ${step.reason}. Alt+A lets you message the ${live.process.name}.`, "warning");
-				return;
-			case "finish":
-				if (implementerReport !== undefined) this.recordStage(live, implementerReport);
-				this.live.clear();
-				void this.finishRun(state, { phase: "idle" }, step.summary);
+				this.seat.notify(`/build paused: ${step.reason}. Alt+A: message it (m) or restart it (r).`, "warning");
 				return;
 			case "advance":
-				if (implementerReport !== undefined) this.recordStage(live, implementerReport);
-				this.live.clear();
+				recordImplementer();
 				void this.advance(state, step.next, stageAnswer);
 				return;
 		}
 	}
 
 	private async advance(previous: DelegatedState, next: WorkflowState, stageAnswer: string): Promise<void> {
+		const generation = this.generation;
+		this.agents.clear();
+		this.reviewAnswers.clear();
 		switch (next.phase) {
 			case "review": {
+				const ruleFiles = await this.seat.ruleFiles();
+				if (generation !== this.generation) return;
 				const reviewerSessions: Partial<Record<ReviewerVendor, string>> = {};
 				for (const vendor of REVIEWER_VENDORS) {
 					reviewerSessions[vendor] = this.createSession(next, { role: reviewerRole(vendor), reviewer: vendor });
 				}
 				const reviewState: DelegatedState = { ...next, reviewerSessions };
 				this.seat.enterPhase(reviewState);
-				const ruleFiles = await this.seat.ruleFiles();
 				const prompt = reviewPrompt(next.planPath, next.baseCommit, ruleFiles, next.issue, next.planIssue);
 				this.beginStage(reviewState, () => prompt);
+				return;
+			}
+			case "implement": {
+				const plan = this.seat.readPlan(next.planPath);
+				if (plan === undefined) {
+					this.seat.notify(`/build paused: cannot read the plan ${next.planPath}`, "error");
+					return;
+				}
+				this.seat.enterPhase(next);
+				this.beginStage(next, () => planChangePrompt(next.planPath, plan, next.planIssue, stageAnswer));
 				return;
 			}
 			case "fix":
@@ -331,6 +526,9 @@ export class BuildOrchestrator {
 				this.seat.enterPhase(next);
 				this.beginStage(next, () => reReviewPrompt(next.baseCommit));
 				return;
+			case "review-failed":
+				await this.finishRun(previous, next, "the re-review still has findings, and the fix round is used up");
+				return;
 			case "awaiting-pr":
 			case "awaiting-ship":
 				await this.finishRun(previous, next, "both reviewers passed it");
@@ -338,11 +536,11 @@ export class BuildOrchestrator {
 		}
 	}
 
-	private async finishRun(previous: WorkflowState, next: WorkflowState, summary: string): Promise<void> {
-		this.stop();
-		const baseCommit = "baseCommit" in previous ? previous.baseCommit : undefined;
-		const changes = await this.seat.describeChanges(baseCommit);
-		this.seat.postReport(runReport(summary, this.seat.stageRecords(), changes));
+	private async finishRun(previous: FeatureState, next: WorkflowState, summary: string): Promise<void> {
+		const generation = await this.stopProcesses();
+		const changes = await this.seat.describeChanges(previous.baseCommit);
+		if (generation !== this.generation) return;
+		this.seat.postReport(runReport(summary, this.seat.runStageRecords(), changes));
 		this.seat.finish(next, summary);
 	}
 }

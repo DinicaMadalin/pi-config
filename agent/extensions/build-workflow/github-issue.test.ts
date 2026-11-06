@@ -13,7 +13,9 @@ import {
 	type RunCommand,
 	shipBranchName,
 	shipCommitMessage,
+	parseStatusPaths,
 	shipWork,
+	updatePlanIssue,
 } from "./github-issue.ts";
 
 const ok = (stdout = ""): CommandResult => ({ stdout, stderr: "", code: 0 });
@@ -147,26 +149,56 @@ test("the ship commit closes the plan issue", () => {
 });
 
 test("shipping branches, commits and pushes, never merging or forcing", async () => {
-	const { run, calls } = fakeRunner([["git status", ok(" M src/export.ts\n?? src/export.test.ts\n")]]);
-	const result = await shipWork(run, { branch: "build-x", commitMessage: "Add x" });
-	assert.deepEqual(result, { ok: true, value: "build-x" });
+	const { run, calls } = fakeRunner([["git status", ok(" M src/export.ts\0?? src/export.test.ts\0")]]);
+	const result = await shipWork(run, { branch: "build-x", commitMessage: "Add x", isCommitted: false });
+	assert.deepEqual(result, { kind: "shipped", branch: "build-x" });
 	assert.deepEqual(calls.slice(1), ["git switch -c build-x", "git add --all", "git commit -m Add x", "git push --set-upstream origin build-x"]);
 	assert.ok(!calls.some((call) => /--force|merge|rebase/.test(call)));
 });
 
 test("shipping with no changes does nothing", async () => {
 	const { run, calls } = fakeRunner([["git status", ok("")]]);
-	assert.deepEqual(await shipWork(run, { branch: "build-x", commitMessage: "Add x" }), {
-		ok: false,
+	assert.deepEqual(await shipWork(run, { branch: "build-x", commitMessage: "Add x", isCommitted: false }), {
+		kind: "failed",
 		error: "Nothing to ship: the working tree has no changes",
 	});
 	assert.equal(calls.length, 1);
 });
 
-test("a failed push says the commit stays on the local branch", async () => {
-	const { run } = fakeRunner([["git status", ok(" M a.ts\n")], ["git push", failed("rejected")]]);
-	assert.deepEqual(await shipWork(run, { branch: "build-x", commitMessage: "Add x" }), {
-		ok: false,
-		error: "Failed to push build-x (exit 1): rejected; the commit is on local branch build-x",
+test("a failed push keeps the commit, and shipping again only pushes it", async () => {
+	const firstTry = fakeRunner([["git status", ok(" M a.ts\0")], ["git push", failed("rejected")]]);
+	assert.deepEqual(await shipWork(firstTry.run, { branch: "build-x", commitMessage: "Add x", isCommitted: false }), {
+		kind: "committed-not-pushed",
+		branch: "build-x",
+		error: "Failed to push build-x (exit 1): rejected",
 	});
+	const retry = fakeRunner([["git branch --show-current", ok("build-x\n")], ["git status", ok("")]]);
+	assert.deepEqual(await shipWork(retry.run, { branch: "build-x", commitMessage: "Add x", isCommitted: true }), {
+		kind: "shipped",
+		branch: "build-x",
+	});
+	assert.deepEqual(retry.calls, [
+		"git branch --show-current",
+		"git status --porcelain -z --untracked-files=all",
+		"git push --set-upstream origin build-x",
+	]);
+});
+
+test("shipping again refuses when you switched away from the committed branch", async () => {
+	const { run, calls } = fakeRunner([["git branch --show-current", ok("main\n")]]);
+	const result = await shipWork(run, { branch: "build-x", commitMessage: "Add x", isCommitted: true });
+	assert.deepEqual(result, { kind: "failed", error: "Switch back to branch build-x (git switch build-x), then ship again" });
+	assert.ok(!calls.some((call) => call.startsWith("git push")));
+});
+
+test("the files to ship keep spaces in paths and list a rename once, by its new path", () => {
+	assert.deepEqual(parseStatusPaths(" M src/a b.ts\0R  new.ts\0old.ts\0?? notes.md\0"), ["src/a b.ts", "new.ts", "notes.md"]);
+});
+
+test("a plan change updates the plan issue's body and comments on it", async () => {
+	const { run, calls } = fakeRunner([]);
+	const planIssue = { number: 7, title: "Add export", url: "https://github.com/o/r/issues/7" };
+	assert.deepEqual(await updatePlanIssue(run, planIssue, "# Add export\n\n## Goal\nCSV", 2), { ok: true, value: undefined });
+	assert.ok(calls[0].startsWith("gh issue edit 7 --body ## Goal"), calls[0]);
+	assert.ok(calls[1].startsWith("gh issue comment 7 --body The plan changed (revision 2)"), calls[1]);
 });

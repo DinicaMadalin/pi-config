@@ -58,6 +58,16 @@ export function createSubagentSessionFile(
 	writeFileSync(sessionPath, `${lines.join("\n")}\n`, { flag: "wx" });
 }
 
+/** A JSON line, or undefined when it is not one, e.g. a line the child is still writing. */
+function parseJsonLine(line: string): unknown {
+	try {
+		return JSON.parse(line);
+	} catch {
+		// Not a complete JSON record: skipped, the caller only reads complete records.
+		return undefined;
+	}
+}
+
 /** The auto model's latest route reason in a session file; undefined when it never routed there. */
 function readRouteReason(sessionPath: string): string | undefined {
 	let content: string;
@@ -70,10 +80,9 @@ function readRouteReason(sessionPath: string): string | undefined {
 	const lines = content.split("\n");
 	for (let index = lines.length - 1; index >= 0; index--) {
 		const line = lines[index];
-		// The child may be mid-write: a line without its closing brace is not complete yet.
-		if (!line.includes(ROUTE_DECISION_ENTRY_TYPE) || !line.endsWith("}")) continue;
-		const entry = JSON.parse(line) as { customType?: string; data?: { reason?: unknown } };
-		if (entry.customType === ROUTE_DECISION_ENTRY_TYPE && typeof entry.data?.reason === "string") return entry.data.reason;
+		if (!line.includes(ROUTE_DECISION_ENTRY_TYPE)) continue;
+		const entry = parseJsonLine(line) as { customType?: string; data?: { reason?: unknown } } | undefined;
+		if (entry?.customType === ROUTE_DECISION_ENTRY_TYPE && typeof entry.data?.reason === "string") return entry.data.reason;
 	}
 	return undefined;
 }
@@ -93,7 +102,24 @@ interface UiRequest {
 	placeholder?: string;
 }
 
-export class SubagentProcess {
+/** What the orchestrator uses of a subagent; tests stand in a fake for the real process. */
+export interface Subagent {
+	readonly name: string;
+	readonly tracker: AgentTracker;
+	readonly isRunning: boolean;
+	readonly isWorking: boolean;
+	start(): void;
+	prompt(message: string): void;
+	sendUserMessage(text: string): void;
+	abortTurn(): void;
+	stop(): Promise<void>;
+}
+
+export type LaunchSubagent = (options: SubagentOptions) => Subagent;
+
+export const launchSubagentProcess: LaunchSubagent = (options) => new SubagentProcess(options);
+
+export class SubagentProcess implements Subagent {
 	readonly name: string;
 	readonly sessionPath: string;
 	readonly tracker = new AgentTracker();
@@ -150,15 +176,27 @@ export class SubagentProcess {
 		this.tracker.startTurn(Date.now());
 	}
 
-	stop(): void {
+	/** Stops the current turn; the process stays, ready for the next prompt. */
+	abortTurn(): void {
+		this.tracker.activity.add("note", "Turn stopped by you", Date.now());
+		this.send({ type: "abort" });
+	}
+
+	/** Ends the process; resolves once it exited, so a new process may take over its session file. */
+	stop(): Promise<void> {
 		const child = this.child;
-		if (!child) return;
+		if (!child) return Promise.resolve();
 		this.isStopping = true;
+		const exited = new Promise<void>((resolve) => {
+			child.once("exit", () => resolve());
+			child.once("error", () => resolve());
+		});
 		this.send({ type: "abort" });
 		child.stdin?.end();
 		setTimeout(() => {
 			if (this.child === child) child.kill("SIGTERM");
 		}, STOP_GRACE_MS).unref();
+		return exited;
 	}
 
 	private send(command: Record<string, unknown>): void {
@@ -181,9 +219,19 @@ export class SubagentProcess {
 		while (newlineIndex !== -1) {
 			const line = this.stdoutBuffer.slice(0, newlineIndex).trim();
 			this.stdoutBuffer = this.stdoutBuffer.slice(newlineIndex + 1);
-			if (line.startsWith("{")) this.handleRecord(JSON.parse(line) as Record<string, unknown>);
+			if (line.startsWith("{")) this.handleLine(line);
 			newlineIndex = this.stdoutBuffer.indexOf("\n");
 		}
+	}
+
+	/** A malformed record is shown in the activity instead of breaking the parent session. */
+	private handleLine(line: string): void {
+		const record = parseJsonLine(line);
+		if (typeof record !== "object" || record === null) {
+			this.tracker.activity.add("error", `Unreadable output from the subagent: ${line.slice(0, 120)}`, Date.now());
+			return;
+		}
+		this.handleRecord(record as Record<string, unknown>);
 	}
 
 	private handleRecord(record: Record<string, unknown>): void {
@@ -191,6 +239,7 @@ export class SubagentProcess {
 		const tracker = this.tracker;
 		switch (record.type) {
 			case "agent_start":
+				this.lastAnswer = "";
 				tracker.startTurn(nowMs);
 				return;
 			case "tool_execution_start":

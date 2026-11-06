@@ -14,9 +14,8 @@ import {
 	type StageRecord,
 	type TrackedIssue,
 } from "./workflow-state.ts";
+import { SAVE_PLAN_TOOL_NAME } from "../project-memory/agreed-plan-files.ts";
 import type { GithubIssue } from "./github-issue.ts";
-
-const SAVE_PLAN_TOOL_NAME = "save_agreed_plan";
 
 function listRuleFiles(ruleFilePaths: readonly string[]): string {
 	if (ruleFilePaths.length === 0) return "- No AGENTS.md or CLAUDE.md was found; follow the conventions of the surrounding code.";
@@ -38,6 +37,8 @@ const AGREE_AND_SAVE_PLAN_STEPS = [
 	"   - Files: every file to create or change, one line each.",
 	"5. After saving, tell me the plan path. I then choose whether to post the plan as a GitHub issue, and the implementer",
 	"   starts on its own as a subagent; if it gets stuck, its question comes back to you here.",
+	`6. If I want the plan changed later, even while the implementer works, update it and call ${SAVE_PLAN_TOOL_NAME} again`,
+	"   with the full updated plan. The run keeps one plan file and passes the change on; never edit files yourself.",
 ];
 
 export function planningPrompt(task: string): string {
@@ -257,11 +258,42 @@ export function plannerAnswerPrompt(answer: string): string {
 	].join("\n");
 }
 
-/** Sent to a subagent restarted on its session after Pi was reloaded mid-run. */
+/** Sent to a subagent restarted on its session: after Pi was reloaded, it crashed, or you restarted it. */
 export function resumePrompt(): string {
 	return [
-		"[/build: RESUME] Your previous run was interrupted (Pi was reloaded). Check the current state of the work,",
+		"[/build: RESUME] Your previous run was interrupted (stopped, crashed or Pi reloaded). Check the current state of the work,",
 		"continue where you left off, and end your reply with the marker line your instructions ask for.",
+	].join("\n");
+}
+
+/**
+ * Sent to the implementer when the plan changed during the run: the full new plan, and the findings of a review
+ * of the previous version when there was one.
+ */
+export function planChangePrompt(planPath: string, plan: string, planIssue: TrackedIssue | undefined, reviewFindings?: string): string {
+	const findings = reviewFindings?.trim()
+		? [
+				"",
+				"## Review of the previous version",
+				"",
+				"The reviewers checked the work against the old plan. Fix their must-fix findings that still apply to the new plan:",
+				"",
+				reviewFindings.trim(),
+			]
+		: [];
+	return [
+		`[/build: PLAN CHANGED] I agreed to a change of the plan (saved at ${planPath}${planIssue ? `, and in issue #${planIssue.number}` : ""}).`,
+		"Bring the implementation in line with the updated plan below: change what the update changes, keep the work that",
+		"still matches it. Follow the same rules and code style as in your original brief, do not commit, and rerun the",
+		"typecheck, lint and test commands. Then both expert reviewers review the work against the new plan.",
+		"",
+		"## Updated plan",
+		"",
+		plan.trim(),
+		...findings,
+		"",
+		`Report what you changed for the update. End your reply with \`${IMPLEMENTATION_DONE_MARKER}\`, or with`,
+		`\`${IMPLEMENTATION_BLOCKED_MARKER}: <your question>\` if the change is unclear.`,
 	].join("\n");
 }
 

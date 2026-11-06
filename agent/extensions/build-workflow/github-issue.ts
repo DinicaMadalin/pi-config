@@ -212,15 +212,27 @@ export async function createPlanIssue(run: RunCommand, plan: string): Promise<St
 	return { ok: true, value: { number: Number(numberMatch[1]), title, url } };
 }
 
+/**
+ * Paths in `git status --porcelain -z` output: "XY path\0", with renames and copies as "XY new\0old\0".
+ * -z keeps paths with spaces or quotes as they are.
+ */
+export function parseStatusPaths(statusOutput: string): string[] {
+	const records = statusOutput.split("\0");
+	const paths: string[] = [];
+	for (let index = 0; index < records.length; index++) {
+		const record = records[index];
+		if (record.length < 4) continue;
+		paths.push(record.slice(3));
+		if (record[0] === "R" || record[0] === "C") index++;
+	}
+	return paths;
+}
+
 /** Changed and untracked paths, as git status lists them; these are what shipping commits. */
 export async function listFilesToShip(run: RunCommand): Promise<StepResult<string[]>> {
-	const status = await run("git", ["status", "--porcelain", "--untracked-files=all"]);
+	const status = await run("git", ["status", "--porcelain", "-z", "--untracked-files=all"]);
 	if (status.code !== 0) return { ok: false, error: commandError("read git status", status) };
-	const paths = status.stdout
-		.split("\n")
-		.filter((line) => line.trim())
-		.map((line) => line.slice(3));
-	return { ok: true, value: paths };
+	return { ok: true, value: parseStatusPaths(status.stdout) };
 }
 
 function shipBaseName(title: string, planIssue: TrackedIssue | undefined): string {
@@ -247,26 +259,63 @@ export function shipCommitMessage(title: string, planIssue?: TrackedIssue): stri
 export interface ShipRequest {
 	branch: string;
 	commitMessage: string;
+	/** An earlier attempt committed on this branch but its push failed: commit what changed since, then push. */
+	isCommitted: boolean;
+}
+
+export type ShipResult =
+	| { kind: "shipped"; branch: string }
+	/** The work is committed on the branch, but the push failed; shipping again only pushes. */
+	| { kind: "committed-not-pushed"; branch: string; error: string }
+	| { kind: "failed"; error: string };
+
+async function commitAll(run: RunCommand, commitMessage: string): Promise<string | undefined> {
+	const add = await run("git", ["add", "--all"]);
+	if (add.code !== 0) return commandError("stage the changes", add);
+	const commit = await run("git", ["commit", "-m", commitMessage]);
+	if (commit.code !== 0) return commandError("commit the changes", commit);
+	return undefined;
+}
+
+/** On the first attempt: a new branch from the current HEAD (keeping the changes) and one commit. */
+async function commitOnNewBranch(run: RunCommand, request: ShipRequest): Promise<string | undefined> {
+	const files = await listFilesToShip(run);
+	if (!files.ok) return files.error;
+	if (files.value.length === 0) return "Nothing to ship: the working tree has no changes";
+	const create = await run("git", ["switch", "-c", request.branch]);
+	if (create.code !== 0) return commandError(`create branch ${request.branch}`, create);
+	return commitAll(run, request.commitMessage);
+}
+
+/** After a failed push: still on the committed branch, with anything changed since committed too. */
+async function commitOnCommittedBranch(run: RunCommand, request: ShipRequest): Promise<string | undefined> {
+	const current = await run("git", ["branch", "--show-current"]);
+	if (current.code !== 0) return commandError("read the current branch", current);
+	if (current.stdout.trim() !== request.branch) return `Switch back to branch ${request.branch} (git switch ${request.branch}), then ship again`;
+	const files = await listFilesToShip(run);
+	if (!files.ok) return files.error;
+	return files.value.length === 0 ? undefined : commitAll(run, request.commitMessage);
 }
 
 /**
- * Ships a reviewed build: a new branch from the current HEAD (keeping the changes), one commit, and a normal push.
- * Never merges, rebases or force pushes.
+ * Ships a reviewed build: a new branch from the current HEAD, one commit, and a normal push.
+ * Never merges, rebases or force pushes. A failed push keeps the commit, and shipping again only pushes.
  */
-export async function shipWork(run: RunCommand, request: ShipRequest): Promise<StepResult<string>> {
-	const files = await listFilesToShip(run);
-	if (!files.ok) return files;
-	if (files.value.length === 0) return { ok: false, error: "Nothing to ship: the working tree has no changes" };
-
-	const create = await run("git", ["switch", "-c", request.branch]);
-	if (create.code !== 0) return { ok: false, error: commandError(`create branch ${request.branch}`, create) };
-	const add = await run("git", ["add", "--all"]);
-	if (add.code !== 0) return { ok: false, error: commandError("stage the changes", add) };
-	const commit = await run("git", ["commit", "-m", request.commitMessage]);
-	if (commit.code !== 0) return { ok: false, error: commandError("commit the changes", commit) };
+export async function shipWork(run: RunCommand, request: ShipRequest): Promise<ShipResult> {
+	const commitError = request.isCommitted ? await commitOnCommittedBranch(run, request) : await commitOnNewBranch(run, request);
+	if (commitError) return { kind: "failed", error: commitError };
 	const push = await run("git", ["push", "--set-upstream", "origin", request.branch]);
-	if (push.code !== 0) {
-		return { ok: false, error: `${commandError(`push ${request.branch}`, push)}; the commit is on local branch ${request.branch}` };
-	}
-	return { ok: true, value: request.branch };
+	if (push.code !== 0) return { kind: "committed-not-pushed", branch: request.branch, error: commandError(`push ${request.branch}`, push) };
+	return { kind: "shipped", branch: request.branch };
+}
+
+/** After a plan change: the plan issue shows the new plan, and a comment tells its readers it changed. */
+export async function updatePlanIssue(run: RunCommand, planIssue: TrackedIssue, plan: string, planRevision: number): Promise<StepResult<void>> {
+	const { body } = planIssueText(plan);
+	const edit = await run("gh", ["issue", "edit", String(planIssue.number), "--body", body]);
+	if (edit.code !== 0) return { ok: false, error: commandError(`update issue #${planIssue.number}`, edit) };
+	const note = `The plan changed (revision ${planRevision}); the issue body now holds the updated plan.`;
+	const comment = await run("gh", ["issue", "comment", String(planIssue.number), "--body", note]);
+	if (comment.code !== 0) return { ok: false, error: commandError(`comment on issue #${planIssue.number}`, comment) };
+	return { ok: true, value: undefined };
 }

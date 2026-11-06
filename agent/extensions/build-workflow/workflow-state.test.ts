@@ -3,14 +3,18 @@ import { test } from "node:test";
 import {
 	canEditFiles,
 	canPlannerEditFiles,
+	type FeatureWork,
+	findLastRunPlan,
 	findWorkflowState,
 	mergeReviews,
+	planChangeReaction,
 	plannerRouteForPhase,
 	readPlannerAnswer,
 	reviewerRoute,
 	routeForPhase,
 	stepAfterTurn,
 	WORKFLOW_STATE_ENTRY_TYPE,
+	withPlanRevision,
 } from "./workflow-state.ts";
 
 const work = { planPath: "/repo/.scratch/handoffs/plan.md", baseCommit: "abc123" };
@@ -41,8 +45,19 @@ test("restores the latest workflow state from the session, idle when there is no
 	assert.deepEqual(findWorkflowState(entries), { phase: "implement", ...work });
 });
 
-test("the plan phase never advances on its own: it waits for the user's agreement", () => {
-	assert.equal(stepAfterTurn({ phase: "plan", task: "x" }, "IMPLEMENTATION: done").kind, "wait");
+test("a stored state with a bad shape reads as idle instead of breaking the run", () => {
+	const broken = [{ type: "custom", customType: WORKFLOW_STATE_ENTRY_TYPE, data: { phase: "implement" } }];
+	assert.deepEqual(findWorkflowState(broken), { phase: "idle" });
+	assert.deepEqual(findWorkflowState([{ type: "custom", customType: WORKFLOW_STATE_ENTRY_TYPE, data: { phase: "dancing" } }]), { phase: "idle" });
+});
+
+test("the last agreed plan of the session is found after the run went idle", () => {
+	const entries = [
+		{ type: "custom", customType: WORKFLOW_STATE_ENTRY_TYPE, data: { phase: "awaiting-implementation", task: "x", planPath: "/p.md" } },
+		{ type: "custom", customType: WORKFLOW_STATE_ENTRY_TYPE, data: { phase: "idle" } },
+	];
+	assert.deepEqual(findLastRunPlan(entries), { task: "x", planPath: "/p.md" });
+	assert.equal(findLastRunPlan([]), undefined);
 });
 
 test("a finished implementation goes to review", () => {
@@ -73,7 +88,7 @@ test("the planner stays on the expert and never edits while the subagents work",
 	assert.deepEqual(plannerRouteForPhase("idle"), { route: "normal" });
 	assert.equal(canPlannerEditFiles("implement"), false);
 	assert.equal(canPlannerEditFiles("fix"), false);
-	assert.equal(canPlannerEditFiles("awaiting-pr"), true);
+	assert.equal(canPlannerEditFiles("idle"), true);
 });
 
 test("the last marker wins and markdown around it is ignored", () => {
@@ -88,7 +103,6 @@ test("a passing review waits for the user to ship", () => {
 		next: { phase: "awaiting-ship", ...work },
 	});
 	assert.deepEqual(routeForPhase("awaiting-ship"), { route: "normal" });
-	assert.equal(stepAfterTurn({ phase: "awaiting-ship", ...work }, "anything").kind, "wait");
 });
 
 test("the plan issue is carried to the next phase", () => {
@@ -106,8 +120,11 @@ test("review findings get exactly one fix round and a re-review", () => {
 		kind: "advance",
 		next: { phase: "re-review", ...work },
 	});
-	const stillFailing = stepAfterTurn({ phase: "re-review", ...work }, "REVIEW_VERDICT: fix");
-	assert.equal(stillFailing.kind, "finish");
+	const stillFailing = stepAfterTurn({ phase: "re-review", ...work }, "a.ts:3 still wrong\nREVIEW_VERDICT: fix");
+	assert.deepEqual(stillFailing, {
+		kind: "advance",
+		next: { phase: "review-failed", ...work, findings: "a.ts:3 still wrong\nREVIEW_VERDICT: fix" },
+	});
 });
 
 test("a review without a verdict waits instead of guessing", () => {
@@ -131,13 +148,38 @@ test("issue work keeps its issue through implement, review and fix", () => {
 	assert.deepEqual(fixStep, { kind: "advance", next: { phase: "fix", ...work, issue } });
 });
 
-test("issue work whose re-review still fails does not open a PR", () => {
-	assert.equal(stepAfterTurn({ phase: "re-review", ...work, issue }, "REVIEW_VERDICT: fix").kind, "finish");
+test("issue work whose re-review still fails waits for your decision instead of opening a PR", () => {
+	const step = stepAfterTurn({ phase: "re-review", ...work, issue }, "REVIEW_VERDICT: fix");
+	assert.equal(step.kind === "advance" && step.next.phase, "review-failed");
 });
 
-test("awaiting the PR lets the user still ask for edits", () => {
-	assert.equal(canEditFiles("awaiting-pr"), true);
+test("reviewed work waiting for you is not edited behind the reviewers' back: changes go through a plan change", () => {
+	for (const phase of ["review-failed", "awaiting-pr", "awaiting-ship"] as const) {
+		assert.equal(canEditFiles(phase), false, phase);
+		assert.equal(canPlannerEditFiles(phase), false, phase);
+		assert.equal(planChangeReaction(phase), "change-round", phase);
+	}
 	assert.deepEqual(routeForPhase("awaiting-pr"), { route: "normal" });
+});
+
+test("a plan saved again reacts to the phase the run is in", () => {
+	assert.equal(planChangeReaction("plan"), "ask-to-start");
+	assert.equal(planChangeReaction("awaiting-implementation"), "ask-to-start");
+	assert.equal(planChangeReaction("implement"), "tell-implementer");
+	assert.equal(planChangeReaction("fix"), "tell-implementer");
+	assert.equal(planChangeReaction("review"), "ask-about-review");
+	assert.equal(planChangeReaction("re-review"), "ask-about-review");
+	assert.equal(planChangeReaction("idle"), "offer-new-run");
+});
+
+test("a plan change held for after the review sends the work back to the implementer, whatever the verdict", () => {
+	const step = stepAfterTurn({ phase: "review", ...work, planChangeAfterReview: true }, "REVIEW_VERDICT: pass");
+	assert.deepEqual(step, { kind: "advance", next: { phase: "implement", ...work } });
+});
+
+test("each plan change counts a new revision", () => {
+	assert.equal(withPlanRevision<FeatureWork>(work).planRevision, 2);
+	assert.equal(withPlanRevision<FeatureWork>({ ...work, planRevision: 2 }).planRevision, 3);
 });
 
 test("two passing reviews pass together, with both reports under the reviewers' names", () => {
