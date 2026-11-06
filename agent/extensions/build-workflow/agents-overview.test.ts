@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import type { Theme } from "@earendil-works/pi-coding-agent";
 import { visibleWidth } from "@earendil-works/pi-tui";
+import type { ControlCommand } from "./agent-controls.ts";
 import type { FileDiffResult } from "./file-diff.ts";
 import { type AgentKey, AgentsOverview, type DelegateRow, formatDuration, type OverviewActions, type OverviewSnapshot } from "./agents-overview.ts";
 
@@ -21,6 +22,7 @@ const busySnapshot: OverviewSnapshot = {
 	nowMs: 10_000,
 	delegates: [],
 	planTitle: undefined,
+	planText: "# Write per-device resolutions\n\n## Goal\nEvery Location gets deviceResolutions.\n\n## Approach\n1. Map screens",
 	repo: { repoName: "neo4j-inventory-sync", branch: "issue-42-crash" },
 	feeds: {
 		planner: { activity: [{ kind: "text", text: "Plan saved.", atMs: 1_000 }], runningTool: undefined, messageBlocker: undefined },
@@ -35,6 +37,8 @@ const busySnapshot: OverviewSnapshot = {
 	},
 	timeline: {
 		task: "Write per-device screen resolutions (deviceResolutions) for every Location, provider-agnostic",
+		phase: "implement",
+		planRevision: 1,
 		planPath: "/repo/.scratch/handoffs/2026-11-04-08-13-write-per-device-screen-resolutions-deviceresolu.md",
 		baseCommit: "df0ec63cd56d",
 		isFinished: false,
@@ -64,7 +68,24 @@ const busySnapshot: OverviewSnapshot = {
 };
 
 const noDiff = async (): Promise<FileDiffResult> => ({ ok: false, error: "no diff in this test" });
-const noActions: OverviewActions = { close: () => {}, sendMessage: () => undefined, loadFileDiff: noDiff, cancelDelegate: () => undefined };
+const noActions: OverviewActions = {
+	close: () => {},
+	sendMessage: () => undefined,
+	loadFileDiff: noDiff,
+	control: async () => undefined,
+	editPlan: () => {},
+};
+
+/** Actions that record every control the overview asks for. */
+function recordingActions(commands: ControlCommand[]): OverviewActions {
+	return {
+		...noActions,
+		control: async (command) => {
+			commands.push(command);
+			return undefined;
+		},
+	};
+}
 
 for (const width of [44, 72, 96]) {
 	test(`every line is exactly ${width} columns wide, so the card never wraps`, () => {
@@ -96,7 +117,7 @@ test("shows the repository and branch the run works on", () => {
 
 test("highlights the whole row of the selected agent", () => {
 	const lines = new AgentsOverview(markingTheme, () => busySnapshot, noActions).render(96);
-	const highlighted = lines.filter((line) => line.includes("[["));
+	const highlighted = lines.filter((line) => line.includes("[[") && !line.includes("1 Agents"));
 	assert.equal(highlighted.length, 1);
 	assert.ok(highlighted[0].includes("❯ ") && highlighted[0].includes("Implementer"), highlighted[0]);
 });
@@ -109,7 +130,16 @@ test("titles the card with the plan heading, else the task's first line without 
 });
 
 test("says no build is running when there is none", () => {
-	const idle: OverviewSnapshot = { nowMs: 0, repo: undefined, planTitle: undefined, feeds: {}, delegates: [], timeline: undefined, changes: { kind: "not-started" } };
+	const idle: OverviewSnapshot = {
+		nowMs: 0,
+		repo: undefined,
+		planTitle: undefined,
+		planText: undefined,
+		feeds: {},
+		delegates: [],
+		timeline: undefined,
+		changes: { kind: "not-started" },
+	};
 	const text = new AgentsOverview(plainTheme, () => idle, noActions).render(72).join("\n");
 	assert.ok(text.includes("No build running"));
 });
@@ -140,7 +170,8 @@ test("Enter opens a message line and sends what the user typed to the selected a
 			return undefined;
 		},
 		loadFileDiff: noDiff,
-		cancelDelegate: () => undefined,
+		control: async () => undefined,
+		editPlan: () => {},
 	});
 	overview.handleInput("\r");
 	assert.ok(overview.render(96).join("\n").includes("Message to the Implementer"));
@@ -166,7 +197,7 @@ test("formats durations for people", () => {
 	assert.equal(formatDuration(3_840_000), "1h 04m");
 });
 
-test("Tab moves to the changed files, and Enter opens the selected file's diff", async () => {
+test("2 opens the Changes tab, and Enter opens the selected file's diff", async () => {
 	const requested: string[] = [];
 	const overview = new AgentsOverview(markingTheme, () => busySnapshot, {
 		...noActions,
@@ -175,9 +206,9 @@ test("Tab moves to the changed files, and Enter opens the selected file's diff",
 			return { ok: true, value: { path: file.path, lines: [{ kind: "added", newNumber: 1, text: "export const x = 1;" }] } };
 		},
 	});
-	overview.handleInput("\t");
+	overview.handleInput("2");
 	overview.handleInput("\x1b[B");
-	const highlighted = overview.render(96).filter((line) => line.includes("[["));
+	const highlighted = overview.render(96).filter((line) => line.includes("[[") && !line.includes("1 Agents"));
 	assert.equal(highlighted.length, 1);
 	assert.ok(highlighted[0].includes("❯ ") && highlighted[0].includes("mapper.ts"), highlighted[0]);
 
@@ -190,14 +221,21 @@ test("Tab moves to the changed files, and Enter opens the selected file's diff",
 	assert.ok(overview.render(96).join("\n").includes("Changes"), "Escape returns to the overview");
 });
 
+function changesTab(overview: AgentsOverview): AgentsOverview {
+	overview.handleInput("2");
+	return overview;
+}
+
 test("the file list grows to fill the rows the card may use", () => {
-	const manyFiles = Array.from({ length: 40 }, (_, index) => ({ path: `src/file${index}.ts`, added: 40 - index, removed: 0, isBinary: false, isNew: false }));
-	const snapshot: OverviewSnapshot = { ...busySnapshot, changes: { kind: "loaded", result: { ok: true, value: { added: 820, removed: 0, files: manyFiles } } } };
+	const manyFiles = Array.from({ length: 80 }, (_, index) => ({ path: `src/file${index}.ts`, added: 80 - index, removed: 0, isBinary: false, isNew: false }));
+	const snapshot: OverviewSnapshot = { ...busySnapshot, changes: { kind: "loaded", result: { ok: true, value: { added: 3240, removed: 0, files: manyFiles } } } };
 	const shownFileCount = (bodyRows: number): number =>
-		new AgentsOverview(plainTheme, () => snapshot, noActions, { bodyRows: () => bodyRows }).render(120).filter((line) => /src\/file\d+\.ts/.test(line)).length;
+		changesTab(new AgentsOverview(plainTheme, () => snapshot, noActions, { bodyRows: () => bodyRows }))
+			.render(120)
+			.filter((line) => /src\/file\d+\.ts/.test(line)).length;
 	assert.equal(shownFileCount(10), 3, "a short card still shows 3 files");
 	assert.ok(shownFileCount(50) > 20, String(shownFileCount(50)));
-	const tall = new AgentsOverview(plainTheme, () => snapshot, noActions, { bodyRows: () => 50 }).render(120);
+	const tall = changesTab(new AgentsOverview(plainTheme, () => snapshot, noActions, { bodyRows: () => 50 })).render(120);
 	// Body rows plus borders and padding; one row stays free while the list is scrolled to the top.
 	assert.ok(tall.length <= 54 && tall.length >= 53, `the card fills its height without overflowing, got ${tall.length}`);
 });
@@ -220,6 +258,7 @@ test("lists acp_delegate runs even without a build, with their task and activity
 		nowMs: 0,
 		repo: undefined,
 		planTitle: undefined,
+		planText: undefined,
 		timeline: undefined,
 		changes: { kind: "not-started" },
 		delegates: [reviewerRun, { ...reviewerRun, key: "delegate:del_abc_2", runId: "del_abc_2", status: "completed", costUsd: 1 }],
@@ -234,22 +273,76 @@ test("lists acp_delegate runs even without a build, with their task and activity
 });
 
 test("x twice cancels the selected running delegate; another key in between keeps it", () => {
-	const cancelled: string[] = [];
+	const commands: ControlCommand[] = [];
 	const snapshot: OverviewSnapshot = { ...busySnapshot, delegates: [reviewerRun] };
-	const overview = new AgentsOverview(plainTheme, () => snapshot, {
-		...noActions,
-		cancelDelegate: (runId) => {
-			cancelled.push(runId);
-			return undefined;
-		},
-	});
+	const overview = new AgentsOverview(plainTheme, () => snapshot, recordingActions(commands));
 	for (let step = 0; step < 5; step++) overview.handleInput("\x1b[B");
 	overview.handleInput("x");
 	assert.ok(overview.render(100).join("\n").includes("Press x again to cancel the reviewer run del_abc_1"));
 	overview.handleInput("\x1b[A");
 	overview.handleInput("\x1b[B");
 	overview.handleInput("x");
-	assert.deepEqual(cancelled, []);
+	assert.deepEqual(commands, []);
 	overview.handleInput("x");
-	assert.deepEqual(cancelled, ["del_abc_1"]);
+	assert.deepEqual(commands, [{ kind: "cancel-delegate", runId: "del_abc_1" }]);
+});
+
+test("the working implementer can be stopped at once, and restarting it asks for the key twice", () => {
+	const commands: ControlCommand[] = [];
+	const overview = new AgentsOverview(plainTheme, () => busySnapshot, recordingActions(commands));
+	assert.ok(overview.render(100).join("\n").includes("keys  s stop turn · r restart"));
+	overview.handleInput("s");
+	overview.handleInput("r");
+	assert.ok(overview.render(100).join("\n").includes("Press r again to restart the Implementer"));
+	overview.handleInput("r");
+	assert.deepEqual(commands, [
+		{ kind: "agent", role: "implementer", control: "stop-turn" },
+		{ kind: "agent", role: "implementer", control: "restart" },
+	]);
+});
+
+const failedReviewSnapshot: OverviewSnapshot = {
+	...busySnapshot,
+	timeline: {
+		...busySnapshot.timeline!,
+		phase: "review-failed",
+		stages: busySnapshot.timeline!.stages.map((stage) => ({ ...stage, status: "done" as const })),
+	},
+};
+
+test("after a failed re-review the run's keys fix again, review again or accept after a second A", () => {
+	const commands: ControlCommand[] = [];
+	const overview = new AgentsOverview(plainTheme, () => failedReviewSnapshot, recordingActions(commands));
+	assert.ok(overview.render(100).join("\n").includes("F fix again · R review again · A accept anyway"));
+	overview.handleInput("F");
+	overview.handleInput("A");
+	overview.handleInput("j");
+	overview.handleInput("A");
+	assert.deepEqual(commands, [{ kind: "run", control: "fix-again" }]);
+	overview.handleInput("A");
+	assert.deepEqual(commands.at(-1), { kind: "run", control: "accept" });
+});
+
+test("number keys switch tabs; the Plan tab shows the plan and marks a changed plan until seen", () => {
+	const changedPlan: OverviewSnapshot = { ...busySnapshot, timeline: { ...busySnapshot.timeline!, planRevision: 2 } };
+	const overview = new AgentsOverview(plainTheme, () => changedPlan, noActions);
+	assert.ok(overview.render(100).join("\n").includes("3 Plan v2 ●"));
+	overview.handleInput("3");
+	const planText = overview.render(100).join("\n");
+	assert.ok(planText.includes("Goal") && planText.includes("Every Location gets deviceResolutions."), planText);
+	assert.ok(planText.includes("changed, version 2"), planText);
+	overview.handleInput("1");
+	assert.ok(!overview.render(100).join("\n").includes("●"), "the marker goes once the plan was seen");
+});
+
+test("p opens the plan in the editor from any tab; Tab steps through the tabs", () => {
+	let editCount = 0;
+	const overview = new AgentsOverview(plainTheme, () => busySnapshot, { ...noActions, editPlan: () => editCount++ });
+	overview.handleInput("\t");
+	assert.ok(overview.render(100).join("\n").includes("enter diff"));
+	overview.handleInput("\t");
+	overview.handleInput("\t");
+	assert.ok(overview.render(100).join("\n").includes("No report yet"));
+	overview.handleInput("p");
+	assert.equal(editCount, 1);
 });

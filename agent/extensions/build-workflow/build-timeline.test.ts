@@ -239,3 +239,17 @@ test("a passing build review waits on you to ship, and names the plan issue", ()
 	assert.equal(timeline?.stages.at(-1)?.role, "Ship");
 	assert.equal(timeline?.stages.at(-1)?.status, "your-turn");
 });
+
+test("the timeline carries the run's phase, the plan's version and the last report", () => {
+	const entries: TimelineEntry[] = [
+		state(0, { phase: "plan", task: "Add device resolutions" }),
+		state(10, { phase: "implement", planPath: PLAN_PATH, planRevision: 2 }),
+		{ type: "custom_message", customType: "build-report", content: "## Run report\nold", timestamp: at(20) },
+		{ type: "custom_message", customType: "build-report", content: "## Run report\nnew", timestamp: at(30) },
+		state(31, { phase: "review-failed", planPath: PLAN_PATH, planRevision: 2, findings: "a.ts:3" }),
+	];
+	const timeline = buildTimeline(entries, START_MS + 40_000, false);
+	assert.equal(timeline?.phase, "review-failed");
+	assert.equal(timeline?.planRevision, 2);
+	assert.equal(timeline?.report, "## Run report\nnew");
+});

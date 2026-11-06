@@ -330,6 +330,9 @@ export function readPlannerAnswer(reply: string): PlannerAnswer {
 
 export const BUILD_STAGE_ENTRY_TYPE = "build-workflow-stage";
 
+/** The run report, posted to the planner's session as a custom message when a run ends or waits for you. */
+export const REPORT_MESSAGE_TYPE = "build-report";
+
 /** A subagent stage that finished, stored in the planner's session for the agents overview and the report. */
 export interface StageRecord {
 	stage: DelegatedPhase;

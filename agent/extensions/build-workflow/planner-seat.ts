@@ -5,9 +5,7 @@ import type { PlannerSession } from "./planner-session.ts";
 import { findRuleFiles } from "./repo-files.ts";
 import type { SubagentDialogs } from "./subagent-process.ts";
 import { loadWorkChanges } from "./work-changes.ts";
-import { BUILD_STAGE_ENTRY_TYPE, type StageRecord, stageRecordsSince, type WorkflowState } from "./workflow-state.ts";
-
-const REPORT_MESSAGE_TYPE = "build-report";
+import { BUILD_STAGE_ENTRY_TYPE, REPORT_MESSAGE_TYPE, type StageRecord, stageRecordsSince, type WorkflowState } from "./workflow-state.ts";
 
 /**
  * The subagents' dialogs, one at a time: two reviewers asking at once would otherwise stack dialogs over each other.

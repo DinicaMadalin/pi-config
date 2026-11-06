@@ -1,15 +1,18 @@
 /**
- * The Alt+A agents overview: a centered card with one row per /build role (model, thinking, time, cost,
- * why that model), the selected agent's live activity, the lines changed since implementation began, and a
- * message line to talk to the selected agent. Renders and handles keys; agents-overview-panel.ts feeds it.
+ * The Alt+A agents overview: a centered card with four tabs. Agents: one row per /build role (model, thinking,
+ * time, cost, why that model), the selected agent's live activity, a message line and the controls for the
+ * agent and the run. Changes: the lines changed since implementation began, with a diff per file. Plan and
+ * Report: the run's plan and its last report. Renders and handles keys; agents-overview-panel.ts feeds it.
  */
 import type { Theme } from "@earendil-works/pi-coding-agent";
 import { type Component, type Focusable, Input, matchesKey, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
 import type { ActivityLine, RunningTool } from "./agent-activity.ts";
+import { type ControlCommand, type ControlKey, controlsFor, type SelectedAgent } from "./agent-controls.ts";
 import type { BuildAgentKey, BuildTimeline, StageKey, StageRow, StageStatus } from "./build-timeline.ts";
 import type { DelegateStatus } from "./delegate-runs.ts";
 import type { FileDiffResult } from "./file-diff.ts";
 import { FileDiffView, type HighlightCode } from "./file-diff-view.ts";
+import { markdownLines, TextPager } from "./text-pager.ts";
 import type { FileChange, WorkChangesResult } from "./work-changes.ts";
 
 export type { BuildAgentKey };
@@ -54,6 +57,8 @@ export interface OverviewSnapshot {
 	repo: RepoLocation | undefined;
 	/** The agreed plan's "# heading"; the task's first line until a plan exists. */
 	planTitle: string | undefined;
+	/** The plan file's text, for the Plan tab; undefined until there is a plan. */
+	planText: string | undefined;
 	changes: ChangesView;
 	feeds: Partial<Record<AgentKey, AgentFeed>>;
 	delegates: readonly DelegateRow[];
@@ -65,8 +70,10 @@ export interface OverviewActions {
 	/** Sends a message to an agent; returns an error to show, or undefined when sent. */
 	sendMessage(agent: AgentKey, text: string): string | undefined;
 	loadFileDiff(file: FileChange): Promise<FileDiffResult>;
-	/** Stops a running delegate; returns an error to show, or undefined when stopped. */
-	cancelDelegate(runId: string): string | undefined;
+	/** Stops or restarts an agent, steers the run, or cancels a delegate; resolves to an error to show, or undefined. */
+	control(command: ControlCommand): Promise<string | undefined>;
+	/** Opens the plan in an editor; saving it is a plan change, like the planner saving it. */
+	editPlan(): void;
 }
 
 export interface OverviewLayout {
@@ -76,8 +83,15 @@ export interface OverviewLayout {
 	highlight?: HighlightCode;
 }
 
-/** Which list ↑↓ moves through; Tab switches. */
-type OverviewFocus = "agents" | "files";
+export type OverviewTab = "agents" | "changes" | "plan" | "report";
+
+/** In the order of their number keys. */
+const TABS: readonly { tab: OverviewTab; key: string }[] = [
+	{ tab: "agents", key: "1" },
+	{ tab: "changes", key: "2" },
+	{ tab: "plan", key: "3" },
+	{ tab: "report", key: "4" },
+];
 
 const AGENT_NAMES: Record<BuildAgentKey, string> = {
 	planner: "Planner",
@@ -107,6 +121,10 @@ const ACTIVITY_LINES_SHOWN = 12;
 
 const SPINNER_FRAMES = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 export const SPINNER_FRAME_MS = 100;
+/** The tab bar and the blank line under it. */
+const TAB_BAR_ROWS = 2;
+/** The Plan and Report tabs' line above the text: file name and position. */
+const PAGER_HEADING_ROWS = 2;
 /** The file list shows at least this many files, and grows to fill the card's height. */
 const MIN_FILES_SHOWN = 3;
 /** The Changes heading plus the "↑ more" and "↓ more" lines around the file list. */
@@ -198,15 +216,19 @@ export class AgentsOverview implements Component, Focusable {
 	/** Undefined until the user moves the selection: then the working agent is shown. */
 	private selectedAgent: AgentKey | undefined;
 	private composer: Input | undefined;
-	private sendError: string | undefined;
+	/** Why the last message or control did not go through. */
+	private actionError: string | undefined;
 	private isFocused = false;
 	private readonly layout: OverviewLayout;
-	/** Undefined until the user presses Tab: then agents when any can be messaged, else files. */
-	private chosenFocus: OverviewFocus | undefined;
+	private tab: OverviewTab = "agents";
 	private selectedFileIndex = 0;
 	private diffView: FileDiffView | undefined;
-	/** The delegate whose cancel waits for a second x, so one stray key does not stop a run. */
-	private cancelArmedFor: DelegateRow | undefined;
+	/** A control that waits for its key a second time, so one stray key does not throw work away. */
+	private armedControl: ControlKey | undefined;
+	private readonly planPager = new TextPager();
+	private readonly reportPager = new TextPager();
+	/** The plan version last shown in the Plan tab; a newer one marks the tab. */
+	private seenPlanRevision = 1;
 
 	constructor(
 		theme: Theme,
@@ -248,35 +270,90 @@ export class AgentsOverview implements Component, Focusable {
 			return;
 		}
 		const snapshot = this.readSnapshot();
-		if (matchesKey(data, "tab") || matchesKey(data, "shift+tab")) {
-			this.chosenFocus = this.focus(snapshot) === "agents" ? "files" : "agents";
+		const armedControl = this.armedControl;
+		this.armedControl = undefined;
+		if (this.switchTab(data, snapshot)) return;
+		if (data === "p" && snapshot.timeline?.planPath) {
+			this.actions.editPlan();
 			return;
 		}
-		if (this.focus(snapshot) === "files") {
-			this.handleFilesInput(data, changedFiles(snapshot.changes));
-			return;
+		switch (this.currentTab(snapshot)) {
+			case "changes":
+				this.handleFilesInput(data, changedFiles(snapshot.changes));
+				return;
+			case "plan":
+				this.planPager.handleInput(data, this.pagerRows());
+				return;
+			case "report":
+				this.reportPager.handleInput(data, this.pagerRows());
+				return;
+			case "agents":
+				this.handleAgentsInput(data, snapshot, armedControl);
 		}
-		const agents = this.selectableAgents(snapshot);
-		if (agents.length === 0) return;
-		const current = this.currentAgent(snapshot) ?? agents[0];
-		const armedRun = this.cancelArmedFor;
-		this.cancelArmedFor = undefined;
-		const index = agents.indexOf(current);
-		if (matchesKey(data, "up") || matchesKey(data, "k")) this.selectedAgent = agents[Math.max(0, index - 1)];
-		else if (matchesKey(data, "down") || matchesKey(data, "j")) this.selectedAgent = agents[Math.min(agents.length - 1, index + 1)];
-		else if (matchesKey(data, "enter") || matchesKey(data, "m")) this.openComposer(current);
-		else if (matchesKey(data, "x")) this.cancelSelectedDelegate(current, snapshot, armedRun);
 	}
 
-	private cancelSelectedDelegate(current: AgentKey, snapshot: OverviewSnapshot, armedRun: DelegateRow | undefined): void {
-		const delegate = snapshot.delegates.find((row) => row.key === current);
-		if (!delegate || delegate.status !== "running") return;
-		if (armedRun?.key !== delegate.key) {
-			this.cancelArmedFor = delegate;
-			this.sendError = undefined;
+	/** 1–4 pick a tab, Tab and Shift+Tab step through them; only a build has tabs. */
+	private switchTab(data: string, snapshot: OverviewSnapshot): boolean {
+		if (!snapshot.timeline) return false;
+		const picked = TABS.find((entry) => entry.key === data);
+		if (picked) {
+			this.tab = picked.tab;
+			return true;
+		}
+		const step = matchesKey(data, "tab") ? 1 : matchesKey(data, "shift+tab") ? -1 : 0;
+		if (step === 0) return false;
+		const index = TABS.findIndex((entry) => entry.tab === this.tab);
+		this.tab = TABS[(index + step + TABS.length) % TABS.length].tab;
+		return true;
+	}
+
+	private currentTab(snapshot: OverviewSnapshot): OverviewTab {
+		return snapshot.timeline ? this.tab : "agents";
+	}
+
+	private handleAgentsInput(data: string, snapshot: OverviewSnapshot, armedControl: ControlKey | undefined): void {
+		const agents = this.selectableAgents(snapshot);
+		const current = this.currentAgent(snapshot);
+		const index = current ? agents.indexOf(current) : -1;
+		if (agents.length > 0 && (matchesKey(data, "up") || matchesKey(data, "k"))) {
+			this.selectedAgent = agents[Math.max(0, index - 1)];
 			return;
 		}
-		this.sendError = this.actions.cancelDelegate(delegate.runId);
+		if (agents.length > 0 && (matchesKey(data, "down") || matchesKey(data, "j"))) {
+			this.selectedAgent = agents[Math.min(agents.length - 1, index + 1)];
+			return;
+		}
+		if (current && (matchesKey(data, "enter") || matchesKey(data, "m"))) {
+			this.openComposer(current);
+			return;
+		}
+		const control = this.controls(snapshot).find((candidate) => candidate.key === data);
+		if (!control) return;
+		this.actionError = undefined;
+		if (control.confirmation && armedControl?.key !== control.key) {
+			this.armedControl = control;
+			return;
+		}
+		void this.actions.control(control.command).then((error) => {
+			this.actionError = error;
+		});
+	}
+
+	private controls(snapshot: OverviewSnapshot): ControlKey[] {
+		return controlsFor(snapshot.timeline, this.selectedOf(this.currentAgent(snapshot), snapshot));
+	}
+
+	private selectedOf(agent: AgentKey | undefined, snapshot: OverviewSnapshot): SelectedAgent {
+		if (!agent) return { kind: "none" };
+		if (!isDelegateKey(agent)) return { kind: "build", agent };
+		const delegate = snapshot.delegates.find((row) => row.key === agent);
+		if (!delegate) return { kind: "none" };
+		return { kind: "delegate", runId: delegate.runId, role: delegate.role, isRunning: delegate.status === "running" };
+	}
+
+	/** Rows of text the Plan and Report tabs show at once. */
+	private pagerRows(): number {
+		return Math.max(3, this.layout.bodyRows() - TAB_BAR_ROWS - PAGER_HEADING_ROWS - 3);
 	}
 
 	private handleFilesInput(data: string, files: readonly FileChange[]): void {
@@ -296,15 +373,6 @@ export class AgentsOverview implements Component, Focusable {
 			highlight: this.layout.highlight,
 			bodyRows: this.layout.bodyRows,
 		});
-	}
-
-	/** Agents while any can be messaged, files once the run is over; Tab overrides. */
-	private focus(snapshot: OverviewSnapshot): OverviewFocus {
-		const hasFiles = changedFiles(snapshot.changes).length > 0;
-		const hasAgents = this.selectableAgents(snapshot).length > 0;
-		if (this.chosenFocus === "files" && hasFiles) return "files";
-		if (this.chosenFocus === "agents" && hasAgents) return "agents";
-		return hasAgents || !hasFiles ? "agents" : "files";
 	}
 
 	invalidate(): void {
@@ -334,21 +402,21 @@ export class AgentsOverview implements Component, Focusable {
 	private openComposer(agent: AgentKey): void {
 		const feed = this.readSnapshot().feeds[agent];
 		if (feed?.messageBlocker) {
-			this.sendError = feed.messageBlocker;
+			this.actionError = feed.messageBlocker;
 			return;
 		}
 		const composer = new Input({ prompt: "› " });
 		composer.focused = this.isFocused;
 		composer.onSubmit = (text) => {
 			if (text.trim() === "") return;
-			this.sendError = this.actions.sendMessage(agent, text.trim());
+			this.actionError = this.actions.sendMessage(agent, text.trim());
 			this.composer = undefined;
 		};
 		composer.onEscape = () => {
 			this.composer = undefined;
 		};
 		this.selectedAgent = agent;
-		this.sendError = undefined;
+		this.actionError = undefined;
 		this.composer = composer;
 	}
 
@@ -408,17 +476,24 @@ export class AgentsOverview implements Component, Focusable {
 		return theme.fg("borderMuted", "╭─ ") + title + theme.fg("borderMuted", ` ${"─".repeat(fillWidth)}`) + rightPart + theme.fg("borderMuted", "╮");
 	}
 
+	/** The bottom border's keys: how to move around; the agent's and run's controls get their own line. */
 	private keyHint(snapshot: OverviewSnapshot): string {
 		if (this.composer) return "enter send · esc cancel";
 		if (this.diffView) return this.diffView.keyHint();
-		const hasFiles = changedFiles(snapshot.changes).length > 0;
-		const tabHint = hasFiles ? "tab agents/files · " : "";
-		if (this.focus(snapshot) === "files") return `${tabHint}↑↓ file · enter/space diff · esc close`;
-		const current = this.currentAgent(snapshot);
-		if (!current) return "esc close";
-		if (!isDelegateKey(current)) return `${tabHint}↑↓ agent · enter message · esc close`;
-		const isRunning = snapshot.delegates.some((delegate) => delegate.key === current && delegate.status === "running");
-		return `${tabHint}↑↓ agent${isRunning ? " · x cancel run" : ""} · esc close`;
+		const tabs = snapshot.timeline ? "1-4 tab · " : "";
+		const plan = snapshot.timeline?.planPath ? "p edit plan · " : "";
+		switch (this.currentTab(snapshot)) {
+			case "changes":
+				return `${tabs}↑↓ file · enter diff · ${plan}esc close`;
+			case "plan":
+			case "report":
+				return `${tabs}↑↓ space b scroll · ${plan}esc close`;
+			case "agents": {
+				const current = this.currentAgent(snapshot);
+				const canMessage = current !== undefined && !isDelegateKey(current);
+				return `${tabs}↑↓ agent · ${canMessage ? "enter message · " : ""}${plan}esc close`;
+			}
+		}
 	}
 
 	private bottomBorder(snapshot: OverviewSnapshot, width: number): string {
@@ -444,23 +519,104 @@ export class AgentsOverview implements Component, Focusable {
 	}
 
 	private renderBuild(timeline: BuildTimeline, snapshot: OverviewSnapshot, innerWidth: number): string[] {
-		const selectedAgent = this.currentAgent(snapshot);
-		const isAgentListFocused = this.focus(snapshot) === "agents";
-		const linesAboveChanges = [
+		const header = [
 			this.theme.bold(snapshot.planTitle ?? taskHeadline(timeline.task)),
 			...this.repoLines(snapshot.repo),
-			this.stepper(timeline.stages),
-			"",
-			...timeline.stages.flatMap((stage) => this.stageLines(stage, snapshot, innerWidth, selectedAgent, isAgentListFocused)),
-			...this.delegateSection(snapshot, innerWidth, selectedAgent, isAgentListFocused),
-			...(selectedAgent ? ["", ...this.activityLines(selectedAgent, snapshot, innerWidth)] : []),
-			// Under the activity, not under the file list: a long card is cut at the bottom, and this must show.
-			...this.composerLines(selectedAgent, snapshot, innerWidth),
+			this.tabBar(timeline, snapshot),
 			"",
 		];
-		const rowsForFiles = this.layout.bodyRows() - linesAboveChanges.length - FILE_LIST_FRAME_ROWS;
-		const filesShown = Math.max(MIN_FILES_SHOWN, rowsForFiles);
-		return [...linesAboveChanges, ...this.changesLines(snapshot, timeline.baseCommit, innerWidth, filesShown)];
+		const rowsLeft = this.layout.bodyRows() - header.length;
+		switch (this.currentTab(snapshot)) {
+			case "agents":
+				return [...header, ...this.agentsTab(timeline, snapshot, innerWidth)];
+			case "changes":
+				return [...header, ...this.changesLines(snapshot, timeline.baseCommit, innerWidth, Math.max(MIN_FILES_SHOWN, rowsLeft - FILE_LIST_FRAME_ROWS))];
+			case "plan":
+				this.seenPlanRevision = Math.max(this.seenPlanRevision, timeline.planRevision);
+				return [...header, ...this.planTab(timeline, snapshot, innerWidth)];
+			case "report":
+				return [...header, ...this.reportTab(timeline, innerWidth)];
+		}
+	}
+
+	/** " 1 Agents   2 Changes 26   3 Plan v2 ●   4 Report ", the open tab highlighted. */
+	private tabBar(timeline: BuildTimeline, snapshot: OverviewSnapshot): string {
+		const theme = this.theme;
+		const fileCount = changedFiles(snapshot.changes).length;
+		const planVersion = timeline.planRevision > 1 ? ` v${timeline.planRevision}` : "";
+		const planChanged = timeline.planRevision > this.seenPlanRevision ? ` ${theme.fg("warning", "●")}` : "";
+		const labels: Record<OverviewTab, string> = {
+			agents: "Agents",
+			changes: fileCount > 0 ? `Changes ${theme.fg("muted", String(fileCount))}` : "Changes",
+			plan: `Plan${planVersion}${planChanged}`,
+			report: timeline.report ? "Report" : theme.fg("dim", "Report"),
+		};
+		const openTab = this.currentTab(snapshot);
+		return TABS.map(({ tab, key }) => {
+			if (tab === openTab) return theme.bg("selectedBg", ` ${theme.fg("accent", key)} ${theme.bold(labels[tab])} `);
+			return ` ${theme.fg("dim", key)} ${labels[tab]} `;
+		}).join(" ");
+	}
+
+	private agentsTab(timeline: BuildTimeline, snapshot: OverviewSnapshot, innerWidth: number): string[] {
+		const selectedAgent = this.currentAgent(snapshot);
+		return [
+			this.stepper(timeline.stages),
+			"",
+			...timeline.stages.flatMap((stage) => this.stageLines(stage, snapshot, innerWidth, selectedAgent)),
+			...this.delegateSection(snapshot, innerWidth, selectedAgent),
+			...(selectedAgent ? ["", ...this.activityLines(selectedAgent, snapshot, innerWidth)] : []),
+			...this.controlLines(snapshot, innerWidth),
+			...this.composerLines(selectedAgent, snapshot, innerWidth),
+			"",
+			this.changesSummary(snapshot, timeline.baseCommit, innerWidth),
+		];
+	}
+
+	/** "keys  s stop turn · r restart · R review again" for the selected agent and the run. */
+	private controlLines(snapshot: OverviewSnapshot, innerWidth: number): string[] {
+		const controls = this.controls(snapshot);
+		if (controls.length === 0) return [];
+		const theme = this.theme;
+		const keys = controls.map((control) => `${theme.fg("accent", control.key)} ${theme.fg("muted", control.label)}`).join(theme.fg("dim", " · "));
+		return ["", truncateToWidth(`${theme.fg("dim", "keys")}  ${keys}`, innerWidth, "…")];
+	}
+
+	/** The Agents tab's one line about the changes: "Changes +140 −12 · 2 files   2 lists them". */
+	private changesSummary(snapshot: OverviewSnapshot, baseCommit: string | undefined, innerWidth: number): string {
+		const changes = snapshot.changes;
+		if (changes.kind !== "loaded" || !changes.result.ok || changes.result.value.files.length === 0) {
+			return this.changesLines(snapshot, baseCommit, innerWidth, 0)[0];
+		}
+		const theme = this.theme;
+		return spread(`${theme.bold("Changes")}  ${this.changeTotals(changes.result.value)}`, theme.fg("dim", "2 lists them"), innerWidth);
+	}
+
+	/** "+140 −12 · 2 files" */
+	private changeTotals(changes: { added: number; removed: number; files: readonly FileChange[] }): string {
+		const theme = this.theme;
+		const fileCount = `${changes.files.length} file${changes.files.length === 1 ? "" : "s"}`;
+		return `${theme.fg("toolDiffAdded", `+${changes.added}`)} ${theme.fg("toolDiffRemoved", `−${changes.removed}`)} ${theme.fg("muted", `· ${fileCount}`)}`;
+	}
+
+	private planTab(timeline: BuildTimeline, snapshot: OverviewSnapshot, innerWidth: number): string[] {
+		const theme = this.theme;
+		if (!timeline.planPath || snapshot.planText === undefined) return [theme.fg("dim", "No plan yet: the planner writes it with you, then saves it")];
+		// The file name is in the bottom border already.
+		const version = timeline.planRevision > 1 ? theme.fg("warning", ` · changed, version ${timeline.planRevision}`) : "";
+		return this.pagedText(this.planPager, `${theme.bold("Plan")}${version}`, snapshot.planText, innerWidth);
+	}
+
+	private reportTab(timeline: BuildTimeline, innerWidth: number): string[] {
+		if (!timeline.report) return [this.theme.fg("dim", "No report yet: the run posts it when the review ends")];
+		return this.pagedText(this.reportPager, this.theme.bold("Run report"), timeline.report, innerWidth);
+	}
+
+	private pagedText(pager: TextPager, heading: string, text: string, innerWidth: number): string[] {
+		const lines = markdownLines(text, innerWidth, this.theme);
+		const { shown, firstLine, lastLine } = pager.page(lines, this.pagerRows());
+		const position = this.theme.fg("dim", `${firstLine}–${lastLine} of ${lines.length}`);
+		return [spread(heading, position, innerWidth), "", ...shown];
 	}
 
 	/** Only acp_delegate runs, no /build: the delegates and the selected one's activity. */
@@ -468,8 +624,9 @@ export class AgentsOverview implements Component, Focusable {
 		const selectedAgent = this.currentAgent(snapshot);
 		return [
 			...this.repoLines(snapshot.repo),
-			...this.delegateSection(snapshot, innerWidth, selectedAgent, true).slice(snapshot.repo ? 0 : 1),
+			...this.delegateSection(snapshot, innerWidth, selectedAgent).slice(snapshot.repo ? 0 : 1),
 			...(selectedAgent ? ["", ...this.activityLines(selectedAgent, snapshot, innerWidth)] : []),
+			...this.controlLines(snapshot, innerWidth),
 			...this.composerLines(selectedAgent, snapshot, innerWidth),
 		];
 	}
@@ -478,7 +635,6 @@ export class AgentsOverview implements Component, Focusable {
 		snapshot: OverviewSnapshot,
 		innerWidth: number,
 		selectedAgent: AgentKey | undefined,
-		isAgentListFocused: boolean,
 	): string[] {
 		if (snapshot.delegates.length === 0) return [];
 		const theme = this.theme;
@@ -488,12 +644,12 @@ export class AgentsOverview implements Component, Focusable {
 			"",
 			heading,
 			...snapshot.delegates.flatMap((delegate) =>
-				this.delegateLines(delegate, innerWidth, delegate.key === selectedAgent, isAgentListFocused),
+				this.delegateLines(delegate, innerWidth, delegate.key === selectedAgent),
 			),
 		];
 	}
 
-	private delegateLines(delegate: DelegateRow, innerWidth: number, isSelected: boolean, isAgentListFocused: boolean): string[] {
+	private delegateLines(delegate: DelegateRow, innerWidth: number, isSelected: boolean): string[] {
 		const theme = this.theme;
 		const roleName = capitalize(delegate.role);
 		const roleText = theme.bold(isSelected ? theme.fg("accent", roleName) : roleName);
@@ -508,7 +664,7 @@ export class AgentsOverview implements Component, Focusable {
 		const pointer = isSelected ? theme.fg("accent", "❯ ") : "  ";
 		const row = `${pointer}${this.delegateIcon(delegate.status)}  ${role}${model}${time}${cost}`;
 		const task = `${DETAIL_INDENT}${theme.fg("dim", "╰")} ${theme.fg("muted", taskHeadline(delegate.task))}`;
-		return [isSelected && isAgentListFocused ? theme.bg("selectedBg", padEndToWidth(row, innerWidth)) : row, task];
+		return [isSelected ? theme.bg("selectedBg", padEndToWidth(row, innerWidth)) : row, task];
 	}
 
 	private delegateIcon(status: DelegateStatus): string {
@@ -558,11 +714,11 @@ export class AgentsOverview implements Component, Focusable {
 		if (this.composer && selectedAgent) {
 			return ["", theme.fg("accent", `Message to the ${this.agentName(selectedAgent, snapshot)}`), ...this.composer.render(innerWidth)];
 		}
-		if (this.cancelArmedFor) {
-			const run = this.cancelArmedFor;
-			return ["", theme.fg("warning", `Press x again to cancel the ${run.role} run ${run.runId}; any other key keeps it running`)];
+		if (this.armedControl) {
+			const { key, confirmation } = this.armedControl;
+			return ["", theme.fg("warning", `Press ${key} again to ${confirmation}; any other key leaves it`)];
 		}
-		if (this.sendError) return ["", theme.fg("error", this.sendError)];
+		if (this.actionError) return ["", theme.fg("error", this.actionError)];
 		return [];
 	}
 
@@ -632,7 +788,6 @@ export class AgentsOverview implements Component, Focusable {
 		snapshot: OverviewSnapshot,
 		innerWidth: number,
 		selectedAgent: AgentKey | undefined,
-		isAgentListFocused: boolean,
 	): string[] {
 		const theme = this.theme;
 		const isUpcoming = stage.status === "waiting" || stage.status === "skipped";
@@ -646,7 +801,7 @@ export class AgentsOverview implements Component, Focusable {
 		const cost = padStartToWidth(theme.fg("muted", formatCost(stage.costUsd)), COST_COLUMN_WIDTH);
 		const pointer = isSelected ? theme.fg("accent", "❯ ") : "  ";
 		const row = `${pointer}${this.statusIcon(stage.status)}  ${role}${model}${time}${cost}`;
-		const lines = [isSelected && isAgentListFocused ? theme.bg("selectedBg", padEndToWidth(row, innerWidth)) : row];
+		const lines = [isSelected ? theme.bg("selectedBg", padEndToWidth(row, innerWidth)) : row];
 
 		const isCurrent = stage.status === "working" || stage.status === "paused" || stage.status === "your-turn";
 		if (isCurrent && stage.routeReason) {
@@ -670,7 +825,7 @@ export class AgentsOverview implements Component, Focusable {
 			case "ship":
 				return "confirm shipping, or run /build ship";
 			case "re-review":
-				return "still has findings: /build implement to fix again, accept, or review again";
+				return "still has findings: F fixes again, R reviews again, A accepts (or /build implement)";
 			default:
 				return "agree on the plan; the implementer then starts";
 		}
@@ -724,21 +879,20 @@ export class AgentsOverview implements Component, Focusable {
 		const since = baseCommit ? theme.fg("dim", ` since ${baseCommit.slice(0, 7)}`) : "";
 		if (files.length === 0) return [`${heading}${since}  ${theme.fg("dim", "no files changed yet")}`];
 
-		const fileCount = `${files.length} file${files.length === 1 ? "" : "s"}`;
-		const totals = `${theme.fg("toolDiffAdded", `+${added}`)} ${theme.fg("toolDiffRemoved", `−${removed}`)} ${theme.fg("muted", `· ${fileCount}`)}`;
+		const totals = this.changeTotals({ added, removed, files });
 		const largestChange = Math.max(1, ...files.map((file) => file.added + file.removed));
-		const isFileListFocused = this.focus(snapshot) === "files";
 		this.selectedFileIndex = Math.min(this.selectedFileIndex, files.length - 1);
 		const firstShown = Math.max(0, Math.min(this.selectedFileIndex - filesShown + 1, files.length - filesShown));
 		const shownFiles = files.slice(firstShown, firstShown + filesShown).map((file, offset) => {
-			const isSelected = isFileListFocused && firstShown + offset === this.selectedFileIndex;
+			const isSelected = firstShown + offset === this.selectedFileIndex;
 			return this.fileLine(file, largestChange, innerWidth, isSelected);
 		});
 		const above = firstShown > 0 ? [theme.fg("dim", `  ↑ ${firstShown} more`)] : [];
 		const hiddenBelow = files.length - firstShown - shownFiles.length;
 		const below = hiddenBelow > 0 ? [theme.fg("dim", `  ↓ ${hiddenBelow} more file${hiddenBelow === 1 ? "" : "s"}`)] : [];
-		const headingText = isFileListFocused ? `${theme.fg("accent", "❯")} ${heading}` : heading;
-		return [spread(`${headingText}${since}`, totals, innerWidth), ...above, ...shownFiles, ...below];
+		const headingLine = spread(`${heading}${since}`, totals, innerWidth);
+		if (filesShown === 0) return [headingLine];
+		return [headingLine, ...above, ...shownFiles, ...below];
 	}
 
 	private fileLine(file: FileChange, largestChange: number, innerWidth: number, isSelected: boolean): string {

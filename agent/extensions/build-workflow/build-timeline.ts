@@ -8,6 +8,7 @@ import { ROUTE_DECISION_ENTRY_TYPE } from "../auto-model/route-decision.ts";
 import {
 	BUILD_STAGE_ENTRY_TYPE,
 	isDelegatedPhase,
+	REPORT_MESSAGE_TYPE,
 	REVIEWER_VENDORS,
 	type ReviewerVendor,
 	reviewerRole,
@@ -24,6 +25,8 @@ export interface TimelineEntry {
 	timestamp?: string;
 	customType?: string;
 	data?: unknown;
+	/** A custom message's text, e.g. the run report. */
+	content?: unknown;
 	message?: {
 		role: string;
 		model?: string;
@@ -77,6 +80,11 @@ export interface LiveStageView {
 
 export interface BuildTimeline {
 	task: string;
+	phase: WorkflowPhase;
+	/** The plan's version since implementation started: 1 until the plan changes. */
+	planRevision: number;
+	/** The last run report posted to the planner's session, once the run reached the end of a review. */
+	report?: string;
 	issue?: { number: number; url: string; branch: string };
 	/** The GitHub issue a /build plan was posted as. */
 	planIssue?: { number: number; url: string };
@@ -119,6 +127,8 @@ interface BuildRun {
 	planPath?: string;
 	baseCommit?: string;
 	phase: WorkflowPhase;
+	planRevision: number;
+	report?: string;
 	/** Keyed by rowId. */
 	progressByStage: Map<string, StageProgress>;
 }
@@ -176,7 +186,7 @@ function roleName(stage: StageKey, isIssue: boolean): string {
 
 function startRun(state: Exclude<WorkflowState, { phase: "idle" }>): BuildRun {
 	const task = "task" in state ? state.task : `Implement ${state.planPath}`;
-	return { task, phase: state.phase, progressByStage: new Map() };
+	return { task, phase: state.phase, planRevision: 1, progressByStage: new Map() };
 }
 
 function applyState(run: BuildRun, state: Exclude<WorkflowState, { phase: "idle" }>): void {
@@ -186,6 +196,7 @@ function applyState(run: BuildRun, state: Exclude<WorkflowState, { phase: "idle"
 	if ("baseCommit" in state && state.baseCommit) run.baseCommit = state.baseCommit;
 	if (state.issue) run.issue = { number: state.issue.number, url: state.issue.url, branch: state.issue.branch };
 	if ("planIssue" in state && state.planIssue) run.planIssue = { number: state.planIssue.number, url: state.planIssue.url };
+	if ("planRevision" in state && state.planRevision) run.planRevision = state.planRevision;
 	if (state.phase === "awaiting-ship") progressOf(run, "ship");
 }
 
@@ -286,6 +297,10 @@ export function buildTimeline(
 			addStageRecord(run, entry.data as StageRecord);
 			continue;
 		}
+		if (entry.type === "custom_message" && entry.customType === REPORT_MESSAGE_TYPE && typeof entry.content === "string") {
+			run.report = entry.content;
+			continue;
+		}
 		if (entry.type === "custom" && entry.customType === ROUTE_DECISION_ENTRY_TYPE) {
 			const reason = (entry.data as { reason?: unknown } | undefined)?.reason;
 			if (typeof reason === "string") progressOf(run, "plan").routeReason = reason;
@@ -345,6 +360,9 @@ export function buildTimeline(
 	});
 	return {
 		task: finishedRun.task,
+		phase: finishedRun.phase,
+		planRevision: finishedRun.planRevision,
+		report: finishedRun.report,
 		issue: finishedRun.issue,
 		planIssue: finishedRun.planIssue,
 		planPath: finishedRun.planPath,

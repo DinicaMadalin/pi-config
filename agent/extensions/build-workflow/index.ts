@@ -97,7 +97,7 @@ export default function (pi: ExtensionAPI) {
 	const startDialog = new StartDialog(session, orchestrator);
 	const planChanges = new PlanChanges(session, orchestrator, startDialog);
 	const shipping = new Shipping(session, endRun);
-	registerAgentsOverview(pi, session, orchestrator);
+	registerAgentsOverview(pi, session, orchestrator, planChanges);
 
 	async function askAfterFailedReview(): Promise<void> {
 		if (session.workflow.phase !== "review-failed" || !session.hasUI) return;

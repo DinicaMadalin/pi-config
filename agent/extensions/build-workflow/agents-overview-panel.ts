@@ -18,6 +18,7 @@ import {
 	type RepoLocation,
 	SPINNER_FRAME_MS,
 } from "./agents-overview.ts";
+import type { ControlCommand } from "./agent-controls.ts";
 import { type AgentCondition, type BuildOrchestrator, type SubagentRole, stageStats } from "./build-orchestrator.ts";
 import { type BuildTimeline, buildTimeline, type LiveStageView, type TimelineEntry } from "./build-timeline.ts";
 import {
@@ -30,6 +31,7 @@ import {
 } from "./delegate-runs.ts";
 import { loadFileDiff } from "./file-diff.ts";
 import type { HighlightCode } from "./file-diff-view.ts";
+import type { PlanChanges } from "./plan-changes.ts";
 import type { PlannerSession } from "./planner-session.ts";
 import { findRepoRoot } from "./repo-files.ts";
 import { loadWorkChanges } from "./work-changes.ts";
@@ -58,12 +60,15 @@ interface OpenOverview {
 	close: () => void;
 }
 
-/** First "# heading" of the agreed plan; undefined while there is no plan file. */
-function readPlanTitle(planPath: string | undefined): string | undefined {
+/** The agreed plan's text; undefined while there is no plan file. */
+function readPlanText(planPath: string | undefined): string | undefined {
 	if (!planPath || !existsSync(planPath)) return undefined;
-	const heading = readFileSync(planPath, "utf8")
-		.split("\n")
-		.find((line) => line.startsWith("# "));
+	return readFileSync(planPath, "utf8");
+}
+
+/** First "# heading" of the plan. */
+function planHeading(planText: string | undefined): string | undefined {
+	const heading = planText?.split("\n").find((line) => line.startsWith("# "));
 	return heading?.slice(2).trim();
 }
 
@@ -92,7 +97,7 @@ function hasWorkflowEntries(entries: readonly TimelineEntry[]): boolean {
 	return entries.some((entry) => entry.type === "custom" && entry.customType === WORKFLOW_STATE_ENTRY_TYPE);
 }
 
-export function registerAgentsOverview(pi: ExtensionAPI, session: PlannerSession, orchestrator: BuildOrchestrator): void {
+export function registerAgentsOverview(pi: ExtensionAPI, session: PlannerSession, orchestrator: BuildOrchestrator, planChanges: PlanChanges): void {
 	let sessionCtx: ExtensionContext | undefined;
 	let planner = new AgentTracker();
 	let openOverview: OpenOverview | undefined;
@@ -202,7 +207,7 @@ export function registerAgentsOverview(pi: ExtensionAPI, session: PlannerSession
 			result[role] = {
 				activity: subagent.tracker.activity.recent(50),
 				runningTool: subagent.tracker.stats.runningTool,
-				messageBlocker: subagent.isRunning ? undefined : `The ${subagent.name} is not running; /build implement resumes the run`,
+				messageBlocker: subagent.isRunning ? undefined : `The ${subagent.name} is not running; r restarts it`,
 			};
 		}
 		return result;
@@ -215,6 +220,32 @@ export function registerAgentsOverview(pi: ExtensionAPI, session: PlannerSession
 		planner.activity.add("you", text, Date.now());
 		session.sendToPlanner(text);
 		return undefined;
+	}
+
+	function cancelDelegateRun(runId: string): string | undefined {
+		delegateProcessesReadAtMs = 0;
+		refreshLiveDelegateProcesses();
+		const error = cancelDelegate(runId, liveDelegateProcesses);
+		delegateProcessesReadAtMs = 0;
+		return error;
+	}
+
+	async function runControl(command: ControlCommand): Promise<string | undefined> {
+		switch (command.kind) {
+			case "cancel-delegate":
+				return cancelDelegateRun(command.runId);
+			case "agent":
+				return command.control === "stop-turn" ? orchestrator.stopAgentTurn(command.role) : orchestrator.restartAgent(command.role);
+			case "run":
+				switch (command.control) {
+					case "fix-again":
+						return orchestrator.fixAgain();
+					case "re-review":
+						return orchestrator.reReview();
+					case "accept":
+						return orchestrator.acceptAnyway();
+				}
+		}
 	}
 
 	async function readRepoLocation(): Promise<RepoLocation | undefined> {
@@ -241,16 +272,13 @@ export function registerAgentsOverview(pi: ExtensionAPI, session: PlannerSession
 					repo = undefined;
 				});
 		};
-		const planTitleByPath = new Map<string, string | undefined>();
-		const planTitleOf = (planPath: string | undefined): string | undefined => {
-			if (!planPath) return undefined;
-			if (!planTitleByPath.has(planPath)) planTitleByPath.set(planPath, readPlanTitle(planPath));
-			return planTitleByPath.get(planPath);
-		};
+		// Read with the timeline, not per frame: the plan changes when it is saved again.
+		let planText = readPlanText(timeline?.planPath);
 		const readSnapshot = (): OverviewSnapshot => ({
 			timeline,
 			repo,
-			planTitle: planTitleOf(timeline?.planPath),
+			planTitle: planHeading(planText),
+			planText,
 			changes,
 			feeds: { ...feeds(), ...delegateFeeds(delegates) },
 			delegates,
@@ -277,12 +305,13 @@ export function registerAgentsOverview(pi: ExtensionAPI, session: PlannerSession
 							if (!baseCommit) return { ok: false, error: "The run has no base commit to diff against yet" };
 							return loadFileDiff(session.run, baseCommit, file);
 						},
-						cancelDelegate: (runId) => {
-							delegateProcessesReadAtMs = 0;
-							refreshLiveDelegateProcesses();
-							const error = cancelDelegate(runId, liveDelegateProcesses);
-							delegateProcessesReadAtMs = 0;
-							return error;
+						control: async (command) => {
+							if (command.kind === "run" && command.control === "accept") close();
+							return runControl(command);
+						},
+						editPlan: () => {
+							close();
+							void planChanges.editPlanByHand((sessionCtx ?? ctx).isIdle());
 						},
 					},
 					{
@@ -297,6 +326,7 @@ export function registerAgentsOverview(pi: ExtensionAPI, session: PlannerSession
 					}, SPINNER_FRAME_MS),
 					setInterval(() => {
 						timeline = readTimeline(sessionCtx ?? ctx);
+						planText = readPlanText(timeline?.planPath);
 						delegates = readDelegates(sessionCtx ?? ctx);
 						refreshChangesWhenStale(timeline?.baseCommit);
 					}, TIMELINE_REFRESH_MS),

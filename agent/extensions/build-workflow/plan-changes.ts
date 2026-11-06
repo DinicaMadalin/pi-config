@@ -49,6 +49,29 @@ export class PlanChanges {
 		this.savedPlanPath = planPath;
 	}
 
+	/**
+	 * Opens the run's plan in an editor (Alt+A, p). Saving a changed plan is a plan change like the planner
+	 * saving it; while the planner works, it is handled when its turn settles.
+	 */
+	async editPlanByHand(isPlannerIdle: boolean): Promise<void> {
+		const planPath = runPlanPath(this.session.workflow);
+		if (!planPath || !this.session.hasUI) return;
+		const plan = this.session.readPlan(planPath);
+		if (plan === undefined) {
+			this.session.notify(`Failed to open the plan: ${planPath} cannot be read`, "error");
+			return;
+		}
+		const edited = await this.session.context.ui.editor(`Plan: ${planPath}`, plan);
+		if (edited === undefined || edited === plan) return;
+		if (runPlanPath(this.session.workflow) !== planPath) {
+			this.session.notify("The run moved on while you edited; the plan was not saved", "warning");
+			return;
+		}
+		writeFileSync(planPath, edited);
+		this.notePlanSaved(planPath);
+		if (isPlannerIdle) await this.handleSavedPlan();
+	}
+
 	get hasPendingStart(): boolean {
 		return this.savedPlanPath !== undefined;
 	}
