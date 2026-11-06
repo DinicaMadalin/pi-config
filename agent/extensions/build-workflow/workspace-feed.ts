@@ -147,11 +147,6 @@ export class WorkspaceFeed {
 		);
 	}
 
-	/** Anything for the overview beyond the workspace's changes: a run, finished or not, or delegate runs. */
-	get hasAgents(): boolean {
-		return this.timeline !== undefined || this.delegates.length > 0;
-	}
-
 	overviewSnapshot(): OverviewSnapshot {
 		return {
 			timeline: this.timeline,

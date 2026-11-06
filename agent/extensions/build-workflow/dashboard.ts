@@ -39,10 +39,8 @@ const OVERVIEW_SHORTCUT = "alt+a";
 const FOCUS_PANEL_SHORTCUT = "alt+s";
 const STRIP_WIDGET_KEY = "dashboard";
 const FEED_REFRESH_MS = 500;
-/** Share of the terminal the centered overview takes. */
+/** Share of the terminal the centered overview takes: it is the expanded side pane, so always wider. */
 const OVERVIEW_SHARE = 0.95;
-/** Without agents the overview only lists the changes; a full-width card would be mostly empty. */
-const WORKSPACE_OVERVIEW_WIDTH = 96;
 /** Top and bottom border plus the blank line inside each. */
 const CARD_FRAME_ROWS = 4;
 /** Below the docked pane: the editor's box and Pi's footer, which the pane must not cover. */
@@ -219,7 +217,7 @@ export function registerDashboard(pi: ExtensionAPI, session: PlannerSession, orc
 				overlay: true,
 				overlayOptions: {
 					anchor: "center",
-					width: feed.hasAgents ? `${OVERVIEW_SHARE * 100}%` : WORKSPACE_OVERVIEW_WIDTH,
+					width: `${OVERVIEW_SHARE * 100}%`,
 					maxHeight: `${OVERVIEW_SHARE * 100}%`,
 				},
 			},
