@@ -7,6 +7,16 @@
 import type { Theme } from "@earendil-works/pi-coding-agent";
 import { type Component, type Focusable, Input, matchesKey, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
 import type { ActivityLine, RunningTool } from "./agent-activity.ts";
+import {
+	formatCost,
+	formatDuration,
+	modelWithThinking,
+	padEndToWidth,
+	padStartToWidth,
+	SPINNER_FRAMES,
+	spread,
+	truncatePathStart,
+} from "./card-text.ts";
 import { type ControlCommand, type ControlKey, controlsFor, type SelectedAgent } from "./agent-controls.ts";
 import type { BuildAgentKey, BuildTimeline, StageKey, StageRow, StageStatus } from "./build-timeline.ts";
 import type { DelegateStatus } from "./delegate-runs.ts";
@@ -60,6 +70,8 @@ export interface OverviewSnapshot {
 	/** The plan file's text, for the Plan tab; undefined until there is a plan. */
 	planText: string | undefined;
 	changes: ChangesView;
+	/** What the changes are counted against: the run's base commit, or HEAD (uncommitted work) outside a run. */
+	changesBase: string | undefined;
 	feeds: Partial<Record<AgentKey, AgentFeed>>;
 	delegates: readonly DelegateRow[];
 	nowMs: number;
@@ -74,6 +86,8 @@ export interface OverviewActions {
 	control(command: ControlCommand): Promise<string | undefined>;
 	/** Opens the plan in an editor; saving it is a plan change, like the planner saving it. */
 	editPlan(): void;
+	/** Docked panel only: opens the full-screen overview. */
+	expand?(): void;
 }
 
 export interface OverviewLayout {
@@ -81,7 +95,11 @@ export interface OverviewLayout {
 	bodyRows: () => number;
 	/** Syntax colors for the diff view; plain text without it. */
 	highlight?: HighlightCode;
+	/** Centered over the chat (Alt+A), or docked beside it, where Esc goes back to the chat. Centered by default. */
+	placement?: OverviewPlacement;
 }
+
+export type OverviewPlacement = "centered" | "docked";
 
 export type OverviewTab = "agents" | "changes" | "plan" | "report";
 
@@ -92,6 +110,8 @@ const TABS: readonly { tab: OverviewTab; key: string }[] = [
 	{ tab: "plan", key: "3" },
 	{ tab: "report", key: "4" },
 ];
+/** Outside a /build there is no plan or report. */
+const WORKSPACE_TABS = TABS.slice(0, 2);
 
 const AGENT_NAMES: Record<BuildAgentKey, string> = {
 	planner: "Planner",
@@ -119,8 +139,6 @@ function stepsOf(stages: readonly StageRow[]): { key: StageKey; status: StageSta
 }
 const ACTIVITY_LINES_SHOWN = 12;
 
-const SPINNER_FRAMES = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
-export const SPINNER_FRAME_MS = 100;
 /** The tab bar and the blank line under it. */
 const TAB_BAR_ROWS = 2;
 /** The Plan and Report tabs' line above the text: file name and position. */
@@ -146,16 +164,6 @@ const STAGE_SHORT_NAMES: Record<StageKey, string> = {
 	ship: "Ship",
 };
 
-type ThinkingColor = Parameters<Theme["fg"]>[0];
-const THINKING_COLORS: Record<string, ThinkingColor> = {
-	off: "thinkingOff",
-	minimal: "thinkingMinimal",
-	low: "thinkingLow",
-	medium: "thinkingMedium",
-	high: "thinkingHigh",
-	xhigh: "thinkingXhigh",
-	max: "thinkingMax",
-};
 
 function isDelegateKey(agent: AgentKey): agent is DelegateKey {
 	return agent.startsWith("delegate:");
@@ -169,44 +177,16 @@ function changedFiles(changes: ChangesView): FileChange[] {
 	return changes.kind === "loaded" && changes.result.ok ? changes.result.value.files : [];
 }
 
-export function formatDuration(durationMs: number): string {
-	const totalSeconds = Math.floor(durationMs / 1000);
-	if (totalSeconds < 60) return `${totalSeconds}s`;
-	const totalMinutes = Math.floor(totalSeconds / 60);
-	if (totalMinutes < 60) return `${totalMinutes}m ${String(totalSeconds % 60).padStart(2, "0")}s`;
-	return `${Math.floor(totalMinutes / 60)}h ${String(totalMinutes % 60).padStart(2, "0")}m`;
-}
 
 function taskHeadline(task: string): string {
 	const firstLine = task.split("\n").find((line) => line.trim() !== "") ?? task;
 	return firstLine.replace(/^#+\s*/, "").trim();
 }
 
-function formatCost(costUsd: number): string {
-	return costUsd > 0 ? `$${costUsd.toFixed(2)}` : "";
-}
 
-/** Keeps the end of a path, where the file name is. */
-function truncatePathStart(path: string, maxWidth: number): string {
-	if (visibleWidth(path) <= maxWidth) return path;
-	return `…${path.slice(path.length - maxWidth + 1)}`;
-}
 
-function padStartToWidth(text: string, width: number): string {
-	return " ".repeat(Math.max(0, width - visibleWidth(text))) + text;
-}
 
-function padEndToWidth(text: string, width: number): string {
-	const fitted = truncateToWidth(text, width, "…");
-	return fitted + " ".repeat(Math.max(0, width - visibleWidth(fitted)));
-}
 
-/** Left text, then right text flush right; the left side gives way when both do not fit. */
-function spread(left: string, right: string, width: number): string {
-	const rightWidth = visibleWidth(right);
-	const fittedLeft = truncateToWidth(left, Math.max(0, width - rightWidth - 1), "…");
-	return fittedLeft + " ".repeat(Math.max(1, width - visibleWidth(fittedLeft) - rightWidth)) + right;
-}
 
 export class AgentsOverview implements Component, Focusable {
 	private frameIndex = 0;
@@ -265,7 +245,11 @@ export class AgentsOverview implements Component, Focusable {
 			else if (this.diffView.handleInput(data) === "close") this.diffView = undefined;
 			return;
 		}
-		if (matchesKey(data, "escape") || matchesKey(data, "q") || matchesKey(data, "alt+a")) {
+		if (this.isDocked && matchesKey(data, "alt+a")) {
+			this.actions.expand?.();
+			return;
+		}
+		if (matchesKey(data, "escape") || matchesKey(data, "q") || matchesKey(data, "alt+a") || matchesKey(data, "alt+s")) {
 			this.actions.close();
 			return;
 		}
@@ -292,23 +276,31 @@ export class AgentsOverview implements Component, Focusable {
 		}
 	}
 
-	/** 1–4 pick a tab, Tab and Shift+Tab step through them; only a build has tabs. */
+	private get isDocked(): boolean {
+		return this.layout.placement === "docked";
+	}
+
+	private tabsOf(snapshot: OverviewSnapshot): readonly { tab: OverviewTab; key: string }[] {
+		return snapshot.timeline ? TABS : WORKSPACE_TABS;
+	}
+
+	/** The number keys pick a tab, Tab and Shift+Tab step through them. */
 	private switchTab(data: string, snapshot: OverviewSnapshot): boolean {
-		if (!snapshot.timeline) return false;
-		const picked = TABS.find((entry) => entry.key === data);
+		const tabs = this.tabsOf(snapshot);
+		const picked = tabs.find((entry) => entry.key === data);
 		if (picked) {
 			this.tab = picked.tab;
 			return true;
 		}
 		const step = matchesKey(data, "tab") ? 1 : matchesKey(data, "shift+tab") ? -1 : 0;
 		if (step === 0) return false;
-		const index = TABS.findIndex((entry) => entry.tab === this.tab);
-		this.tab = TABS[(index + step + TABS.length) % TABS.length].tab;
+		const index = Math.max(0, tabs.findIndex((entry) => entry.tab === this.currentTab(snapshot)));
+		this.tab = tabs[(index + step + tabs.length) % tabs.length].tab;
 		return true;
 	}
 
 	private currentTab(snapshot: OverviewSnapshot): OverviewTab {
-		return snapshot.timeline ? this.tab : "agents";
+		return this.tabsOf(snapshot).some((entry) => entry.tab === this.tab) ? this.tab : "agents";
 	}
 
 	private handleAgentsInput(data: string, snapshot: OverviewSnapshot, armedControl: ControlKey | undefined): void {
@@ -386,13 +378,14 @@ export class AgentsOverview implements Component, Focusable {
 			? this.diffView.render(innerWidth)
 			: snapshot.timeline
 				? this.renderBuild(snapshot.timeline, snapshot, innerWidth)
-				: snapshot.delegates.length > 0
-					? this.renderDelegatesOnly(snapshot, innerWidth)
-					: this.renderNoBuild();
+				: this.renderWorkspace(snapshot, innerWidth);
+		// Docked, the card is a pane: it keeps its height however little it shows.
+		const paneFill = this.isDocked ? Math.max(0, this.layout.bodyRows() - body.length) : 0;
 		const lines = [
 			this.topBorder(snapshot.timeline, width),
 			this.frame("", innerWidth),
 			...body.map((line) => this.frame(line, innerWidth)),
+			...Array.from({ length: paneFill }, () => this.frame("", innerWidth)),
 			this.frame("", innerWidth),
 			this.bottomBorder(snapshot, width),
 		];
@@ -453,8 +446,13 @@ export class AgentsOverview implements Component, Focusable {
 		return delegate ? `${capitalize(delegate.role)} ${delegate.runId}` : agent;
 	}
 
+	/** A docked pane lights its frame while it has the keys, so you see where typing goes. */
+	private get frameColor(): "borderAccent" | "borderMuted" {
+		return this.isDocked && this.isFocused ? "borderAccent" : "borderMuted";
+	}
+
 	private frame(content: string, innerWidth: number): string {
-		const border = this.theme.fg("borderMuted", "│");
+		const border = this.theme.fg(this.frameColor, "│");
 		return `${border} ${padEndToWidth(content, innerWidth)} ${border}`;
 	}
 
@@ -466,32 +464,35 @@ export class AgentsOverview implements Component, Focusable {
 				? `Build · issue #${timeline.planIssue.number}`
 				: timeline
 					? "Build"
-					: "Agents";
+					: "Workspace";
 		const title = `${theme.fg("accent", "◆")} ${theme.bold(name)}`;
 		const totals = timeline ? [formatDuration(timeline.activeMs), formatCost(timeline.costUsd)].filter(Boolean).join(" · ") : "";
 		const state = timeline?.isFinished ? "finished" : "";
 		const right = [state, totals].filter(Boolean).join(" · ");
 		const rightPart = right ? ` ${theme.fg("muted", right)} ` : "";
 		const fillWidth = Math.max(1, width - 5 - visibleWidth(title) - visibleWidth(rightPart));
-		return theme.fg("borderMuted", "╭─ ") + title + theme.fg("borderMuted", ` ${"─".repeat(fillWidth)}`) + rightPart + theme.fg("borderMuted", "╮");
+		const color = this.frameColor;
+		return theme.fg(color, "╭─ ") + title + theme.fg(color, ` ${"─".repeat(fillWidth)}`) + rightPart + theme.fg(color, "╮");
 	}
 
 	/** The bottom border's keys: how to move around; the agent's and run's controls get their own line. */
 	private keyHint(snapshot: OverviewSnapshot): string {
+		if (this.isDocked && !this.isFocused) return "alt+s focus · alt+a expand";
 		if (this.composer) return "enter send · esc cancel";
 		if (this.diffView) return this.diffView.keyHint();
-		const tabs = snapshot.timeline ? "1-4 tab · " : "";
+		const tabs = `1-${this.tabsOf(snapshot).length} tab · `;
 		const plan = snapshot.timeline?.planPath ? "p edit plan · " : "";
+		const leave = this.isDocked ? "alt+a expand · esc chat" : "esc close";
 		switch (this.currentTab(snapshot)) {
 			case "changes":
-				return `${tabs}↑↓ file · enter diff · ${plan}esc close`;
+				return `${tabs}↑↓ file · enter diff · ${plan}${leave}`;
 			case "plan":
 			case "report":
-				return `${tabs}↑↓ space b scroll · ${plan}esc close`;
+				return `${tabs}↑↓ space b scroll · ${plan}${leave}`;
 			case "agents": {
 				const current = this.currentAgent(snapshot);
 				const canMessage = current !== undefined && !isDelegateKey(current);
-				return `${tabs}↑↓ agent · ${canMessage ? "enter message · " : ""}${plan}esc close`;
+				return `${tabs}${current ? "↑↓ agent · " : ""}${canMessage ? "enter message · " : ""}${plan}${leave}`;
 			}
 		}
 	}
@@ -505,16 +506,37 @@ export class AgentsOverview implements Component, Focusable {
 		const maxPlanWidth = Math.max(0, width - 10 - visibleWidth(keys));
 		const plan = planName ? ` ${theme.fg("dim", truncatePathStart(`plan ${planName}`, maxPlanWidth))} ` : "";
 		const fillWidth = Math.max(1, width - 3 - visibleWidth(keys) - visibleWidth(plan));
-		return theme.fg("borderMuted", "╰─") + keys + theme.fg("borderMuted", "─".repeat(fillWidth)) + plan + theme.fg("borderMuted", "╯");
+		const color = this.frameColor;
+		return theme.fg(color, "╰─") + keys + theme.fg(color, "─".repeat(fillWidth)) + plan + theme.fg(color, "╯");
 	}
 
-	private renderNoBuild(): string[] {
+	/** Outside a /build: the delegates or how to start one, and the uncommitted changes. */
+	private renderWorkspace(snapshot: OverviewSnapshot, innerWidth: number): string[] {
+		const header = [...this.repoLines(snapshot.repo), this.tabBar(undefined, snapshot), ""];
+		if (this.currentTab(snapshot) === "changes") {
+			const filesShown = Math.max(MIN_FILES_SHOWN, this.layout.bodyRows() - header.length - FILE_LIST_FRAME_ROWS);
+			return [...header, ...this.changesLines(snapshot, snapshot.changesBase, innerWidth, filesShown)];
+		}
+		const selectedAgent = this.currentAgent(snapshot);
+		const agentLines =
+			snapshot.delegates.length === 0
+				? this.noAgentLines()
+				: [
+						...this.delegateSection(snapshot, innerWidth, selectedAgent).slice(1),
+						...(selectedAgent ? ["", ...this.activityLines(selectedAgent, snapshot, innerWidth)] : []),
+						...this.controlLines(snapshot, innerWidth),
+						...this.composerLines(selectedAgent, snapshot, innerWidth),
+					];
+		return [...header, ...agentLines, "", this.changesSummary(snapshot, snapshot.changesBase, innerWidth)];
+	}
+
+	private noAgentLines(): string[] {
 		const theme = this.theme;
 		return [
-			theme.bold("No build running"),
+			theme.fg("muted", "No agents running"),
 			"",
-			`${theme.fg("accent", "/build <task>")}   ${theme.fg("muted", "plan → implement → review")}`,
-			`${theme.fg("accent", "/issue #123")}     ${theme.fg("muted", "GitHub issue → fix → draft PR")}`,
+			`${theme.fg("accent", "/build <task>")}   ${theme.fg("dim", "plan → implement → two expert reviews")}`,
+			`${theme.fg("accent", "/issue #123")}     ${theme.fg("dim", "GitHub issue → fix → draft PR")}`,
 		];
 	}
 
@@ -530,7 +552,7 @@ export class AgentsOverview implements Component, Focusable {
 			case "agents":
 				return [...header, ...this.agentsTab(timeline, snapshot, innerWidth)];
 			case "changes":
-				return [...header, ...this.changesLines(snapshot, timeline.baseCommit, innerWidth, Math.max(MIN_FILES_SHOWN, rowsLeft - FILE_LIST_FRAME_ROWS))];
+				return [...header, ...this.changesLines(snapshot, snapshot.changesBase, innerWidth, Math.max(MIN_FILES_SHOWN, rowsLeft - FILE_LIST_FRAME_ROWS))];
 			case "plan":
 				this.seenPlanRevision = Math.max(this.seenPlanRevision, timeline.planRevision);
 				return [...header, ...this.planTab(timeline, snapshot, innerWidth)];
@@ -539,20 +561,21 @@ export class AgentsOverview implements Component, Focusable {
 		}
 	}
 
-	/** " 1 Agents   2 Changes 26   3 Plan v2 ●   4 Report ", the open tab highlighted. */
-	private tabBar(timeline: BuildTimeline, snapshot: OverviewSnapshot): string {
+	/** " 1 Agents   2 Changes 26   3 Plan v2 ●   4 Report ", the open tab highlighted; no plan or report outside a run. */
+	private tabBar(timeline: BuildTimeline | undefined, snapshot: OverviewSnapshot): string {
 		const theme = this.theme;
 		const fileCount = changedFiles(snapshot.changes).length;
-		const planVersion = timeline.planRevision > 1 ? ` v${timeline.planRevision}` : "";
-		const planChanged = timeline.planRevision > this.seenPlanRevision ? ` ${theme.fg("warning", "●")}` : "";
+		const planRevision = timeline?.planRevision ?? 1;
+		const planVersion = planRevision > 1 ? ` v${planRevision}` : "";
+		const planChanged = planRevision > this.seenPlanRevision ? ` ${theme.fg("warning", "●")}` : "";
 		const labels: Record<OverviewTab, string> = {
 			agents: "Agents",
 			changes: fileCount > 0 ? `Changes ${theme.fg("muted", String(fileCount))}` : "Changes",
 			plan: `Plan${planVersion}${planChanged}`,
-			report: timeline.report ? "Report" : theme.fg("dim", "Report"),
+			report: timeline?.report ? "Report" : theme.fg("dim", "Report"),
 		};
 		const openTab = this.currentTab(snapshot);
-		return TABS.map(({ tab, key }) => {
+		return this.tabsOf(snapshot).map(({ tab, key }) => {
 			if (tab === openTab) return theme.bg("selectedBg", ` ${theme.fg("accent", key)} ${theme.bold(labels[tab])} `);
 			return ` ${theme.fg("dim", key)} ${labels[tab]} `;
 		}).join(" ");
@@ -569,7 +592,7 @@ export class AgentsOverview implements Component, Focusable {
 			...this.controlLines(snapshot, innerWidth),
 			...this.composerLines(selectedAgent, snapshot, innerWidth),
 			"",
-			this.changesSummary(snapshot, timeline.baseCommit, innerWidth),
+			this.changesSummary(snapshot, snapshot.changesBase, innerWidth),
 		];
 	}
 
@@ -617,18 +640,6 @@ export class AgentsOverview implements Component, Focusable {
 		const { shown, firstLine, lastLine } = pager.page(lines, this.pagerRows());
 		const position = this.theme.fg("dim", `${firstLine}–${lastLine} of ${lines.length}`);
 		return [spread(heading, position, innerWidth), "", ...shown];
-	}
-
-	/** Only acp_delegate runs, no /build: the delegates and the selected one's activity. */
-	private renderDelegatesOnly(snapshot: OverviewSnapshot, innerWidth: number): string[] {
-		const selectedAgent = this.currentAgent(snapshot);
-		return [
-			...this.repoLines(snapshot.repo),
-			...this.delegateSection(snapshot, innerWidth, selectedAgent).slice(snapshot.repo ? 0 : 1),
-			...(selectedAgent ? ["", ...this.activityLines(selectedAgent, snapshot, innerWidth)] : []),
-			...this.controlLines(snapshot, innerWidth),
-			...this.composerLines(selectedAgent, snapshot, innerWidth),
-		];
 	}
 
 	private delegateSection(
@@ -841,9 +852,7 @@ export class AgentsOverview implements Component, Focusable {
 	}
 
 	private modelWithThinking(model: string, thinkingLevel: string | undefined): string {
-		if (!thinkingLevel) return model;
-		const thinkingColor = THINKING_COLORS[thinkingLevel] ?? "muted";
-		return `${model} ${this.theme.fg("dim", "·")} ${this.theme.fg(thinkingColor, thinkingLevel)}`;
+		return modelWithThinking(this.theme, model, thinkingLevel);
 	}
 
 	private timeText(stage: StageRow): string {
@@ -876,7 +885,7 @@ export class AgentsOverview implements Component, Focusable {
 		}
 		if (!changes.result.ok) return [`${heading}  ${theme.fg("error", changes.result.error)}`];
 		const { files, added, removed } = changes.result.value;
-		const since = baseCommit ? theme.fg("dim", ` since ${baseCommit.slice(0, 7)}`) : "";
+		const since = !baseCommit ? "" : theme.fg("dim", baseCommit === "HEAD" ? " uncommitted" : ` since ${baseCommit.slice(0, 7)}`);
 		if (files.length === 0) return [`${heading}${since}  ${theme.fg("dim", "no files changed yet")}`];
 
 		const totals = this.changeTotals({ added, removed, files });

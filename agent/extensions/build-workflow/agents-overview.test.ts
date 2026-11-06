@@ -4,7 +4,8 @@ import type { Theme } from "@earendil-works/pi-coding-agent";
 import { visibleWidth } from "@earendil-works/pi-tui";
 import type { ControlCommand } from "./agent-controls.ts";
 import type { FileDiffResult } from "./file-diff.ts";
-import { type AgentKey, AgentsOverview, type DelegateRow, formatDuration, type OverviewActions, type OverviewSnapshot } from "./agents-overview.ts";
+import { type AgentKey, AgentsOverview, type DelegateRow, type OverviewActions, type OverviewSnapshot } from "./agents-overview.ts";
+import { formatDuration } from "./card-text.ts";
 
 const plainTheme = {
 	fg: (_color: string, text: string) => text,
@@ -20,6 +21,7 @@ const markingTheme = { ...plainTheme, bg: (_color: string, text: string) => `[[$
 
 const busySnapshot: OverviewSnapshot = {
 	nowMs: 10_000,
+	changesBase: "abc1234def",
 	delegates: [],
 	planTitle: undefined,
 	planText: "# Write per-device resolutions\n\n## Goal\nEvery Location gets deviceResolutions.\n\n## Approach\n1. Map screens",
@@ -139,9 +141,10 @@ test("says no build is running when there is none", () => {
 		delegates: [],
 		timeline: undefined,
 		changes: { kind: "not-started" },
+		changesBase: "HEAD",
 	};
 	const text = new AgentsOverview(plainTheme, () => idle, noActions).render(72).join("\n");
-	assert.ok(text.includes("No build running"));
+	assert.ok(text.includes("Workspace") && text.includes("No agents running"), text);
 });
 
 test("closes on Escape and Alt+A", () => {
@@ -261,6 +264,7 @@ test("lists acp_delegate runs even without a build, with their task and activity
 		planText: undefined,
 		timeline: undefined,
 		changes: { kind: "not-started" },
+		changesBase: "HEAD",
 		delegates: [reviewerRun, { ...reviewerRun, key: "delegate:del_abc_2", runId: "del_abc_2", status: "completed", costUsd: 1 }],
 		feeds: { "delegate:del_abc_1": { activity: [{ kind: "tool", text: "bash  pnpm test", atMs: 0 }], runningTool: undefined, messageBlocker: "no" } },
 	};
@@ -345,4 +349,42 @@ test("p opens the plan in the editor from any tab; Tab steps through the tabs", 
 	assert.ok(overview.render(100).join("\n").includes("No report yet"));
 	overview.handleInput("p");
 	assert.equal(editCount, 1);
+});
+
+const uncommittedWork: OverviewSnapshot = {
+	nowMs: 0,
+	repo: { repoName: "pi-config", branch: "dashboard" },
+	planTitle: undefined,
+	planText: undefined,
+	feeds: {},
+	delegates: [],
+	timeline: undefined,
+	changesBase: "HEAD",
+	changes: {
+		kind: "loaded",
+		result: { ok: true, value: { added: 12, removed: 3, files: [{ path: "src/app.ts", added: 12, removed: 3, isBinary: false, isNew: false }] } },
+	},
+};
+
+test("outside a build the Changes tab lists the uncommitted work, and there is no Plan tab", () => {
+	const overview = new AgentsOverview(plainTheme, () => uncommittedWork, noActions);
+	assert.ok(overview.render(100).join("\n").includes("+12 −3 · 1 file"));
+	overview.handleInput("3");
+	overview.handleInput("2");
+	const text = overview.render(100).join("\n");
+	assert.ok(text.includes("Changes uncommitted") && text.includes("src/app.ts") && !text.includes("Plan"), text);
+});
+
+test("docked beside the chat, Esc goes back to the chat and Alt+A opens the full overview", () => {
+	const calls: string[] = [];
+	const actions: OverviewActions = { ...noActions, close: () => calls.push("close"), expand: () => calls.push("expand") };
+	const overview = new AgentsOverview(plainTheme, () => uncommittedWork, actions, { bodyRows: () => 20, placement: "docked" });
+	assert.ok(overview.render(60).join("\n").includes("alt+s focus"));
+	overview.focused = true;
+	const pane = overview.render(60);
+	assert.ok(pane.join("\n").includes("esc chat"));
+	assert.equal(pane.length, 20 + 4, "the docked pane keeps its full height");
+	overview.handleInput("\x1ba");
+	overview.handleInput("\x1b");
+	assert.deepEqual(calls, ["expand", "close"]);
 });

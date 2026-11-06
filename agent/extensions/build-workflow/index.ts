@@ -23,7 +23,7 @@ import type { TaskKind } from "../auto-model/classify-difficulty.ts";
 import { TASK_KIND_EVENT } from "../auto-model/route-pin.ts";
 import { SAVE_PLAN_TOOL_NAME } from "../project-memory/agreed-plan-files.ts";
 import { answerText } from "./agent-activity.ts";
-import { registerAgentsOverview } from "./agents-overview-panel.ts";
+import { registerDashboard } from "./dashboard.ts";
 import { BuildOrchestrator } from "./build-orchestrator.ts";
 import { ISSUE_USAGE, openPullRequest, promptForPullRequest, startIssueWorkflow } from "./issue-workflow.ts";
 import { PlanChanges } from "./plan-changes.ts";
@@ -97,7 +97,6 @@ export default function (pi: ExtensionAPI) {
 	const startDialog = new StartDialog(session, orchestrator);
 	const planChanges = new PlanChanges(session, orchestrator, startDialog);
 	const shipping = new Shipping(session, endRun);
-	registerAgentsOverview(pi, session, orchestrator, planChanges);
 
 	async function askAfterFailedReview(): Promise<void> {
 		if (session.workflow.phase !== "review-failed" || !session.hasUI) return;
@@ -167,6 +166,9 @@ export default function (pi: ExtensionAPI) {
 	pi.on("session_shutdown", () => {
 		orchestrator.stop();
 	});
+
+	// After the session_start above: the dashboard reads git through the session, which must be attached first.
+	registerDashboard(pi, session, orchestrator, planChanges);
 
 	pi.on("tool_call", (event) => {
 		const phase = session.workflow.phase;

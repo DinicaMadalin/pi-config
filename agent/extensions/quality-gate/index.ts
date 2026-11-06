@@ -13,6 +13,7 @@ import { createHash } from "node:crypto";
 import type { AgentBeforeSettleEvent, BoundaryResult, ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { checkFailureMessage } from "./check-failure-report.ts";
 import { type CheckRun, describeFailedCheck, runProjectChecks } from "./check-runner.ts";
+import { CHECK_STATUS_EVENT, type CheckStatus } from "./check-events.ts";
 import { CHECKS_CONFIG_RELATIVE_PATH, findProjectChecks, type ProjectChecks } from "./project-checks.ts";
 
 const MAX_FIX_ROUNDS_PER_PROMPT = 2;
@@ -94,8 +95,14 @@ export default function (pi: ExtensionAPI) {
 	let autoVerifyOverride: boolean | undefined;
 
 	async function runChecksWithStatus(projectChecks: ProjectChecks, ctx: ExtensionContext): Promise<CheckRun> {
+		const publish = (status: CheckStatus) => pi.events.emit(CHECK_STATUS_EVENT, status);
 		try {
-			return await runProjectChecks(pi, projectChecks, (check) => ctx.ui.setStatus(STATUS_KEY, `checks: ${check.name}…`));
+			const run = await runProjectChecks(pi, projectChecks, (check) => {
+				ctx.ui.setStatus(STATUS_KEY, `checks: ${check.name}…`);
+				publish({ kind: "running", checkName: check.name });
+			});
+			publish(run.kind === "passed" ? { kind: "passed", checkNames: run.passedNames } : { kind: "failed", checkName: run.failedCheck.name });
+			return run;
 		} finally {
 			ctx.ui.setStatus(STATUS_KEY, undefined);
 		}
