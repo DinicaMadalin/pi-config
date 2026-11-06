@@ -15,7 +15,7 @@ import {
 	getLanguageFromPath,
 	highlightCode,
 } from "@earendil-works/pi-coding-agent";
-import type { OverlayHandle, TUI } from "@earendil-works/pi-tui";
+import type { Component, OverlayHandle, TUI } from "@earendil-works/pi-tui";
 import { AgentsOverview, type OverviewActions } from "./agents-overview.ts";
 import type { BuildOrchestrator } from "./build-orchestrator.ts";
 import { SPINNER_FRAME_MS } from "./card-text.ts";
@@ -55,6 +55,12 @@ const highlightForPath: HighlightCode = (codeLines, path) => {
 	return highlightCode(codeLines.join("\n"), language);
 };
 
+/** The TUI class has getFocusedComponent; the type extensions get leaves it out. */
+function focusedComponentOf(tui: TUI): Component | null {
+	const tuiWithFocus = tui as TUI & { getFocusedComponent?: () => Component | null };
+	return tuiWithFocus.getFocusedComponent?.() ?? null;
+}
+
 function layoutPath(): string {
 	return join(getAgentDir(), "dashboard.json");
 }
@@ -65,9 +71,21 @@ export function registerDashboard(pi: ExtensionAPI, session: PlannerSession, orc
 	let layout: DashboardLayout = DEFAULT_LAYOUT;
 	let strip: DashboardStrip | undefined;
 	let renderer: TUI | undefined;
-	let dockedPane: { handle: OverlayHandle | undefined; overview: AgentsOverview; close: () => void } | undefined;
+	let dockedPane:
+		| {
+				handle: OverlayHandle | undefined;
+				overview: AgentsOverview;
+				tui: TUI;
+				close: () => void;
+		  }
+		| undefined;
 	/** Alt+S opened the pane while no agent works; it stays until Esc. */
 	let isPaneOpenedByHand = false;
+	/**
+	 * What had the keys in the chat (the editor) before the pane or the overview took them. Pi's overlays
+	 * remember it themselves, but after /reload that memory points at the old editor and the keys went nowhere.
+	 */
+	let chatFocus: Component | null = null;
 	let fullOverview: { close: () => void } | undefined;
 	let refreshTimer: ReturnType<typeof setInterval> | undefined;
 	let spinnerTimer: ReturnType<typeof setInterval> | undefined;
@@ -121,7 +139,7 @@ export function registerDashboard(pi: ExtensionAPI, session: PlannerSession, orc
 				};
 				const giveKeysBack = (): void => {
 					isPaneOpenedByHand = false;
-					dockedPane?.handle?.unfocus();
+					returnKeys();
 				};
 				const overview = new AgentsOverview(
 					theme,
@@ -134,7 +152,7 @@ export function registerDashboard(pi: ExtensionAPI, session: PlannerSession, orc
 						placement: "docked",
 					},
 				);
-				dockedPane = { handle: undefined, overview, close };
+				dockedPane = { handle: undefined, overview, tui, close };
 				return overview;
 			},
 			{
@@ -154,15 +172,21 @@ export function registerDashboard(pi: ExtensionAPI, session: PlannerSession, orc
 		);
 	}
 
+	function returnKeys(): void {
+		dockedPane?.handle?.unfocus(chatFocus ? { target: chatFocus } : undefined);
+	}
+
 	function toggleDockedFocus(): void {
-		const handle = dockedPane?.handle;
-		if (!handle || handle.isHidden()) return;
+		const pane = dockedPane;
+		const handle = pane?.handle;
+		if (!pane || !handle || handle.isHidden()) return;
 		if (handle.isFocused()) {
 			isPaneOpenedByHand = false;
-			handle.unfocus();
+			returnKeys();
 			return;
 		}
 		isPaneOpenedByHand = true;
+		chatFocus = focusedComponentOf(pane.tui);
 		handle.focus();
 	}
 
@@ -172,15 +196,17 @@ export function registerDashboard(pi: ExtensionAPI, session: PlannerSession, orc
 			fullOverview.close();
 			return;
 		}
+		// Before hiding the pane: hiding it moves the keys, possibly to a stale component.
+		if (renderer && !dockedPane?.handle?.isFocused()) chatFocus = focusedComponentOf(renderer);
 		dockedPane?.handle?.setHidden(true);
 		void ctx.ui.custom<void>(
 			(tui, theme, _keybindings, done) => {
 				const close = (): void => {
 					fullOverview = undefined;
+					isPaneOpenedByHand = false;
 					done();
-					const pane = dockedPane?.handle;
-					pane?.setHidden(false);
-					pane?.unfocus();
+					dockedPane?.handle?.setHidden(false);
+					if (chatFocus) tui.setFocus(chatFocus);
 				};
 				const overview = new AgentsOverview(theme, () => feed.overviewSnapshot(), overviewActions(ctx, close), {
 					bodyRows: () => Math.floor(tui.terminal.rows * OVERVIEW_SHARE) - CARD_FRAME_ROWS,
