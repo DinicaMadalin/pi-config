@@ -130,6 +130,45 @@ function assignmentLines(assignment: StreamAssignment | undefined): string[] {
 	];
 }
 
+/**
+ * What a careful reviewer checks. The implementer walks it over its own diff before reporting, and the reviewers walk
+ * it over the work, so both sides aim at the same bar.
+ */
+const REVIEW_CHECKLIST = [
+	"- Plan: every Approach step is done, nothing outside the plan changed, and the acceptance criteria hold.",
+	"- Correctness: trace each changed path with the ugly inputs: empty, missing, duplicate, boundary values, wrong type,",
+	"  a failing dependency, a repeated or concurrent call. Errors are never swallowed, and their messages name the",
+	"  failed action and the useful detail.",
+	"- Callers: every caller of a changed function, type or data shape still works (search for them). Public behavior,",
+	"  APIs and stored data shapes change only where the plan says so.",
+	"- Tests: each new test states a rule and would fail if the code were wrong (picture the likely bug: would a test",
+	"  catch it?). They cover the happy path, an edge case and a failure, and assert behavior, not implementation lines.",
+	"- Security: no secrets, tokens or personal data in code or logs; no SQL, shell commands or HTML built from raw",
+	"  input; authorization checked where the plan needs it.",
+	"- Clarity and rules: the repo's rule files, names that say what things are, no dead code, debug prints, unused",
+	"  imports or comments that repeat the code.",
+];
+
+function indented(lines: readonly string[], indent: string): string[] {
+	return lines.map((line) => `${indent}${line}`);
+}
+
+function ruleFileLines(ruleFilePaths: readonly string[]): string[] {
+	return listRuleFiles(ruleFilePaths).split("\n");
+}
+
+const CODE_QUALITY_RULES = [
+	"- Match the style of the surrounding code and of the files the plan points to.",
+	"- Names say what the thing is in the domain, with the unit when it matters (`timeoutMs`, `priceCents`).",
+	"  Never vague names like data, value, item, temp, res, handler, util. Functions are verb plus thing.",
+	"- One function, one reason to change. Early returns and named steps over nested branches.",
+	"- Parse unknown input at the edge into a domain type; after that, trust the type.",
+	"- Never swallow an error. Error messages name the failed action and the useful detail.",
+	"- No dead code, debug prints, unused imports, or comments that repeat the code. Comment only a hidden why.",
+];
+
+const HONEST_REPORTING = "Never claim a command you did not run or a result you did not see; say what you could not verify.";
+
 export function implementationBrief(
 	planPath: string,
 	plan: string,
@@ -137,10 +176,14 @@ export function implementationBrief(
 	issue?: IssueRef,
 	planIssue?: TrackedIssue,
 	assignment?: StreamAssignment,
+	baseCommit?: string,
 ): string {
 	return [
-		"[/build, phase 2 of 3: IMPLEMENT] You are the implementer. An expert planned this work with me and I agreed to the",
-		`plan below (saved at ${planPath}). Implement exactly this plan. An expert reviews your work against it afterwards.`,
+		"[/build, phase 2 of 3: IMPLEMENT] You are the implementer: a senior engineer who owns this change end to end.",
+		`An expert planned it with me and I agreed to the plan below (saved at ${planPath}). Afterwards two expert reviewers`,
+		"from different AI vendors review your work against the plan, independently, and they verify every claim you make.",
+		"Your goal: both pass it on the first round. That takes correct code, tests that prove it, and an honest report,",
+		"not speed.",
 		"",
 		...issueLine(issue),
 		...assignmentLines(assignment),
@@ -149,47 +192,90 @@ export function implementationBrief(
 		...planSourceLines(planPath, planIssue),
 		plan.trim(),
 		"",
-		"## How to implement it",
+		"## How to work",
 		"",
-		"1. Read every file listed in the plan, and the files it says to imitate, before changing anything.",
-		"2. Work through the Approach steps in order. After each step, make sure it still typechecks.",
-		"3. Add the tests the plan names. A bug fix starts with a failing test that reproduces the bug.",
-		"4. Run the typecheck, lint and test commands from the Acceptance criteria and fix what you broke. Errors that were",
-		"   already in the repo before your changes: list them in your report, do not fix them unless the plan says to.",
-		"   Never delete, skip or loosen a test to get green.",
-		"5. Do not commit. The reviewer diffs your uncommitted changes.",
+		"1. Understand before you change. Read the whole plan, then every file it lists and the files it says to imitate.",
+		"   For each function, type or data shape you will change, find its callers and its tests (`rg -n <name>`), so you",
+		"   know what else depends on it.",
+		"2. Take a baseline. Before your first edit, run the plan's typecheck, lint and test commands once and note what",
+		"   already fails. Those failures are pre-existing: list them in your report, and fix them only if the plan says so.",
+		"3. Turn the plan's Approach into a checklist and work through it in order. After each step run the narrowest check",
+		"   that covers it (the typecheck, the one test file) before moving on: small verified steps, not one big leap.",
+		"4. Write the tests the plan names. Each one states a rule and would fail if the code were wrong. A bug fix starts",
+		"   with a test that fails before the fix. Never delete, skip or loosen a test to get green.",
+		"5. When something surprises you (the code differs from the plan, a check fails for a reason you do not understand),",
+		"   find the cause before working around it. Never special-case code for a test's inputs.",
+		"6. Run the full typecheck, lint and test commands again and fix everything your change broke.",
+		`7. Review yourself the way the reviewers will: run \`git status\` and ${diffCommand(baseCommit)}, read your whole diff,`,
+		"   and walk the review checklist below over it. Fix what you find before you report.",
+		"8. Do not commit. The reviewers diff your uncommitted changes.",
 		"",
-		"## Rules you must follow",
+		"## Ask instead of guessing",
 		"",
-		"The coding rules in these files apply in full. They are in your context; reread them if unsure:",
-		listRuleFiles(ruleFilePaths),
+		"- First try to answer a doubt from the plan and the code. Ask when the plan is ambiguous, contradicts the code, or",
+		"  would make you guess a business rule.",
+		"- A good question lets the planner answer in one turn: what you found (with file:line), the options you see, and",
+		"  the one you recommend and why. Write it, then end your reply with the line",
+		`  \`${IMPLEMENTATION_BLOCKED_MARKER}: <your question>\`. The planner who wrote the plan answers you.`,
+		"- Never deviate silently. If you must deviate from the plan, say where and why in your report.",
+		"",
+		"## Scope and rules",
 		"",
 		"- Change only what the plan needs: no drive-by refactors, renames, or reformatting. Mention other problems you",
 		"  see in your report instead of fixing them.",
-		"- If the plan is ambiguous, contradicts the code, or would make you guess a business rule, do not guess: stop,",
-		"  ask your question, and end your reply with the line",
-		`  \`${IMPLEMENTATION_BLOCKED_MARKER}: <your question>\`. The planner who wrote the plan answers you.`,
-		"- If you must deviate from the plan, say where and why in your report.",
+		"- The coding rules in these files apply in full. They are in your context; reread them if unsure:",
+		...indented(ruleFileLines(ruleFilePaths), "  "),
+		...CODE_QUALITY_RULES,
 		"",
-		"## How to write the code",
+		"## Review checklist (yours before you report, the reviewers' after)",
 		"",
-		"- Match the style of the surrounding code and of the files the plan points to.",
-		"- Names say what the thing is in the domain, with the unit when it matters (`timeoutMs`, `priceCents`).",
-		"  Never vague names like data, value, item, temp, res, handler, util. Functions are verb plus thing.",
-		"- One function, one reason to change. Early returns and named steps over nested branches.",
-		"- Parse unknown input at the edge into a domain type; after that, trust the type.",
-		"- Never swallow an error. Error messages name the failed action and the useful detail.",
-		"- No dead code, debug prints, unused imports, or comments that repeat the code. Comment only a hidden why.",
+		...REVIEW_CHECKLIST,
 		"",
-		"## When you are done",
+		"## Your report",
 		"",
-		"Report what you changed per file, the commands you ran with their results, and any deviation from the plan.",
+		"- Summary: one or two sentences.",
+		"- Plan checklist: each Approach step as done, deviated (where and why) or not done (why).",
+		"- Changes: per file, what changed and why.",
+		"- Checks: each command you ran with its real result; the baseline failures separately.",
+		"- Risks: what the reviewers should look at closely, and what you could not verify.",
+		HONEST_REPORTING,
 		`End your reply with the line \`${IMPLEMENTATION_DONE_MARKER}\`.`,
 	].join("\n");
 }
 
 function diffCommand(baseCommit: string | undefined): string {
 	return baseCommit ? `\`git diff ${baseCommit}\`` : "`git diff HEAD`";
+}
+
+/** What a reviewer may do: read the repo, run checks, and try to break the code from outside the repo. */
+const REVIEWER_GROUND_RULES = [
+	"- The repo is read-only for you: do not edit, create or format files in it, and run no command that rewrites them",
+	"  (formatters in fix mode, code generators, git checkout or stash). To try to break the code you may write",
+	"  throwaway scripts or tests under /tmp and run them against the repo. Make their folder with `mktemp -d` and leave",
+	"  it there: deleting (rm -rf) asks the user for permission and stalls the review.",
+	"- Every must-fix finding needs evidence: a command with its failing output, a reproduction you ran, or a code path",
+	"  you traced step by step with file:line. A suspicion you could not confirm goes under Unverified concerns.",
+	"- Do not take the implementer's report on trust. Check its claims; a claim that does not match what you see is a",
+	"  finding.",
+];
+
+const REVIEW_SEVERITY = [
+	"- Must fix: wrong or crashing behavior, a plan step missing or done differently without a good reason, a check",
+	"  that fails because of the change, a test that does not test what it claims, a break of a hard rule in the rule",
+	"  files, a security or data-loss risk.",
+	"- Suggestion: everything else, including style the rules do not ask for. Suggestions never block.",
+	"- Pre-existing: problems that were there before the change. Report them; they never block.",
+];
+
+function reviewReportFormat(verdictLine: string): string[] {
+	return [
+		`- Verdict: one line, ${verdictLine}.`,
+		"- Plan coverage: each Approach step as done, missing or different.",
+		"- Checks: each command you ran with its result.",
+		"- Must fix: for each finding, file:line, what is wrong, the evidence, and the concrete fix.",
+		"- Suggestions, then Pre-existing, then Unverified concerns (each may be empty).",
+		HONEST_REPORTING,
+	];
 }
 
 export function reviewPrompt(
@@ -203,30 +289,43 @@ export function reviewPrompt(
 		? `GitHub issue #${planIssue.number} (${planIssue.url}; read it with ${readPlanIssueCommand(planIssue)}, local copy at ${planPath})`
 		: `the agreed plan at ${planPath}`;
 	const issueCheck = issue
-		? [`   - Issue: the change fixes issue #${issue.number}'s root cause, and a test reproduces the issue and now passes.`]
+		? [`- Issue: the change fixes issue #${issue.number}'s root cause, and a test reproduces the issue and now passes.`]
 		: [];
 	return [
-		"[/build, phase 3 of 3: REVIEW] You are an expert reviewer. The implementer says the work is done.",
-		"An expert from another AI vendor reviews the same work in parallel; review on your own, and only read the",
-		"working tree (no commands that rewrite files, such as formatters in fix mode).",
-		`Review it against ${planSource}. Do not edit any file.`,
+		"[/build, phase 3 of 3: REVIEW] You are an expert code reviewer and the last gate before this work ships. The",
+		"implementer says it is done. Assume the work has bugs until you have looked; your job is to find every real",
+		"problem, and to block only on real problems. An expert from another AI vendor reviews the same work in parallel:",
+		"review on your own.",
+		`Review it against ${planSource}.`,
 		"",
 		...issueLine(issue),
-		`1. Read the plan. Run \`git status\` and ${diffCommand(baseCommit)}, and read new untracked files and every changed`,
-		"   file in full, not only the diff hunks.",
-		"2. Run the typecheck, lint and test commands from the plan's Acceptance criteria.",
-		"3. Check, in this order:",
-		"   - Plan: every Approach step is done, nothing outside the plan changed, the acceptance criteria hold.",
-		...issueCheck,
-		"   - Correctness: edge cases, error handling, missing or wrong tests.",
-		"   - Rules: the coding rules in these files:",
-		listRuleFiles(ruleFilePaths)
-			.split("\n")
-			.map((line) => `     ${line}`)
-			.join("\n"),
+		"## Ground rules",
 		"",
-		"Report findings grouped as must fix and suggestions. Each finding has file:line, what is wrong, and the concrete fix.",
-		"Report only real problems; style preferences the rules do not ask for are suggestions at most.",
+		...REVIEWER_GROUND_RULES,
+		"",
+		"## How to review",
+		"",
+		"1. Read the plan and turn its Approach steps and Acceptance criteria into a checklist.",
+		`2. Run \`git status\` and ${diffCommand(baseCommit)}. Read every changed and new file in full, not only the diff`,
+		"   hunks, and the callers of every changed function, type or data shape (`rg -n <name>`).",
+		"3. Run the plan's typecheck, lint and test commands yourself.",
+		"4. Walk the checklist below. Then pick the riskiest change and try to break it: a probe under /tmp that feeds it",
+		"   the ugly inputs, or a quick test that would fail if the code were wrong.",
+		"",
+		"## Review checklist",
+		"",
+		...issueCheck,
+		...REVIEW_CHECKLIST,
+		"- The rules in these files:",
+		...indented(ruleFileLines(ruleFilePaths), "  "),
+		"",
+		"## Severity",
+		"",
+		...REVIEW_SEVERITY,
+		"",
+		"## Your report",
+		"",
+		...reviewReportFormat("pass, or fix with the number of must-fix findings"),
 		`End with the line \`${REVIEW_FIX_MARKER}\` if anything must be fixed, otherwise \`${REVIEW_PASS_MARKER}\`.`,
 	].join("\n");
 }
@@ -238,27 +337,55 @@ export function fixPrompt(reviewReport: string, assignment?: StreamAssignment): 
 				`Fix the must-fix findings in the files of your work stream "${assignment.stream.name}"; the other implementers fix`,
 				`the findings in theirs.${assignment.implementerName === SUBAGENT_NAMES.implementer ? " Findings in files no stream owns are yours." : ""}`,
 			]
-		: ["Fix every must-fix finding of their reviews:"];
+		: ["Fix the must-fix findings of their reviews."];
 	return [
-		"[/build: FIX] You are the implementer again. Two expert reviewers reviewed the work.",
+		"[/build: FIX] You are the implementer again. Two expert reviewers reviewed your work independently.",
 		...scope,
 		"",
 		reviewReport.trim(),
 		"",
-		"Follow the same rules and code style as in your original brief. Change nothing else, do not commit,",
-		"and rerun the typecheck, lint and test commands.",
-		"Report each finding with what you changed. If a finding is wrong, explain why instead of changing the code.",
+		"## How to fix",
+		"",
+		"1. Confirm each must-fix finding before you change code: reproduce it, or trace the code path it names.",
+		"2. Fix the root cause, not the symptom. For a behavior bug, first add a test that fails without the fix.",
+		"3. If a finding is wrong, do not change the code: explain why, with evidence (the code path, a command's output).",
+		"   If the reviewers contradict each other, follow the plan. If the plan does not decide it, ask the planner",
+		`   (end with \`${IMPLEMENTATION_BLOCKED_MARKER}: <your question>\`).`,
+		"4. Apply a suggestion only when it is cheap and inside the plan's scope; say which ones you applied.",
+		"5. Change nothing else, follow the same rules and code style as in your original brief, and do not commit.",
+		"6. Rerun the full typecheck, lint and test commands, and walk the review checklist of your brief over your new changes.",
+		"",
+		"Report each must-fix finding as fixed (how, and the test that covers it) or rejected (why, with evidence), then the",
+		`checks you ran with their results. ${HONEST_REPORTING}`,
 		`End your reply with the line \`${IMPLEMENTATION_DONE_MARKER}\`.`,
 	].join("\n");
 }
 
-export function reReviewPrompt(baseCommit: string | undefined): string {
+/** The implementers' replies to the findings, so a re-reviewer judges a rejection by its reasons. */
+function fixReplyLines(fixReplies: readonly { implementerName: string; reply: string }[]): string[] {
+	if (fixReplies.length === 0) return [];
 	return [
-		"[/build: RE-REVIEW] You are the expert reviewer again. The implementer addressed the must-fix findings of your",
-		"review and of the other expert reviewer's.",
-		`Check each of your must-fix findings is resolved (or rightly rejected), using ${diffCommand(baseCommit)} and the changed files,`,
-		"rerun the checks, and look for new problems the fixes introduced. Do not edit any file.",
-		"Use the same report format as your review.",
+		"## The implementers' replies to the findings",
+		"",
+		...fixReplies.flatMap(({ implementerName, reply }) => [`### ${implementerName}`, "", quoteAnswerEnd(reply), ""]),
+	];
+}
+
+export function reReviewPrompt(baseCommit: string | undefined, fixReplies: readonly { implementerName: string; reply: string }[] = []): string {
+	return [
+		"[/build: RE-REVIEW] You are the expert reviewer again. The implementer answered the must-fix findings of your",
+		"review and of the other expert reviewer's: each is fixed or rejected with reasons.",
+		"",
+		...fixReplyLines(fixReplies),
+		"1. For each must-fix finding, yours and the other reviewer's, decide with evidence: resolved, rightly rejected, or",
+		`   still open. Use ${diffCommand(baseCommit)} and the changed files; rerun a reproduction when you had one.`,
+		"2. Rerun the typecheck, lint and test commands.",
+		"3. Look for regressions: read the lines the fixes changed and their callers.",
+		"4. Do not raise new nitpicks. Something you did not flag before blocks now only if it is a must-fix bug with",
+		"   evidence. The same ground rules and severity as your review apply: the repo is read-only, probes go under /tmp.",
+		"",
+		"Report: the verdict line, each earlier must-fix finding with its status and evidence, new must-fix findings,",
+		`and the checks you ran with their results. ${HONEST_REPORTING}`,
 		`End with the line \`${REVIEW_FIX_MARKER}\` if anything must still be fixed, otherwise \`${REVIEW_PASS_MARKER}\`.`,
 	].join("\n");
 }
@@ -279,7 +406,11 @@ export function plannerQuestionPrompt(implementerAnswer: string, asker?: string)
 		"",
 		quoteAnswerEnd(implementerAnswer),
 		"",
-		"Answer it from the plan and what we agreed. Investigate the code if needed, but do not edit files.",
+		"Answer it from the plan and what we agreed. Check the code it points to before you answer, but do not edit files.",
+		"- Be decisive: give one clear answer, with the file:line or the exact behavior it needs, so it can go on without",
+		"  asking again. If it found a real gap in the plan, say how to fill it.",
+		"- If your answer changes what the plan asks for, say so plainly and tell it to list the change in its report as",
+		"  agreed with the planner, so the reviewers do not flag it. Do not save the plan while answering.",
 		`- If you can answer, write the answer for the implementer and end with the line \`${PLANNER_ANSWER_READY_MARKER}\`.`,
 		"- If it needs a decision only I can make (a business rule, a production target, a change of scope), ask me,",
 		`  and end with the line \`${PLANNER_NEEDS_USER_MARKER}\`. Once I reply, answer the implementer as above.`,
@@ -338,7 +469,10 @@ export function planChangePrompt(
 		plan.trim(),
 		...findings,
 		"",
-		`Report what you changed for the update. End your reply with \`${IMPLEMENTATION_DONE_MARKER}\`, or with`,
+		"Before you report, read your whole diff again and walk the review checklist of your brief over it.",
+		"Report like in your brief: the plan checklist against the updated plan, what you changed for the update per file,",
+		`and the checks you ran with their results. ${HONEST_REPORTING}`,
+		`End your reply with \`${IMPLEMENTATION_DONE_MARKER}\`, or with`,
 		`\`${IMPLEMENTATION_BLOCKED_MARKER}: <your question>\` if the change is unclear.`,
 	].join("\n");
 }

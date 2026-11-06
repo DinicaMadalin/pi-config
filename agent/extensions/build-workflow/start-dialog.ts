@@ -100,7 +100,7 @@ export class StartDialog {
 		// The awaits above let you stop the run or save another plan meanwhile; then this start is stale.
 		if (this.session.workflow !== awaiting) return;
 		const work = { planPath, baseCommit, ...(issue && { issue }), ...(planIssue && { planIssue }) };
-		this.orchestrator.startImplementation(work, plan, (assignment) => implementationBrief(planPath, plan, ruleFiles, issue, planIssue, assignment));
+		this.orchestrator.startImplementation(work, plan, (assignment) => implementationBrief(planPath, plan, ruleFiles, issue, planIssue, assignment, baseCommit));
 		const started = implementerCount(this.session.workflow);
 		const who = started > 1 ? `${started} implementers started as subagents, one per work stream` : "Implementer started as a subagent";
 		this.session.notify(`${who}. Alt+A shows the agents; you can keep talking to the planner.`, "info");

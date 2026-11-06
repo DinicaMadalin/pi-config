@@ -29,6 +29,7 @@ import {
 	type DelegatedState,
 	type FeatureState,
 	type FeatureWork,
+	agentOfRecord,
 	featureWorkOf,
 	hasReviewVerdict,
 	isImplementerRole,
@@ -350,7 +351,7 @@ export class BuildOrchestrator {
 		const next: DelegatedState = { phase: "re-review", ...featureWorkOf(state) };
 		if (!next.reviewerSessions) return "This run has no reviewer sessions to continue";
 		this.seat.enterPhase(next);
-		this.beginStage(next, () => reReviewPrompt(next.baseCommit));
+		this.beginStage(next, () => reReviewPrompt(next.baseCommit, this.latestFixReplies()));
 		return undefined;
 	}
 
@@ -494,6 +495,15 @@ export class BuildOrchestrator {
 	}
 
 	/** Each implementer's fix prompt: the merged review, and its own work stream when there are several. */
+	/** Each implementer's last fix report, so the re-reviewers can check its claims and rejections. */
+	private latestFixReplies(): { implementerName: string; reply: string }[] {
+		const replyByAgent = new Map<SubagentRole, string>();
+		for (const record of this.seat.runStageRecords()) {
+			if (record.stage === "fix") replyByAgent.set(agentOfRecord(record), record.report);
+		}
+		return [...replyByAgent].map(([agent, reply]) => ({ implementerName: SUBAGENT_NAMES[agent], reply }));
+	}
+
 	private fixPromptFor(state: DelegatedState, findings: string): (seat: StageSeat) => string {
 		const plan = this.seat.readPlan(state.planPath);
 		const assignments = plan === undefined ? new Map<SubagentRole, StreamAssignment | undefined>() : streamAssignments(state.implementers ?? [], plan);
@@ -675,7 +685,7 @@ export class BuildOrchestrator {
 				return;
 			case "re-review":
 				this.seat.enterPhase(next);
-				this.beginStage(next, () => reReviewPrompt(next.baseCommit));
+				this.beginStage(next, () => reReviewPrompt(next.baseCommit, this.latestFixReplies()));
 				return;
 			case "review-failed":
 				await this.finishRun(previous, next, "the re-review still has findings, and the fix round is used up");

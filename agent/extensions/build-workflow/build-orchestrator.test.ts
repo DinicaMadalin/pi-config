@@ -251,9 +251,10 @@ test("a re-review that still finds problems waits for your call, and fixing agai
 	agent("OpenAI reviewer").settle("REVIEW_VERDICT: pass");
 	await settleAsync();
 	assert.equal(phaseOf(recorded), "fix");
-	agent("Implementer").settle("IMPLEMENTATION: done");
+	agent("Implementer").settle("Fixed a.ts:3 with a boundary test\nIMPLEMENTATION: done");
 	await settleAsync();
 	assert.equal(phaseOf(recorded), "re-review");
+	assert.ok(agent("Claude reviewer").prompts.at(-1)?.includes("Fixed a.ts:3 with a boundary test"), "re-reviewers see the fix reply");
 	agent("Claude reviewer").settle("still off by one\nREVIEW_VERDICT: fix");
 	agent("OpenAI reviewer").settle("REVIEW_VERDICT: pass");
 	await settleAsync();
