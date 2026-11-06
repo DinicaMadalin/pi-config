@@ -158,7 +158,9 @@ export default function (pi: ExtensionAPI) {
 		session.attach(ctx);
 		hasSuggestedWorkflow = false;
 		const phase = session.workflow.phase;
-		if (isDelegatedPhase(phase)) session.notify(`/build was interrupted in the ${phase} phase; /build implement resumes it`, "warning");
+		if (isDelegatedPhase(phase)) {
+			session.notify(`/build was interrupted in the ${phase} phase; /build implement resumes it, /build stop ends it`, "warning");
+		}
 		if (phase === "review-failed") session.notify("/build waits for your decision on the re-review; /build implement asks", "info");
 	});
 
@@ -171,8 +173,8 @@ export default function (pi: ExtensionAPI) {
 		if (canPlannerEditFiles(phase) || !FILE_EDITING_TOOLS.has(event.toolName)) return undefined;
 		const reason =
 			phase === "plan" || phase === "awaiting-implementation"
-				? `/build ${phase} phase: nothing is edited until the plan is agreed; the implementer edits the files`
-				: "/build: the implementer edits the files. To change the work, change the plan (save it again) or message the implementer (Alt+A)";
+				? `/build ${phase} phase: nothing is edited until the plan is agreed; the implementer edits the files (/build stop ends the run)`
+				: `/build ${phase} phase: the implementer edits the files. To change the work, save the plan again or message the implementer (Alt+A); /build stop ends the run and allows edits here again`;
 		return { block: true, reason };
 	});
 

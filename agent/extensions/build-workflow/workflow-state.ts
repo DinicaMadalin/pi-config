@@ -181,6 +181,22 @@ export function findWorkflowState(branchEntries: readonly SessionEntryLike[]): W
 	return IDLE_WORKFLOW;
 }
 
+/**
+ * The run the planner's session is in. A subagent's session starts in its own stage (implement, review), and
+ * /resume lists it like any session; opened by hand it is a plain session, so its stage must not block edits
+ * there or pass for an interrupted run. A /build started in it later counts again.
+ */
+export function findPlannerWorkflowState(branchEntries: readonly SessionEntryLike[]): WorkflowState {
+	const states = branchEntries
+		.filter((entry) => entry.type === "custom" && entry.customType === WORKFLOW_STATE_ENTRY_TYPE)
+		.map((entry) => parseWorkflowState(entry.data));
+	const firstState = states[0];
+	const isSubagentSession = firstState !== undefined && isDelegatedPhase(firstState.phase);
+	if (!isSubagentSession) return findWorkflowState(branchEntries);
+	const hasPlannerRun = states.some((state) => state?.phase === "plan" || state?.phase === "awaiting-implementation");
+	return hasPlannerRun ? findWorkflowState(branchEntries) : IDLE_WORKFLOW;
+}
+
 /** The plan of the session's last run that got as far as an agreed plan, e.g. to start a new run from it. */
 export function findLastRunPlan(branchEntries: readonly SessionEntryLike[]): { task: string; planPath: string } | undefined {
 	for (let index = branchEntries.length - 1; index >= 0; index--) {

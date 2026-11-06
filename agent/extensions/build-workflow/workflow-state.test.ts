@@ -5,6 +5,7 @@ import {
 	canPlannerEditFiles,
 	type FeatureWork,
 	findLastRunPlan,
+	findPlannerWorkflowState,
 	findWorkflowState,
 	mergeReviews,
 	planChangeReaction,
@@ -212,4 +213,24 @@ test("a reviewer without a verdict holds the review even when the other passed",
 test("each reviewer routes to the expert tier with its own vendor's models first", () => {
 	assert.deepEqual(reviewerRoute("openai"), { route: "tier", tier: "expert", preferredProvider: "openai" });
 	assert.deepEqual(reviewerRoute("anthropic"), { route: "tier", tier: "expert", preferredProvider: "anthropic" });
+});
+
+const stateEntry = (data: unknown) => ({ type: "custom", customType: WORKFLOW_STATE_ENTRY_TYPE, data });
+const userEntry = { type: "message" };
+
+test("a resumed subagent session is not a stuck /build run, so the planner rules do not apply in it", () => {
+	const implementerSession = [stateEntry({ phase: "implement", ...work }), userEntry, userEntry];
+	assert.deepEqual(findPlannerWorkflowState(implementerSession), { phase: "idle" });
+	const reviewerSession = [stateEntry({ phase: "review", ...work })];
+	assert.deepEqual(findPlannerWorkflowState(reviewerSession), { phase: "idle" });
+});
+
+test("a /build started later in a resumed subagent session is followed like any run", () => {
+	const entries = [stateEntry({ phase: "implement", ...work }), userEntry, stateEntry({ phase: "plan", task: "next" })];
+	assert.deepEqual(findPlannerWorkflowState(entries), { phase: "plan", task: "next" });
+});
+
+test("the planner's own session keeps its run, including an interrupted one", () => {
+	const entries = [stateEntry({ phase: "plan", task: "x" }), userEntry, stateEntry({ phase: "implement", ...work })];
+	assert.equal(findPlannerWorkflowState(entries).phase, "implement");
 });

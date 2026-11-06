@@ -7,7 +7,7 @@ import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-a
 import { ROUTE_PIN_ENTRY_TYPE, type RoutePin } from "../auto-model/route-pin.ts";
 import type { RunCommand } from "./github-issue.ts";
 import {
-	findWorkflowState,
+	findPlannerWorkflowState,
 	IDLE_WORKFLOW,
 	plannerRouteForPhase,
 	WORKFLOW_STATE_ENTRY_TYPE,
@@ -66,7 +66,7 @@ export class PlannerSession {
 	/** A new or reloaded session: the run continues from the state stored in it. */
 	attach(ctx: ExtensionContext): void {
 		this.ctx = ctx;
-		this.workflowState = findWorkflowState(ctx.sessionManager.getBranch());
+		this.workflowState = findPlannerWorkflowState(ctx.sessionManager.getBranch());
 		this.showPhase();
 	}
 
