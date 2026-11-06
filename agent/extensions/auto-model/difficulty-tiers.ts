@@ -29,16 +29,21 @@ export const DEFAULT_TIER_POLICIES: TierPolicies = {
 		minThinkingLevel: "medium",
 	},
 	standard: {
-		models: ["opencode-go/gpt-6-luna", "anthropic/claude-sonnet-5-5", "opencode-go/glm-5.3"],
+		models: [
+			"opencode-go/gpt-6-luna",
+			"openai/gpt-6-luna",
+			"anthropic/claude-sonnet-5-5",
+			"opencode-go/glm-5.3",
+		],
 		thinkingLevel: "medium",
 		minThinkingLevel: "medium",
 	},
 	complex: {
-		models: ["anthropic/claude-opus-5-5"],
+		models: ["anthropic/claude-opus-5-5", "openai/gpt-6.1-sol"],
 		thinkingLevel: "high",
 	},
 	expert: {
-		models: ["anthropic/claude-opus-5-5"],
+		models: ["openai/gpt-6-astra", "openai/gpt-6.1-sol", "anthropic/claude-opus-5-5"],
 		thinkingLevel: "high",
 		// Jev may still pick xhigh for the hardest tasks.
 		minThinkingLevel: "high",
@@ -81,6 +86,13 @@ export function modelKey(model: Pick<Model<Api>, "provider" | "id">): string {
 
 function canReadImages(model: Model<Api>): boolean {
 	return model.input.includes("image");
+}
+
+/** The provider's models first, in their tier order, then the tier's other models as fallbacks. */
+export function preferProvider(policy: TierPolicy, provider: string): TierPolicy {
+	const isFromProvider = (key: string) => key.startsWith(`${provider}/`);
+	const models = [...policy.models.filter(isFromProvider), ...policy.models.filter((key) => !isFromProvider(key))];
+	return { ...policy, models };
 }
 
 /** Price per million output tokens; the best available proxy for capability across providers. */

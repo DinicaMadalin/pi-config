@@ -4,9 +4,15 @@
 import {
 	IMPLEMENTATION_BLOCKED_MARKER,
 	IMPLEMENTATION_DONE_MARKER,
+	PLANNER_ANSWER_READY_MARKER,
+	PLANNER_NEEDS_USER_MARKER,
 	REVIEW_FIX_MARKER,
 	REVIEW_PASS_MARKER,
 	type IssueRef,
+	REVIEWER_NAMES,
+	type ReviewerVendor,
+	type StageRecord,
+	type TrackedIssue,
 } from "./workflow-state.ts";
 import type { GithubIssue } from "./github-issue.ts";
 
@@ -21,14 +27,17 @@ function listRuleFiles(ruleFilePaths: readonly string[]): string {
 const AGREE_AND_SAVE_PLAN_STEPS = [
 	"3. Discuss with me until I explicitly agree with both the goal and the approach. Do not edit any file in this phase.",
 	`4. Once I agree, call ${SAVE_PLAN_TOOL_NAME}. The plan is the implementer's only brief, so write it for a capable`,
-	"   developer who has never seen this repo:",
+	"   developer who has never seen this repo, and it may be posted as a GitHub issue, so it must stand on its own and",
+	"   hold no secrets, tokens or personal data:",
+	"   - Goal: start with the problem (what is wrong or missing, why it matters, how to see it), then the result we want.",
 	"   - Approach: numbered steps in order, each naming the file, the functions or types to add or change with their",
 	"     signatures, the data shapes, the error and edge cases, and the tests to add with their names.",
 	"   - Constraints: the repo rules that matter here, and the local conventions to imitate (naming, error handling,",
 	"     test style), each with an existing file to copy the style from.",
 	"   - Acceptance criteria: the observable behavior plus the exact typecheck, lint and test commands.",
 	"   - Files: every file to create or change, one line each.",
-	"5. After saving, tell me the plan path and that `/build implement` starts the implementation.",
+	"5. After saving, tell me the plan path. I then choose whether to post the plan as a GitHub issue, and the implementer",
+	"   starts on its own as a subagent; if it gets stuck, its question comes back to you here.",
 ];
 
 export function planningPrompt(task: string): string {
@@ -75,11 +84,26 @@ function issueLine(issue: IssueRef | undefined): string[] {
 	return [`This fixes GitHub issue #${issue.number} (${issue.url}): ${issue.title}`, ""];
 }
 
+function readPlanIssueCommand(planIssue: TrackedIssue): string {
+	return `\`gh issue view ${planIssue.number} --json title,body,comments\``;
+}
+
+function planSourceLines(planPath: string, planIssue: TrackedIssue | undefined): string[] {
+	if (!planIssue) return [];
+	return [
+		`The plan is GitHub issue #${planIssue.number} (${planIssue.url}). Read it first with ${readPlanIssueCommand(planIssue)}:`,
+		"it is the source of truth, including comments added after planning. The text below is the plan as agreed, also",
+		`saved at ${planPath}, for when gh is unavailable.`,
+		"",
+	];
+}
+
 export function implementationBrief(
 	planPath: string,
 	plan: string,
 	ruleFilePaths: readonly string[],
 	issue?: IssueRef,
+	planIssue?: TrackedIssue,
 ): string {
 	return [
 		"[/build, phase 2 of 3: IMPLEMENT] You are the implementer. An expert planned this work with me and I agreed to the",
@@ -88,6 +112,7 @@ export function implementationBrief(
 		...issueLine(issue),
 		"## What to implement",
 		"",
+		...planSourceLines(planPath, planIssue),
 		plan.trim(),
 		"",
 		"## How to implement it",
@@ -108,7 +133,8 @@ export function implementationBrief(
 		"- Change only what the plan needs: no drive-by refactors, renames, or reformatting. Mention other problems you",
 		"  see in your report instead of fixing them.",
 		"- If the plan is ambiguous, contradicts the code, or would make you guess a business rule, do not guess: stop,",
-		`  ask me, and end your reply with the line \`${IMPLEMENTATION_BLOCKED_MARKER}: <your question>\`.`,
+		"  ask your question, and end your reply with the line",
+		`  \`${IMPLEMENTATION_BLOCKED_MARKER}: <your question>\`. The planner who wrote the plan answers you.`,
 		"- If you must deviate from the plan, say where and why in your report.",
 		"",
 		"## How to write the code",
@@ -137,13 +163,19 @@ export function reviewPrompt(
 	baseCommit: string | undefined,
 	ruleFilePaths: readonly string[],
 	issue?: IssueRef,
+	planIssue?: TrackedIssue,
 ): string {
+	const planSource = planIssue
+		? `GitHub issue #${planIssue.number} (${planIssue.url}; read it with ${readPlanIssueCommand(planIssue)}, local copy at ${planPath})`
+		: `the agreed plan at ${planPath}`;
 	const issueCheck = issue
 		? [`   - Issue: the change fixes issue #${issue.number}'s root cause, and a test reproduces the issue and now passes.`]
 		: [];
 	return [
-		"[/build, phase 3 of 3: REVIEW] You are the expert reviewer. The implementer says the work is done.",
-		`Review it against the agreed plan at ${planPath}. Do not edit any file.`,
+		"[/build, phase 3 of 3: REVIEW] You are an expert reviewer. The implementer says the work is done.",
+		"An expert from another AI vendor reviews the same work in parallel; review on your own, and only read the",
+		"working tree (no commands that rewrite files, such as formatters in fix mode).",
+		`Review it against ${planSource}. Do not edit any file.`,
 		"",
 		...issueLine(issue),
 		`1. Read the plan. Run \`git status\` and ${diffCommand(baseCommit)}, and read new untracked files and every changed`,
@@ -168,7 +200,8 @@ export function reviewPrompt(
 /** Quotes the review so the fix request is self-contained: the router rates its difficulty from this prompt. */
 export function fixPrompt(reviewReport: string): string {
 	return [
-		"[/build: FIX] You are the implementer again. Fix every must-fix finding of this review:",
+		"[/build: FIX] You are the implementer again. Two expert reviewers reviewed your work.",
+		"Fix every must-fix finding of their reviews:",
 		"",
 		reviewReport.trim(),
 		"",
@@ -181,10 +214,110 @@ export function fixPrompt(reviewReport: string): string {
 
 export function reReviewPrompt(baseCommit: string | undefined): string {
 	return [
-		"[/build: RE-REVIEW] You are the expert reviewer again. The implementer addressed your review.",
-		`Check each must-fix finding is resolved (or rightly rejected), using ${diffCommand(baseCommit)} and the changed files,`,
+		"[/build: RE-REVIEW] You are the expert reviewer again. The implementer addressed the must-fix findings of your",
+		"review and of the other expert reviewer's.",
+		`Check each of your must-fix findings is resolved (or rightly rejected), using ${diffCommand(baseCommit)} and the changed files,`,
 		"rerun the checks, and look for new problems the fixes introduced. Do not edit any file.",
 		"Use the same report format as your review.",
 		`End with the line \`${REVIEW_FIX_MARKER}\` if anything must still be fixed, otherwise \`${REVIEW_PASS_MARKER}\`.`,
+	].join("\n");
+}
+
+const MAX_QUOTED_ANSWER_CHARS = 6000;
+
+/** Keeps the end of a long answer, where the question and the marker are. */
+function quoteAnswerEnd(answer: string): string {
+	const trimmed = answer.trim();
+	if (trimmed.length <= MAX_QUOTED_ANSWER_CHARS) return trimmed;
+	return `…${trimmed.slice(trimmed.length - MAX_QUOTED_ANSWER_CHARS)}`;
+}
+
+/** Sent to the planner when the implementer stops without finishing. */
+export function plannerQuestionPrompt(implementerAnswer: string): string {
+	return [
+		"[/build: IMPLEMENTER QUESTION] The implementer stopped before finishing. Its last reply:",
+		"",
+		quoteAnswerEnd(implementerAnswer),
+		"",
+		"Answer it from the plan and what we agreed. Investigate the code if needed, but do not edit files.",
+		`- If you can answer, write the answer for the implementer and end with the line \`${PLANNER_ANSWER_READY_MARKER}\`.`,
+		"- If it needs a decision only I can make (a business rule, a production target, a change of scope), ask me,",
+		`  and end with the line \`${PLANNER_NEEDS_USER_MARKER}\`. Once I reply, answer the implementer as above.`,
+	].join("\n");
+}
+
+export function plannerAnswerPrompt(answer: string): string {
+	return [
+		"[/build: ANSWER FROM THE PLANNER]",
+		"",
+		answer.trim(),
+		"",
+		`Continue the implementation. End your reply with \`${IMPLEMENTATION_DONE_MARKER}\` when done, or with`,
+		`\`${IMPLEMENTATION_BLOCKED_MARKER}: <your question>\` if you are stuck again.`,
+	].join("\n");
+}
+
+/** Sent to a subagent restarted on its session after Pi was reloaded mid-run. */
+export function resumePrompt(): string {
+	return [
+		"[/build: RESUME] Your previous run was interrupted (Pi was reloaded). Check the current state of the work,",
+		"continue where you left off, and end your reply with the marker line your instructions ask for.",
+	].join("\n");
+}
+
+const STAGE_ROLES: Record<StageRecord["stage"], string> = {
+	implement: "Implementer",
+	review: "Reviewer",
+	fix: "Fixer",
+	"re-review": "Re-reviewer",
+};
+
+/** "Claude reviewer", "OpenAI re-reviewer", "Implementer". */
+export function stageRoleName(stage: StageRecord["stage"], reviewer: ReviewerVendor | undefined): string {
+	if (!reviewer) return STAGE_ROLES[stage];
+	const vendorName = REVIEWER_NAMES[reviewer].replace(/ reviewer$/, "");
+	return `${vendorName} ${STAGE_ROLES[stage].toLowerCase()}`;
+}
+
+function isReview(stage: StageRecord): boolean {
+	return stage.stage === "review" || stage.stage === "re-review";
+}
+
+/** Each reviewer's report from the last review stage (a single reviewer's in runs from before two reviewers). */
+function lastReviews(stages: readonly StageRecord[]): StageRecord[] {
+	const lastReview = stages.findLast(isReview);
+	if (!lastReview) return [];
+	const latestByReviewer = new Map<string, StageRecord>();
+	for (const stage of stages) {
+		if (stage.stage === lastReview.stage) latestByReviewer.set(stage.reviewer ?? "", stage);
+	}
+	return [...latestByReviewer.values()];
+}
+
+function formatMinutes(durationMs: number): string {
+	const totalSeconds = Math.round(durationMs / 1000);
+	return totalSeconds < 60 ? `${totalSeconds}s` : `${Math.floor(totalSeconds / 60)}m ${totalSeconds % 60}s`;
+}
+
+/** Posted in the planner's session when a run ends: who did what, the changes, and the last review. */
+export function runReport(summary: string, stages: readonly StageRecord[], changes: string | undefined): string {
+	const rows = stages.map((stage) => {
+		const model = stage.model ? `${stage.model}${stage.thinkingLevel ? ` · ${stage.thinkingLevel}` : ""}` : "unknown";
+		return `| ${stageRoleName(stage.stage, stage.reviewer)} | ${model} | ${formatMinutes(stage.activeMs)} | $${stage.costUsd.toFixed(2)} |`;
+	});
+	const reviewReports = lastReviews(stages).flatMap((review) => [
+		"",
+		`### ${stageRoleName(review.stage, review.reviewer)}'s report`,
+		"",
+		review.report.trim(),
+	]);
+	return [
+		`**/build finished: ${summary}.**`,
+		...(changes ? ["", `Changes: ${changes}`] : []),
+		"",
+		"| Agent | Model | Time | Cost |",
+		"| --- | --- | --- | --- |",
+		...rows,
+		...reviewReports,
 	].join("\n");
 }

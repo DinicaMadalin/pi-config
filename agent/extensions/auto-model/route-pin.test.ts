@@ -21,3 +21,8 @@ test("a normal pin removes an earlier one", () => {
 test("an unknown tier falls back to normal routing", () => {
 	assert.deepEqual(findRoutePin([pin({ route: "tier", tier: "legendary" })]), { route: "normal" });
 });
+
+test("a tier pin keeps its preferred provider", () => {
+	const entry = { type: "custom", customType: ROUTE_PIN_ENTRY_TYPE, data: { route: "tier", tier: "expert", preferredProvider: "openai" } };
+	assert.deepEqual(findRoutePin([entry]), { route: "tier", tier: "expert", preferredProvider: "openai" });
+});

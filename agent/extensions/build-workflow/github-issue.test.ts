@@ -3,12 +3,17 @@ import { test } from "node:test";
 import {
 	type CommandResult,
 	createIssueBranch,
+	createPlanIssue,
 	fetchIssue,
 	issueBranchName,
 	openDraftPullRequest,
 	parseIssueArgument,
+	planIssueText,
 	pullRequestBody,
 	type RunCommand,
+	shipBranchName,
+	shipCommitMessage,
+	shipWork,
 } from "./github-issue.ts";
 
 const ok = (stdout = ""): CommandResult => ({ stdout, stderr: "", code: 0 });
@@ -102,4 +107,66 @@ test("the PR body closes the issue and carries the plan's goal and approach", ()
 		pullRequestBody(7, plan),
 		"Fixes #7\n\n## Goal\n\nNo crash.\n\n## Approach\n\n1. Guard.\n\nPlanned and reviewed by the expert model with /issue.",
 	);
+});
+
+const plan = "# Add CSV export\n\n## Goal\nProblem: users cannot export.\n\n## Approach\n1. Add exportCsv in src/export.ts";
+const planIssue = { number: 9, title: "Add CSV export", url: "https://github.com/acme/shop/issues/9" };
+
+test("the issue is the plan: its heading becomes the title and the rest the body", () => {
+	const { title, body } = planIssueText(plan);
+	assert.equal(title, "Add CSV export");
+	assert.ok(body.startsWith("## Goal\nProblem: users cannot export."));
+	assert.ok(!body.includes("# Add CSV export"));
+	assert.equal(planIssueText("no heading").title, "Agreed plan");
+});
+
+test("creating the plan issue reads its number from the URL gh prints", async () => {
+	const { run, calls } = fakeRunner([["gh issue create", ok("Creating issue in acme/shop\n\nhttps://github.com/acme/shop/issues/9\n")]]);
+	assert.deepEqual(await createPlanIssue(run, plan), { ok: true, value: planIssue });
+	assert.ok(calls[0].startsWith("gh issue create --title Add CSV export --body ## Goal"));
+	const { run: failing } = fakeRunner([["gh issue create", failed("not logged in")]]);
+	assert.deepEqual(await createPlanIssue(failing, plan), {
+		ok: false,
+		error: "Failed to create the GitHub issue (exit 1): not logged in",
+	});
+});
+
+test("the ship branch skips names that already exist", async () => {
+	const { run } = fakeRunner([
+		["git rev-parse --verify --quiet refs/heads/issue-9-add-csv-export-2", failed("")],
+		["git rev-parse --verify --quiet refs/heads/", ok("abc")],
+	]);
+	assert.deepEqual(await shipBranchName(run, "Add CSV export", planIssue), { ok: true, value: "issue-9-add-csv-export-2" });
+	const { run: noneExist } = fakeRunner([["git rev-parse", failed("")]]);
+	assert.deepEqual(await shipBranchName(noneExist, "Add CSV export"), { ok: true, value: "build-add-csv-export" });
+});
+
+test("the ship commit closes the plan issue", () => {
+	assert.equal(shipCommitMessage("Add CSV export", planIssue), "Add CSV export\n\nCloses #9");
+	assert.equal(shipCommitMessage("Add CSV export"), "Add CSV export");
+});
+
+test("shipping branches, commits and pushes, never merging or forcing", async () => {
+	const { run, calls } = fakeRunner([["git status", ok(" M src/export.ts\n?? src/export.test.ts\n")]]);
+	const result = await shipWork(run, { branch: "build-x", commitMessage: "Add x" });
+	assert.deepEqual(result, { ok: true, value: "build-x" });
+	assert.deepEqual(calls.slice(1), ["git switch -c build-x", "git add --all", "git commit -m Add x", "git push --set-upstream origin build-x"]);
+	assert.ok(!calls.some((call) => /--force|merge|rebase/.test(call)));
+});
+
+test("shipping with no changes does nothing", async () => {
+	const { run, calls } = fakeRunner([["git status", ok("")]]);
+	assert.deepEqual(await shipWork(run, { branch: "build-x", commitMessage: "Add x" }), {
+		ok: false,
+		error: "Nothing to ship: the working tree has no changes",
+	});
+	assert.equal(calls.length, 1);
+});
+
+test("a failed push says the commit stays on the local branch", async () => {
+	const { run } = fakeRunner([["git status", ok(" M a.ts\n")], ["git push", failed("rejected")]]);
+	assert.deepEqual(await shipWork(run, { branch: "build-x", commitMessage: "Add x" }), {
+		ok: false,
+		error: "Failed to push build-x (exit 1): rejected; the commit is on local branch build-x",
+	});
 });

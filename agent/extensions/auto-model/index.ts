@@ -48,6 +48,7 @@ import {
 	IMPORTANT_TASK_TIER,
 	modelKey,
 	pickModelForTier,
+	preferProvider,
 	type RoutedThinkingLevel,
 	type TierPolicies,
 } from "./difficulty-tiers.ts";
@@ -102,7 +103,9 @@ function routeToTier(
 	ctx: ExtensionContext,
 ): ModelRoute<AutoRouteState> {
 	const needsImageInput = latestUserMessageHasImage(request.messages);
-	const choice = pickModelForTier(usableModels(memory, ctx), policies[tier], tier, needsImageInput);
+	const pin = findRoutePin(ctx.sessionManager.getBranch());
+	const policy = pin.route === "tier" && pin.preferredProvider ? preferProvider(policies[tier], pin.preferredProvider) : policies[tier];
+	const choice = pickModelForTier(usableModels(memory, ctx), policy, tier, needsImageInput);
 	if (!choice) throw new Error(`Auto model found no logged-in model for the "${tier}" tier; log in with /login`);
 	return { model: choice.model, thinkingLevel, state: { tier, modelKey: modelKey(choice.model), thinkingLevel } };
 }

@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import type { Api, Model } from "@earendil-works/pi-ai";
-import { applyQualityBias, applyThinkingFloor, DEFAULT_TIER_POLICIES, pickModelForTier, type TierPolicy } from "./difficulty-tiers.ts";
+import { applyQualityBias, applyThinkingFloor, DEFAULT_TIER_POLICIES, pickModelForTier, preferProvider, type TierPolicy } from "./difficulty-tiers.ts";
 
 function fakeModel(provider: string, id: string, outputPrice: number, readsImages = true): Model<Api> {
 	return {
@@ -58,4 +58,11 @@ test("raises thinking below the tier floor and keeps levels at or above it", () 
 test("the expert tier thinks at least high and may go to xhigh", () => {
 	assert.equal(applyThinkingFloor("medium", DEFAULT_TIER_POLICIES.expert), "high");
 	assert.equal(applyThinkingFloor("xhigh", DEFAULT_TIER_POLICIES.expert), "xhigh");
+});
+
+test("preferring a provider tries its models first and keeps the others as fallbacks", () => {
+	const expert: TierPolicy = { models: ["openai/gpt-6-astra", "openai/gpt-6.1-sol", "anthropic/claude-opus-5-5"], thinkingLevel: "high" };
+	assert.deepEqual(preferProvider(expert, "anthropic").models, ["anthropic/claude-opus-5-5", "openai/gpt-6-astra", "openai/gpt-6.1-sol"]);
+	assert.deepEqual(preferProvider(expert, "openai").models, expert.models);
+	assert.deepEqual(preferProvider(expert, "xai").models, expert.models);
 });
