@@ -19,11 +19,12 @@
  * Phase routes reach the auto model through its route pin (auto-model/route-pin.ts).
  */
 import type { ExtensionAPI, ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
+import { Type } from "typebox";
 import type { TaskKind } from "../auto-model/classify-difficulty.ts";
 import { TASK_KIND_EVENT } from "../auto-model/route-pin.ts";
 import { SAVE_PLAN_TOOL_NAME } from "../project-memory/agreed-plan-files.ts";
 import { answerText } from "./agent-activity.ts";
-import { registerAgentsOverview } from "./agents-overview-panel.ts";
+import { registerDashboard } from "./dashboard.ts";
 import { BuildOrchestrator } from "./build-orchestrator.ts";
 import { ISSUE_USAGE, openPullRequest, promptForPullRequest, startIssueWorkflow } from "./issue-workflow.ts";
 import { PlanChanges } from "./plan-changes.ts";
@@ -55,6 +56,8 @@ const REVIEW_FAILED_CHOICES = {
 	reReview: "Review again (after you changed something yourself)",
 	later: "Decide later (Alt+A or /build implement)",
 } as const;
+
+const SHIP_TOOL_NAME = "ship_build";
 
 /** In a subagent's process: keep the reviewers from editing; the parent session runs the workflow. */
 function guardSubagentEdits(pi: ExtensionAPI): void {
@@ -97,7 +100,6 @@ export default function (pi: ExtensionAPI) {
 	const startDialog = new StartDialog(session, orchestrator);
 	const planChanges = new PlanChanges(session, orchestrator, startDialog);
 	const shipping = new Shipping(session, endRun);
-	registerAgentsOverview(pi, session, orchestrator, planChanges);
 
 	async function askAfterFailedReview(): Promise<void> {
 		if (session.workflow.phase !== "review-failed" || !session.hasUI) return;
@@ -167,6 +169,26 @@ export default function (pi: ExtensionAPI) {
 	pi.on("session_shutdown", () => {
 		orchestrator.stop();
 	});
+
+	pi.registerTool({
+		name: SHIP_TOOL_NAME,
+		label: "Ship /build work",
+		description:
+			"Ship the work of a finished /build run: the user confirms in a dialog, then it goes on a new branch with one commit and a normal push (never a merge or force push), and the run ends. " +
+			"Only works after both reviewers passed; otherwise it says what the run is waiting for.",
+		promptSnippet: "Ship a reviewed /build run when the user asks to ship, commit or push it",
+		promptGuidelines: [
+			`When the user asks to ship, commit or push the work of a /build run, call ${SHIP_TOOL_NAME} instead of running git commit or git push yourself, so the run ends cleanly.`,
+		],
+		parameters: Type.Object({}),
+		async execute() {
+			const outcome = await shipping.confirmAndShip();
+			return { content: [{ type: "text", text: outcome }], details: { outcome } };
+		},
+	});
+
+	// After the session_start above: the dashboard reads git through the session, which must be attached first.
+	registerDashboard(pi, session, orchestrator, planChanges);
 
 	pi.on("tool_call", (event) => {
 		const phase = session.workflow.phase;
