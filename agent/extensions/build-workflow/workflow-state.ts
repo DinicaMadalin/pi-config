@@ -9,6 +9,7 @@
  * No Pi runtime imports, so every transition can be unit tested.
  */
 import type { RoutePin } from "../auto-model/route-pin.ts";
+import { IMPLEMENTER_ROLES, type ImplementerRole, type ImplementerSeat } from "./work-streams.ts";
 
 export const WORKFLOW_STATE_ENTRY_TYPE = "build-workflow-state";
 
@@ -43,18 +44,27 @@ export const REVIEWER_VENDORS = ["anthropic", "openai"] as const;
 /** Also the Pi provider the reviewer's route prefers. */
 export type ReviewerVendor = (typeof REVIEWER_VENDORS)[number];
 
-export type SubagentRole = "implementer" | `${ReviewerVendor}-reviewer`;
+export type SubagentRole = ImplementerRole | `${ReviewerVendor}-reviewer`;
 
 export const REVIEWER_NAMES: Record<ReviewerVendor, string> = { anthropic: "Claude reviewer", openai: "OpenAI reviewer" };
 
 export const SUBAGENT_NAMES: Record<SubagentRole, string> = {
 	implementer: "Implementer",
+	"implementer-2": "Implementer 2",
+	"implementer-3": "Implementer 3",
 	"anthropic-reviewer": REVIEWER_NAMES.anthropic,
 	"openai-reviewer": REVIEWER_NAMES.openai,
 };
 
 export function reviewerRole(vendor: ReviewerVendor): SubagentRole {
 	return `${vendor}-reviewer`;
+}
+
+/** Every subagent of a run, implementers first. */
+export const SUBAGENT_ROLES: readonly SubagentRole[] = [...IMPLEMENTER_ROLES, ...REVIEWER_VENDORS.map(reviewerRole)];
+
+export function isImplementerRole(role: SubagentRole): role is ImplementerRole {
+	return role === "implementer" || role.startsWith("implementer-");
 }
 
 export interface FeatureWork {
@@ -64,8 +74,11 @@ export interface FeatureWork {
 	issue?: IssueRef;
 	/** The issue /build posted the agreed plan to; the implementer and reviewer read the plan from it. */
 	planIssue?: TrackedIssue;
-	/** Session files of the subagents, so a reload can resume them with their context. */
-	implementerSession?: string;
+	/**
+	 * The implementers, one per work stream of the plan, with their session files: a reload resumes them with
+	 * their context, and later runs of the planner's session reuse them.
+	 */
+	implementers?: ImplementerSeat[];
 	reviewerSessions?: Partial<Record<ReviewerVendor, string>>;
 	/** The plan's version since implementation started: missing for the first, 2 after the first change. */
 	planRevision?: number;
@@ -169,7 +182,14 @@ function parseWorkflowState(data: unknown): WorkflowState | undefined {
 	const phase = (data as { phase?: unknown }).phase;
 	if (!WORKFLOW_PHASES.includes(phase as WorkflowPhase)) return undefined;
 	if (phase !== "idle" && phase !== "plan" && typeof (data as { planPath?: unknown }).planPath !== "string") return undefined;
-	return data as WorkflowState;
+	return withLegacyImplementer(data as WorkflowState & { implementerSession?: unknown });
+}
+
+/** States written before parallel implementers had one implementerSession; it is the first implementer. */
+function withLegacyImplementer(state: WorkflowState & { implementerSession?: unknown }): WorkflowState {
+	const { implementerSession, ...rest } = state;
+	if (typeof implementerSession !== "string" || ("implementers" in rest && rest.implementers)) return rest as WorkflowState;
+	return { ...rest, implementers: [{ role: "implementer", stream: "", sessionPath: implementerSession }] } as WorkflowState;
 }
 
 export function findWorkflowState(branchEntries: readonly SessionEntryLike[]): WorkflowState {
@@ -195,6 +215,17 @@ export function findPlannerWorkflowState(branchEntries: readonly SessionEntryLik
 	if (!isSubagentSession) return findWorkflowState(branchEntries);
 	const hasPlannerRun = states.some((state) => state?.phase === "plan" || state?.phase === "awaiting-implementation");
 	return hasPlannerRun ? findWorkflowState(branchEntries) : IDLE_WORKFLOW;
+}
+
+/** The implementers of the session's latest run; a new run or a changed plan gives them their next work. */
+export function findCrew(branchEntries: readonly SessionEntryLike[]): ImplementerSeat[] {
+	for (let index = branchEntries.length - 1; index >= 0; index--) {
+		const entry = branchEntries[index];
+		if (entry.type !== "custom" || entry.customType !== WORKFLOW_STATE_ENTRY_TYPE) continue;
+		const state = parseWorkflowState(entry.data);
+		if (state && "implementers" in state && state.implementers) return state.implementers;
+	}
+	return [];
 }
 
 /** The plan of the session's last run that got as far as an agreed plan, e.g. to start a new run from it. */
@@ -233,7 +264,7 @@ export function featureWorkOf(state: FeatureWork): FeatureWork {
 	const work: FeatureWork = { planPath: state.planPath, baseCommit: state.baseCommit };
 	if (state.issue) work.issue = state.issue;
 	if (state.planIssue) work.planIssue = state.planIssue;
-	if (state.implementerSession) work.implementerSession = state.implementerSession;
+	if (state.implementers) work.implementers = state.implementers;
 	if (state.reviewerSessions) work.reviewerSessions = state.reviewerSessions;
 	if (state.planRevision) work.planRevision = state.planRevision;
 	if (state.committedBranch) work.committedBranch = state.committedBranch;
@@ -352,6 +383,8 @@ export const REPORT_MESSAGE_TYPE = "build-report";
 /** A subagent stage that finished, stored in the planner's session for the agents overview and the report. */
 export interface StageRecord {
 	stage: DelegatedPhase;
+	/** Which subagent; missing in records written before parallel implementers (then the implementer or the reviewer). */
+	agent?: SubagentRole;
 	/** Which reviewer, in the review stages. */
 	reviewer?: ReviewerVendor;
 	model?: string;
@@ -367,6 +400,12 @@ export interface StageRecord {
  * Stage records stored after the latest state for which isBefore holds, oldest first. E.g. the run's records
  * stop at its plan phase; the current review's records stop at the first state of another phase.
  */
+/** The subagent a stage record belongs to. */
+export function agentOfRecord(record: StageRecord): SubagentRole {
+	if (record.agent) return record.agent;
+	return record.reviewer ? reviewerRole(record.reviewer) : "implementer";
+}
+
 export function stageRecordsSince(branchEntries: readonly SessionEntryLike[], isBefore: (state: WorkflowState) => boolean): StageRecord[] {
 	const records: StageRecord[] = [];
 	for (let index = branchEntries.length - 1; index >= 0; index--) {

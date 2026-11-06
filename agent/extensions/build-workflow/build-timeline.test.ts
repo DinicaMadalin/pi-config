@@ -47,10 +47,11 @@ const implementing = state(700, {
 	phase: "implement",
 	planPath: PLAN_PATH,
 	baseCommit: "abc1234",
-	implementerSession: IMPLEMENTER_SESSION,
+	implementers: [{ role: "implementer", stream: "", sessionPath: IMPLEMENTER_SESSION }],
 });
 const liveImplementer: LiveStageView = {
 	stage: "implement",
+	agent: "implementer",
 	model: "gpt-6-luna",
 	thinkingLevel: "medium",
 	routeReason: "rated complex (80%): multi-file or tricky change",
@@ -122,6 +123,7 @@ test("a review shows a row per reviewer: one done while the other still works", 
 	];
 	const liveOpenaiReviewer: LiveStageView = {
 		stage: "review",
+		agent: "openai-reviewer",
 		reviewer: "openai",
 		model: "gpt-6-astra",
 		thinkingLevel: "high",
@@ -142,7 +144,7 @@ test("a review shows a row per reviewer: one done while the other still works", 
 	);
 });
 
-test("runs from before two reviewers keep their single reviewer row", () => {
+test("runs from before two reviewers show their single review on the Claude reviewer's row", () => {
 	const legacyReview: TimelineEntry[] = [
 		state(761, { phase: "review", planPath: PLAN_PATH, baseCommit: "abc1234" }),
 		stageRecord(830, finishedStage("review", "claude-opus-5-5", 1)),
@@ -150,12 +152,17 @@ test("runs from before two reviewers keep their single reviewer row", () => {
 	];
 	const timeline = buildTimeline([...planningSession, implementing, ...legacyReview], START_MS + 900_000, false);
 	assert.deepEqual(
-		timeline?.stages.map((stage) => stage.role),
-		["Planner", "Implementer", "Reviewer"],
+		timeline?.stages.map((stage) => [stage.role, stage.status]),
+		[
+			["Planner", "done"],
+			["Implementer", "skipped"],
+			["Claude reviewer", "done"],
+			["OpenAI reviewer", "skipped"],
+		],
 	);
 });
 
-test("shows fix rounds from stage records and marks a finished run", () => {
+test("an implementer that also fixes stays one row, with its rounds summed; the steps show the fix round", () => {
 	const reviewAndFix: TimelineEntry[] = [
 		stageRecord(760, finishedStage("implement", "gpt-6-luna", 0.5)),
 		state(761, { phase: "review", planPath: PLAN_PATH, baseCommit: "abc1234" }),
@@ -170,13 +177,22 @@ test("shows fix rounds from stage records and marks a finished run", () => {
 	assert.ok(timeline);
 	assert.equal(timeline.isFinished, true);
 	assert.deepEqual(
-		timeline.stages.map((stage) => [stage.role, stage.status, stage.model]),
+		timeline.stages.map((stage) => [stage.role, stage.key, stage.status, stage.model, stage.costUsd]),
 		[
-			["Planner", "done", "claude-opus-5-5"],
-			["Implementer", "done", "gpt-6-luna"],
-			["Reviewer", "done", "claude-opus-5-5"],
-			["Fixer", "done", "gpt-6-luna"],
-			["Re-reviewer", "done", "claude-opus-5-5"],
+			["Planner", "plan", "done", "claude-opus-5-5", 2],
+			["Implementer", "fix", "done", "gpt-6-luna", 0.6],
+			["Claude reviewer", "re-review", "done", "claude-opus-5-5", 1.5],
+			["OpenAI reviewer", "review", "skipped", undefined, 0],
+		],
+	);
+	assert.deepEqual(
+		timeline.steps.map((step) => [step.key, step.status]),
+		[
+			["plan", "done"],
+			["implement", "done"],
+			["review", "done"],
+			["fix", "done"],
+			["re-review", "done"],
 		],
 	);
 	assert.equal(timeline.costUsd, 4.1);
@@ -252,4 +268,36 @@ test("the timeline carries the run's phase, the plan's version and the last repo
 	assert.equal(timeline?.phase, "review-failed");
 	assert.equal(timeline?.planRevision, 2);
 	assert.equal(timeline?.report, "## Run report\nnew");
+});
+
+test("parallel implementers get a row each with their work stream, and the step works while one of them does", () => {
+	const twoStreams = state(700, {
+		phase: "implement",
+		planPath: PLAN_PATH,
+		implementers: [
+			{ role: "implementer", stream: "API", sessionPath: "/s/1.jsonl" },
+			{ role: "implementer-2", stream: "Tests", sessionPath: "/s/2.jsonl" },
+		],
+	});
+	const apiDone = stageRecord(760, { ...finishedStage("implement", "gpt-6-luna", 0.5), agent: "implementer" });
+	const testsWorking: LiveStageView = { ...liveImplementer, agent: "implementer-2", model: "deepseek-v4.1-flash" };
+	const timeline = buildTimeline([...planningSession, twoStreams, apiDone], START_MS + 800_000, false, [testsWorking]);
+	assert.deepEqual(
+		timeline?.stages.slice(1, 3).map((stage) => [stage.role, stage.stream, stage.status, stage.model]),
+		[
+			["Implementer", "API", "done", "gpt-6-luna"],
+			["Implementer 2", "Tests", "working", "deepseek-v4.1-flash"],
+		],
+	);
+	assert.equal(timeline?.steps.find((step) => step.key === "implement")?.status, "working");
+});
+
+test("a failed re-review waits on you at the re-review step", () => {
+	const entries: TimelineEntry[] = [
+		...planningSession,
+		implementing,
+		state(800, { phase: "review-failed", planPath: PLAN_PATH, findings: "a.ts:3" }),
+	];
+	const timeline = buildTimeline(entries, START_MS + 900_000, false);
+	assert.equal(timeline?.steps.find((step) => step.key === "re-review")?.status, "your-turn");
 });

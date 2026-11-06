@@ -39,10 +39,12 @@ import {
 	canPlannerEditFiles,
 	findWorkflowState,
 	IDLE_WORKFLOW,
+	isAwaitingUser,
 	isDelegatedPhase,
 	SUBAGENT_ENV_VAR,
 	type WorkflowState,
 } from "./workflow-state.ts";
+import { tooManyStreamsWarning } from "./work-streams.ts";
 
 const FILE_EDITING_TOOLS = new Set(["edit", "write"]);
 const FEATURE_TASK_KINDS: ReadonlySet<TaskKind> = new Set(["feature_planning", "feature_build"]);
@@ -81,10 +83,27 @@ export default function (pi: ExtensionAPI) {
 
 	/** The run is over: subagents stopped, the planner back on normal routing and on the model you had before. */
 	function endRun(summary: string): void {
+		void endRunAndRestoreModel(summary);
+	}
+
+	async function endRunAndRestoreModel(summary: string): Promise<void> {
 		orchestrator.stop();
 		session.enterPhase(IDLE_WORKFLOW);
 		session.notify(`Build workflow finished: ${summary}. Back to normal routing.`, "info");
-		void restorePreviousModel(pi, session.context);
+		await restorePreviousModel(pi, session.context);
+	}
+
+	/**
+	 * A new /build or /issue may replace a run that only waits on you (ship, PR, the call after a failed re-review):
+	 * it ends, its changes stay in the folder, and its implementers take the next work. A run whose agents still
+	 * work is refused; undefined means the new run may start.
+	 */
+	async function makeRoomForNewRun(): Promise<string | undefined> {
+		const workflow = session.workflow;
+		if (workflow.phase === "idle") return undefined;
+		if (!isAwaitingUser(workflow.phase)) return `A build workflow is running (${phaseLabel(workflow)}); /build stop first`;
+		await endRunAndRestoreModel("replaced by a new run; its changes stay uncommitted in the folder");
+		return undefined;
 	}
 
 	/** The subagents are done; what follows needs you. */
@@ -207,8 +226,10 @@ export default function (pi: ExtensionAPI) {
 		if (typeof savedPath !== "string") return undefined;
 		const planPath = planChanges.keepOnePlanFile(savedPath);
 		planChanges.notePlanSaved(planPath);
-		if (planPath === savedPath) return undefined;
-		return { content: [{ type: "text", text: `Plan saved to ${planPath} (the run's plan, updated)` }], details: { planPath } };
+		const streamsWarning = tooManyStreamsWarning(session.readPlan(planPath) ?? "");
+		if (planPath === savedPath && !streamsWarning) return undefined;
+		const saved = planPath === savedPath ? `Plan saved to ${planPath}` : `Plan saved to ${planPath} (the run's plan, updated)`;
+		return { content: [{ type: "text", text: streamsWarning ? `${saved}\n${streamsWarning}` : saved }], details: { planPath } };
 	});
 
 	pi.on("agent_settled", async (event, ctx) => {
@@ -260,8 +281,9 @@ export default function (pi: ExtensionAPI) {
 						ctx.ui.notify("Wait for the agent to finish, then run /build again", "warning");
 						return;
 					}
-					if (workflow.phase !== "idle") {
-						ctx.ui.notify(`A build workflow is running (${phaseLabel(workflow)}); /build stop first`, "warning");
+					const buildRefusal = await makeRoomForNewRun();
+					if (buildRefusal) {
+						ctx.ui.notify(buildRefusal, "warning");
 						return;
 					}
 					await startWorkflow(argument, ctx);
@@ -285,8 +307,9 @@ export default function (pi: ExtensionAPI) {
 				await openPullRequest(session, ctx, endRun);
 				return;
 			}
-			if (session.workflow.phase !== "idle") {
-				ctx.ui.notify(`A build workflow is running (${phaseLabel(session.workflow)}); /build stop first`, "warning");
+			const issueRefusal = await makeRoomForNewRun();
+			if (issueRefusal) {
+				ctx.ui.notify(issueRefusal, "warning");
 				return;
 			}
 			await startIssueWorkflow(session, argument, ctx);

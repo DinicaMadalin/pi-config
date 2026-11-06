@@ -7,12 +7,12 @@ import { createPlanIssue, isGithubRepo } from "./github-issue.ts";
 import type { PlannerSession } from "./planner-session.ts";
 import { findHeadCommit, findRuleFiles } from "./repo-files.ts";
 import { implementationBrief } from "./workflow-prompts.ts";
-import type { TrackedIssue } from "./workflow-state.ts";
+import type { TrackedIssue, WorkflowState } from "./workflow-state.ts";
 
 const START_CHOICES = {
 	withIssue: "Create a GitHub issue from the plan and start the implementer",
-	withoutIssue: "Start the implementer without an issue",
-	start: "Start the implementer",
+	withoutIssue: "Start implementing without an issue",
+	start: "Start implementing",
 	keepPlanning: "Not yet, keep planning",
 } as const;
 
@@ -99,8 +99,14 @@ export class StartDialog {
 		const baseCommit = await findHeadCommit(this.session.run);
 		// The awaits above let you stop the run or save another plan meanwhile; then this start is stale.
 		if (this.session.workflow !== awaiting) return;
-		const brief = implementationBrief(planPath, plan, ruleFiles, issue, planIssue);
-		this.orchestrator.startImplementation({ planPath, baseCommit, ...(issue && { issue }), ...(planIssue && { planIssue }) }, brief);
-		this.session.notify("Implementer started as a subagent. Alt+A shows the agents; you can keep talking to the planner.", "info");
+		const work = { planPath, baseCommit, ...(issue && { issue }), ...(planIssue && { planIssue }) };
+		this.orchestrator.startImplementation(work, plan, (assignment) => implementationBrief(planPath, plan, ruleFiles, issue, planIssue, assignment));
+		const started = implementerCount(this.session.workflow);
+		const who = started > 1 ? `${started} implementers started as subagents, one per work stream` : "Implementer started as a subagent";
+		this.session.notify(`${who}. Alt+A shows the agents; you can keep talking to the planner.`, "info");
 	}
+}
+
+function implementerCount(state: WorkflowState): number {
+	return state.phase === "implement" ? (state.implementers?.length ?? 1) : 1;
 }

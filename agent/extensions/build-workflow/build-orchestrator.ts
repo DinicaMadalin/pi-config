@@ -1,8 +1,10 @@
 /**
- * Runs the delegated part of a /build run: the implementer and the two reviewers (one on Claude, one on OpenAI,
- * reviewing in parallel) are subagent processes, the planner stays in your session. Moves the run along when a
- * subagent settles, sends the implementer's questions to the planner and its answers back, applies plan changes,
- * lets you stop, restart or message each agent, and posts a report when the run ends.
+ * Runs the delegated part of a /build run: the implementers (one per work stream of the plan, building in parallel)
+ * and the two reviewers (one on Claude, one on OpenAI, reviewing in parallel) are subagent processes, the planner
+ * stays in your session. Moves the run along when every subagent of a stage is done, sends the implementers'
+ * questions to the planner one at a time and each answer back to the one that asked, applies plan changes, lets
+ * you stop, restart or message each agent, and posts a report when the run ends. The implementers stay with the
+ * planner's session: its next run gives them their next work, so they keep their context.
  */
 import { randomUUID } from "node:crypto";
 import { existsSync } from "node:fs";
@@ -19,7 +21,9 @@ import {
 	resumePrompt,
 	reviewPrompt,
 	runReport,
+	type StreamAssignment,
 } from "./workflow-prompts.ts";
+import { assignStreams, capWorkStreams, type ImplementerSeat, parseWorkStreams, streamOf, type WorkStream } from "./work-streams.ts";
 import {
 	type DelegatedPhase,
 	type DelegatedState,
@@ -27,6 +31,7 @@ import {
 	type FeatureWork,
 	featureWorkOf,
 	hasReviewVerdict,
+	isImplementerRole,
 	isAwaitingUser,
 	isDelegatedState,
 	isFeatureState,
@@ -63,6 +68,8 @@ export interface PlannerSeat {
 	/** Stages stored since the current phase began; a resumed review keeps the verdicts it already has. */
 	currentStageRecords(): StageRecord[];
 	readPlan(planPath: string): string | undefined;
+	/** The implementers of the session's earlier runs, to give them the next work. */
+	crew(): ImplementerSeat[];
 	ruleFiles(): Promise<string[]>;
 	/** "+120 −8 in 5 files" since the base commit, or undefined when it cannot be counted. */
 	describeChanges(baseCommit: string | undefined): Promise<string | undefined>;
@@ -91,19 +98,44 @@ export interface LiveStage {
 	startActiveMs: number;
 }
 
-/** One subagent per stage of the implementer; a review stage runs a reviewer of each vendor. */
+/** An implementer stage runs one implementer per work stream; a review stage runs a reviewer of each vendor. */
 interface StageSeat {
 	role: SubagentRole;
 	reviewer?: ReviewerVendor;
 }
 
-function seatsOfStage(stage: DelegatedPhase): StageSeat[] {
-	if (stage === "implement" || stage === "fix") return [{ role: "implementer" }];
+function seatsOfStage(state: DelegatedState): StageSeat[] {
+	if (state.phase === "implement" || state.phase === "fix") return (state.implementers ?? []).map((seat) => ({ role: seat.role }));
 	return REVIEWER_VENDORS.map((vendor) => ({ role: reviewerRole(vendor), reviewer: vendor }));
 }
 
 function sessionOfSeat(state: FeatureWork, seat: StageSeat): string | undefined {
-	return seat.reviewer ? state.reviewerSessions?.[seat.reviewer] : state.implementerSession;
+	if (seat.reviewer) return state.reviewerSessions?.[seat.reviewer];
+	return state.implementers?.find((implementer) => implementer.role === seat.role)?.sessionPath;
+}
+
+/** Each implementer's part of the plan; undefined for all when one implementer builds the whole plan. */
+function streamAssignments(implementers: readonly ImplementerSeat[], plan: string): Map<SubagentRole, StreamAssignment | undefined> {
+	const streams = capWorkStreams(parseWorkStreams(plan));
+	const assignments = new Map<SubagentRole, StreamAssignment | undefined>();
+	for (const seat of implementers) {
+		const stream = streamOf(streams, seat.stream);
+		if (implementers.length < 2 || !stream) {
+			assignments.set(seat.role, undefined);
+			continue;
+		}
+		const otherStreams = implementers
+			.filter((other) => other.role !== seat.role)
+			.map((other) => ({ implementerName: SUBAGENT_NAMES[other.role], streamName: other.stream }));
+		assignments.set(seat.role, { implementerName: SUBAGENT_NAMES[seat.role], stream, otherStreams });
+	}
+	return assignments;
+}
+
+/** An implementer's question waiting for the planner, which answers one at a time. */
+interface PlannerQuestion {
+	role: SubagentRole;
+	implementerAnswer: string;
 }
 
 export function stageStats(live: LiveStage, nowMs: number): { activeMs: number; costUsd: number } {
@@ -124,6 +156,9 @@ export class BuildOrchestrator {
 	private readonly agents = new Map<SubagentRole, LiveStage>();
 	/** Latest answer of each reviewer in the current review stage; the stage moves on once both answered. */
 	private readonly reviewAnswers = new Map<ReviewerVendor, string>();
+	/** The implementer whose question the planner is answering now, and the questions waiting behind it. */
+	private askingRole: SubagentRole | undefined;
+	private readonly queuedQuestions: PlannerQuestion[] = [];
 	/** Bumped by stop(): a step of a stopped run that was waiting on I/O sees the change and drops out. */
 	private generation = 0;
 
@@ -136,22 +171,32 @@ export class BuildOrchestrator {
 		return this.processes.get(role);
 	}
 
-	/** The subagents of the current stage: the implementer, or both reviewers. */
+	/** The subagents of the current stage: the implementers, or both reviewers. */
 	liveStages(): LiveStage[] {
 		return [...this.agents.values()];
 	}
 
 	get isWaitingForPlanner(): boolean {
-		return this.agents.get("implementer")?.condition === "waiting-for-planner";
+		return this.askingRole !== undefined;
 	}
 
-	/** Plan agreed: start the implementer on the brief, with the planner's session left as it is. */
-	startImplementation(work: FeatureWork, brief: string): void {
+	/**
+	 * Plan agreed: one implementer per work stream starts on its brief, with the planner's session left as it is.
+	 * Implementers of the session's earlier runs build their streams again, with their context.
+	 */
+	startImplementation(work: FeatureWork, plan: string, briefFor: (assignment: StreamAssignment | undefined) => string): void {
 		const implementState: DelegatedState = { phase: "implement", ...work };
-		const sessionPath = this.createSession(implementState, { role: "implementer" });
-		const state: DelegatedState = { ...implementState, implementerSession: sessionPath };
+		const crew = this.seat.crew().filter((seat) => existsSync(seat.sessionPath));
+		const state: DelegatedState = { ...implementState, implementers: this.assignCrew(implementState, crew, plan) };
 		this.seat.enterPhase(state);
-		this.beginStage(state, () => brief);
+		const assignments = streamAssignments(state.implementers ?? [], plan);
+		this.beginStage(state, (seat) => briefFor(assignments.get(seat.role)));
+	}
+
+	/** Gives the plan's streams to the implementers, making sessions for the streams that have none. */
+	private assignCrew(state: DelegatedState, crew: readonly ImplementerSeat[], plan: string): ImplementerSeat[] {
+		const streams: WorkStream[] = capWorkStreams(parseWorkStreams(plan));
+		return assignStreams(streams, crew, (role) => this.createSession(state, { role }));
 	}
 
 	/** After a reload: restart the subagents of the current phase that still owe an answer, and let them continue. */
@@ -159,7 +204,7 @@ export class BuildOrchestrator {
 		const state = this.seat.state();
 		if (!isDelegatedState(state)) return "No subagent stage to resume";
 		if (this.agents.size > 0) return "The run is already going; Alt+A shows it";
-		const missing = seatsOfStage(state.phase).find((seat) => {
+		const missing = seatsOfStage(state).find((seat) => {
 			const sessionPath = sessionOfSeat(state, seat);
 			return !sessionPath || !existsSync(sessionPath);
 		});
@@ -170,22 +215,27 @@ export class BuildOrchestrator {
 		return undefined;
 	}
 
-	/** The planner's turn settled; if it answered the implementer, pass the answer on. */
+	/** The planner's turn settled; if it answered the implementer that asked, pass the answer on and ask the next question. */
 	handlePlannerReply(reply: string): void {
-		if (!this.isWaitingForPlanner) return;
+		const asker = this.askingRole;
+		if (!asker) return;
 		const plannerAnswer = readPlannerAnswer(reply);
 		if (plannerAnswer.kind === "none") return;
 		if (plannerAnswer.kind === "needs-user") {
-			this.seat.notify("The implementer is waiting: answer the planner's question, and it passes your answer on", "info");
+			this.seat.notify(`The ${SUBAGENT_NAMES[asker]} is waiting: answer the planner's question, and it passes your answer on`, "info");
 			return;
 		}
-		this.promptAgent("implementer", plannerAnswerPrompt(plannerAnswer.answer));
+		this.askingRole = undefined;
+		this.promptAgent(asker, plannerAnswerPrompt(plannerAnswer.answer));
+		this.askNextQuestion();
 	}
 
-	/** The planner's turn was aborted while the implementer waited on it. */
+	/** The planner's turn was aborted while an implementer waited on it. */
 	handlePlannerAborted(): void {
-		if (!this.isWaitingForPlanner) return;
-		this.seat.notify("The implementer still waits for the planner's answer: reply to the planner, or message the implementer (Alt+A)", "warning");
+		const asker = this.askingRole;
+		if (!asker) return;
+		const name = SUBAGENT_NAMES[asker];
+		this.seat.notify(`The ${name} still waits for the planner's answer: reply to the planner, or message the ${name} (Alt+A)`, "warning");
 	}
 
 	/** A message you typed in the agents overview. */
@@ -193,6 +243,7 @@ export class BuildOrchestrator {
 		const subagent = this.processes.get(role);
 		if (!subagent?.isRunning) return `The ${SUBAGENT_NAMES[role]} is not running; r restarts it`;
 		subagent.sendUserMessage(text);
+		this.dropQuestionOf(role);
 		this.setCondition(role, "running");
 		return undefined;
 	}
@@ -219,6 +270,7 @@ export class BuildOrchestrator {
 			await previous.stop();
 		}
 		if (generation !== this.generation) return "The run was stopped";
+		this.dropQuestionOf(role);
 		const restarted = this.ensureProcess(live, state);
 		if (!restarted) return `No session file for the ${SUBAGENT_NAMES[role]}`;
 		if (live.reviewer) this.reviewAnswers.delete(live.reviewer);
@@ -227,15 +279,40 @@ export class BuildOrchestrator {
 		return undefined;
 	}
 
-	/** The plan changed while the implementer works on it: it gets the new plan right away. */
-	tellImplementerAboutPlanChange(): ActionRefusal {
+	/**
+	 * The plan changed while the implementers work on it: each gets its part of the new plan right away, a new
+	 * stream gets a new implementer, and an implementer whose stream is gone stops.
+	 */
+	async tellImplementersAboutPlanChange(): Promise<ActionRefusal> {
 		const state = this.seat.state();
-		if (state.phase !== "implement" && state.phase !== "fix") return "The implementer is not working on the plan now";
+		if (state.phase !== "implement" && state.phase !== "fix") return "The implementers are not working on the plan now";
 		const plan = this.seat.readPlan(state.planPath);
 		if (plan === undefined) return `Cannot read the plan ${state.planPath}`;
-		this.seat.enterPhase(withPlanRevision(state));
-		this.promptAgent("implementer", planChangePrompt(state.planPath, plan, state.planIssue));
+		const implementers = this.assignCrew(state, state.implementers ?? [], plan);
+		const next: DelegatedState = withPlanRevision({ ...state, implementers });
+		const dropped = (state.implementers ?? []).filter((seat) => !implementers.some((kept) => kept.role === seat.role));
+		const generation = this.generation;
+		for (const seat of dropped) await this.retireImplementer(seat.role);
+		if (generation !== this.generation) return "The run was stopped";
+		this.seat.enterPhase(next);
+		const assignments = streamAssignments(implementers, plan);
+		for (const seat of implementers) {
+			const prompt = planChangePrompt(next.planPath, plan, next.planIssue, undefined, assignments.get(seat.role));
+			if (!this.agents.has(seat.role)) this.startAgent(next, { role: seat.role }, prompt);
+			else this.promptAgent(seat.role, prompt);
+		}
 		return undefined;
+	}
+
+	/** An implementer whose stream left the plan: its process ends, its work so far is recorded. */
+	private async retireImplementer(role: SubagentRole): Promise<void> {
+		const live = this.agents.get(role);
+		if (live) this.recordUnfinishedStage(live, "(its work stream left the plan)");
+		this.agents.delete(role);
+		this.dropQuestionOf(role);
+		const subagent = this.processes.get(role);
+		this.processes.delete(role);
+		await subagent?.stop();
 	}
 
 	/** The plan changed during a review: the review finishes, then its findings go into a change round. */
@@ -257,9 +334,12 @@ export class BuildOrchestrator {
 		if (plan === undefined) return `Cannot read the plan ${state.planPath}`;
 		const generation = await this.stopProcesses();
 		if (generation !== this.generation) return "The run was stopped";
-		const next: DelegatedState = withPlanRevision({ phase: "implement", ...featureWorkOf(state) });
+		const work = featureWorkOf(state);
+		const changeState: DelegatedState = { phase: "implement", ...work };
+		const next: DelegatedState = withPlanRevision({ ...changeState, implementers: this.assignCrew(changeState, work.implementers ?? [], plan) });
 		this.seat.enterPhase(next);
-		this.beginStage(next, () => planChangePrompt(state.planPath, plan, state.planIssue));
+		const assignments = streamAssignments(next.implementers ?? [], plan);
+		this.beginStage(next, (seat) => planChangePrompt(state.planPath, plan, state.planIssue, undefined, assignments.get(seat.role)));
 		return undefined;
 	}
 
@@ -280,7 +360,7 @@ export class BuildOrchestrator {
 		if (state.phase !== "review-failed") return "Another fix round works after a failed re-review";
 		const next: DelegatedState = { phase: "fix", ...featureWorkOf(state) };
 		this.seat.enterPhase(next);
-		this.beginStage(next, () => fixPrompt(state.findings));
+		this.beginStage(next, this.fixPromptFor(next, state.findings));
 		return undefined;
 	}
 
@@ -304,6 +384,7 @@ export class BuildOrchestrator {
 		this.processes.clear();
 		this.agents.clear();
 		this.reviewAnswers.clear();
+		this.clearQuestions();
 		await Promise.all(running.map((subagent) => subagent.stop()));
 		return generation;
 	}
@@ -385,22 +466,71 @@ export class BuildOrchestrator {
 	): void {
 		this.agents.clear();
 		this.reviewAnswers.clear();
-		for (const seat of seatsOfStage(state.phase)) {
-			const subagent = this.ensureProcess(seat, state);
-			if (!subagent) {
-				this.seat.notify(`/build: no session file for the ${SUBAGENT_NAMES[seat.role]}`, "error");
-				continue;
-			}
-			const live = this.liveStageOf(state.phase, seat, subagent);
-			this.agents.set(seat.role, live);
+		this.clearQuestions();
+		for (const seat of seatsOfStage(state)) {
 			const answer = seat.reviewer ? answered.get(seat.reviewer) : undefined;
 			if (seat.reviewer && answer !== undefined) {
+				const live = this.startAgent(state, seat, undefined);
+				if (!live) continue;
 				this.reviewAnswers.set(seat.reviewer, answer);
 				live.condition = "answered";
 				continue;
 			}
-			subagent.prompt(promptFor(seat));
+			this.startAgent(state, seat, promptFor(seat));
 		}
+	}
+
+	/** Adds a subagent to the current stage and prompts it, unless prompt is undefined (it already answered). */
+	private startAgent(state: DelegatedState, seat: StageSeat, prompt: string | undefined): LiveStage | undefined {
+		const subagent = this.ensureProcess(seat, state);
+		if (!subagent) {
+			this.seat.notify(`/build: no session file for the ${SUBAGENT_NAMES[seat.role]}`, "error");
+			return undefined;
+		}
+		const live = this.liveStageOf(state.phase, seat, subagent);
+		this.agents.set(seat.role, live);
+		if (prompt !== undefined) subagent.prompt(prompt);
+		return live;
+	}
+
+	/** Each implementer's fix prompt: the merged review, and its own work stream when there are several. */
+	private fixPromptFor(state: DelegatedState, findings: string): (seat: StageSeat) => string {
+		const plan = this.seat.readPlan(state.planPath);
+		const assignments = plan === undefined ? new Map<SubagentRole, StreamAssignment | undefined>() : streamAssignments(state.implementers ?? [], plan);
+		return (seat) => fixPrompt(findings, assignments.get(seat.role));
+	}
+
+	private askPlanner(question: PlannerQuestion): void {
+		this.setCondition(question.role, "waiting-for-planner");
+		const name = SUBAGENT_NAMES[question.role];
+		if (this.askingRole) {
+			this.queuedQuestions.push(question);
+			this.seat.notify(`The ${name} has a question; the planner answers it after the current one`, "info");
+			return;
+		}
+		this.askingRole = question.role;
+		this.seat.notify(`The ${name} has a question; the planner answers it`, "info");
+		const isOneOfSeveral = [...this.agents.keys()].filter(isImplementerRole).length > 1;
+		this.seat.askPlanner(plannerQuestionPrompt(question.implementerAnswer, isOneOfSeveral ? name : undefined));
+	}
+
+	private askNextQuestion(): void {
+		const next = this.queuedQuestions.shift();
+		if (next) this.askPlanner(next);
+	}
+
+	/** The implementer got going without the planner (your message, a restart): its question is void. */
+	private dropQuestionOf(role: SubagentRole): void {
+		const queued = this.queuedQuestions.findIndex((question) => question.role === role);
+		if (queued !== -1) this.queuedQuestions.splice(queued, 1);
+		if (this.askingRole !== role) return;
+		this.askingRole = undefined;
+		this.askNextQuestion();
+	}
+
+	private clearQuestions(): void {
+		this.askingRole = undefined;
+		this.queuedQuestions.length = 0;
 	}
 
 	private liveStageOf(stage: DelegatedPhase, seat: StageSeat, subagent: Subagent): LiveStage {
@@ -426,6 +556,7 @@ export class BuildOrchestrator {
 		const stats = live.process.tracker.stats;
 		const record: StageRecord = {
 			stage: live.stage,
+			agent: live.role,
 			model: stats.model,
 			thinkingLevel: stats.thinkingLevel,
 			routeReason: stats.routeReason,
@@ -452,7 +583,7 @@ export class BuildOrchestrator {
 			return;
 		}
 		if (!live.reviewer) {
-			this.moveOn(state, lastAnswer, () => this.recordStage(live, lastAnswer));
+			this.handleImplementerSettled(state, live, lastAnswer);
 			return;
 		}
 		this.recordStage(live, lastAnswer);
@@ -466,25 +597,42 @@ export class BuildOrchestrator {
 		this.moveOnFromReviews(state);
 	}
 
-	private moveOnFromReviews(state: DelegatedState): void {
-		const reviews = [...this.reviewAnswers].map(([vendor, answer]) => ({ vendor, answer }));
-		this.moveOn(state, mergeReviews(reviews), () => undefined);
+	/** An implementer that is done waits for the others; one that stopped short asks the planner. */
+	private handleImplementerSettled(state: DelegatedState, live: LiveStage, lastAnswer: string): void {
+		const step = stepAfterTurn(state, lastAnswer);
+		switch (step.kind) {
+			case "ask-planner":
+				this.askPlanner({ role: live.role, implementerAnswer: step.implementerAnswer });
+				return;
+			case "wait":
+				this.seat.notify(`/build paused: ${step.reason}. Alt+A: message it (m) or restart it (r).`, "warning");
+				return;
+			case "advance": {
+				this.recordStage(live, lastAnswer);
+				this.setCondition(live.role, "answered");
+				const stillWorking = this.liveStages().filter((stage) => stage.condition !== "answered");
+				if (stillWorking.length > 0) {
+					const names = stillWorking.map((stage) => stage.process.name).join(", ");
+					this.seat.notify(`${live.process.name} is done; waiting for ${names}`, "info");
+					return;
+				}
+				void this.advance(state, step.next, lastAnswer);
+				return;
+			}
+		}
 	}
 
-	/** Applies the stage's outcome; recordImplementer stores the implementer's turn once the stage ends with it. */
-	private moveOn(state: DelegatedState, stageAnswer: string, recordImplementer: () => void): void {
+	private moveOnFromReviews(state: DelegatedState): void {
+		const reviews = [...this.reviewAnswers].map(([vendor, answer]) => ({ vendor, answer }));
+		const stageAnswer = mergeReviews(reviews);
 		const step = stepAfterTurn(state, stageAnswer);
 		switch (step.kind) {
 			case "ask-planner":
-				this.setCondition("implementer", "waiting-for-planner");
-				this.seat.notify("The implementer has a question; the planner answers it", "info");
-				this.seat.askPlanner(plannerQuestionPrompt(step.implementerAnswer));
 				return;
 			case "wait":
 				this.seat.notify(`/build paused: ${step.reason}. Alt+A: message it (m) or restart it (r).`, "warning");
 				return;
 			case "advance":
-				recordImplementer();
 				void this.advance(state, step.next, stageAnswer);
 				return;
 		}
@@ -494,6 +642,7 @@ export class BuildOrchestrator {
 		const generation = this.generation;
 		this.agents.clear();
 		this.reviewAnswers.clear();
+		this.clearQuestions();
 		switch (next.phase) {
 			case "review": {
 				const ruleFiles = await this.seat.ruleFiles();
@@ -514,13 +663,15 @@ export class BuildOrchestrator {
 					this.seat.notify(`/build paused: cannot read the plan ${next.planPath}`, "error");
 					return;
 				}
-				this.seat.enterPhase(next);
-				this.beginStage(next, () => planChangePrompt(next.planPath, plan, next.planIssue, stageAnswer));
+				const changeState: DelegatedState = { ...next, implementers: this.assignCrew(next, next.implementers ?? [], plan) };
+				this.seat.enterPhase(changeState);
+				const assignments = streamAssignments(changeState.implementers ?? [], plan);
+				this.beginStage(changeState, (seat) => planChangePrompt(next.planPath, plan, next.planIssue, stageAnswer, assignments.get(seat.role)));
 				return;
 			}
 			case "fix":
 				this.seat.enterPhase(next);
-				this.beginStage(next, () => fixPrompt(stageAnswer));
+				this.beginStage(next, this.fixPromptFor(next, stageAnswer));
 				return;
 			case "re-review":
 				this.seat.enterPhase(next);

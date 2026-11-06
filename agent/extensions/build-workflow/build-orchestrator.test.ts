@@ -6,6 +6,8 @@ import { test } from "node:test";
 import { AgentTracker } from "./agent-activity.ts";
 import { BuildOrchestrator, type PlannerSeat } from "./build-orchestrator.ts";
 import type { Subagent, SubagentOptions } from "./subagent-process.ts";
+import type { StreamAssignment } from "./workflow-prompts.ts";
+import type { ImplementerSeat } from "./work-streams.ts";
 import { IDLE_WORKFLOW, type StageRecord, type WorkflowState } from "./workflow-state.ts";
 
 /** Stands in for a subagent process: records prompts, and the test settles or crashes it. */
@@ -81,6 +83,8 @@ interface RecordedSession {
 	finished: { next: WorkflowState; summary: string }[];
 	ruleFilesGate: Deferred | undefined;
 	plan: string;
+	/** The implementers of the session's earlier runs. */
+	crew: ImplementerSeat[];
 }
 
 function newRecordedSession(): RecordedSession {
@@ -94,6 +98,7 @@ function newRecordedSession(): RecordedSession {
 		finished: [],
 		ruleFilesGate: undefined,
 		plan: "# Add export\n\n## Goal\nCSV export",
+		crew: [],
 	};
 }
 
@@ -112,6 +117,7 @@ function fakeSeat(recorded: RecordedSession): PlannerSeat {
 		runStageRecords: () => recorded.stages,
 		currentStageRecords: () => recorded.stages.filter((record) => record.stage === phaseOf(recorded)),
 		readPlan: () => recorded.plan,
+		crew: () => recorded.crew,
 		ruleFiles: async () => {
 			await recorded.ruleFilesGate?.promise;
 			return ["/repo/AGENTS.md"];
@@ -128,8 +134,31 @@ function fakeSeat(recorded: RecordedSession): PlannerSeat {
 	};
 }
 
-function startedRun() {
+const TWO_STREAM_PLAN = [
+	"# Add export",
+	"",
+	"## Goal",
+	"CSV export",
+	"",
+	"## Work streams",
+	"### API",
+	"src/export.ts",
+	"### Tests",
+	"test/export.test.ts",
+	"",
+	"## Files",
+	"- src/export.ts",
+].join("\n");
+
+/** "BRIEF", or "BRIEF Implementer 2: Tests" for an implementer of one of several work streams. */
+function briefFor(assignment: StreamAssignment | undefined): string {
+	return assignment ? `BRIEF ${assignment.implementerName}: ${assignment.stream.name}` : "BRIEF";
+}
+
+function startedRun(plan?: string, crew: ImplementerSeat[] = []) {
 	const recorded = newRecordedSession();
+	if (plan) recorded.plan = plan;
+	recorded.crew = crew;
 	const launched: FakeSubagent[] = [];
 	const launch = (options: SubagentOptions): FakeSubagent => {
 		const subagent = new FakeSubagent(options);
@@ -137,7 +166,7 @@ function startedRun() {
 		return subagent;
 	};
 	const orchestrator = new BuildOrchestrator(fakeSeat(recorded), launch);
-	orchestrator.startImplementation({ planPath: "/repo/plan.md", baseCommit: "abc123" }, "BRIEF");
+	orchestrator.startImplementation({ planPath: "/repo/plan.md", baseCommit: "abc123" }, recorded.plan, briefFor);
 	/** The latest process launched for the agent, e.g. "Implementer" or "Claude reviewer". */
 	const agent = (name: string): FakeSubagent => {
 		const subagent = launched.findLast((candidate) => candidate.name === name);
@@ -241,10 +270,10 @@ test("accepting a failed re-review releases the work for shipping", async () => 
 	assert.equal(recorded.finished.at(-1)?.next.phase, "awaiting-ship");
 });
 
-test("a plan change while implementing reaches the implementer at once as a new revision", () => {
+test("a plan change while implementing reaches the implementer at once as a new revision", async () => {
 	const { orchestrator, recorded, agent } = startedRun();
 	recorded.plan = "# Add export\n\n## Goal\nCSV and JSON export";
-	assert.equal(orchestrator.tellImplementerAboutPlanChange(), undefined);
+	assert.equal(await orchestrator.tellImplementersAboutPlanChange(), undefined);
 	assert.ok(agent("Implementer").prompts.at(-1)?.includes("CSV and JSON export"));
 	assert.equal(recorded.state.phase === "implement" && recorded.state.planRevision, 2);
 });
@@ -285,4 +314,83 @@ test("stopping an agent's turn keeps its process for a message or a restart", ()
 	assert.equal(orchestrator.liveStages()[0]?.condition, "stopped");
 	assert.equal(orchestrator.sendToSubagent("implementer", "go on"), undefined);
 	assert.equal(orchestrator.liveStages()[0]?.condition, "running");
+});
+
+const implementersOf = (recorded: RecordedSession): ImplementerSeat[] =>
+	"implementers" in recorded.state ? (recorded.state.implementers ?? []) : [];
+
+test("a plan with two work streams starts two implementers, and the review waits until both are done", async () => {
+	const { recorded, agent } = startedRun(TWO_STREAM_PLAN);
+	assert.deepEqual(agent("Implementer").prompts, ["BRIEF Implementer: API"]);
+	assert.deepEqual(agent("Implementer 2").prompts, ["BRIEF Implementer 2: Tests"]);
+	agent("Implementer 2").settle("IMPLEMENTATION: done");
+	await settleAsync();
+	assert.equal(phaseOf(recorded), "implement", "waits for the API implementer");
+	agent("Implementer").settle("IMPLEMENTATION: done");
+	await settleAsync();
+	assert.equal(phaseOf(recorded), "review");
+	assert.deepEqual(
+		recorded.stages.map((record) => record.agent),
+		["implementer-2", "implementer"],
+	);
+});
+
+test("the planner answers parallel questions one at a time, each back to the implementer that asked", () => {
+	const { orchestrator, recorded, agent } = startedRun(TWO_STREAM_PLAN);
+	agent("Implementer 2").settle("IMPLEMENTATION: blocked: which test runner?");
+	agent("Implementer").settle("IMPLEMENTATION: blocked: which currency?");
+	assert.equal(recorded.plannerQuestions.length, 1, "the second question waits");
+	assert.ok(recorded.plannerQuestions[0].includes("Implementer 2"));
+	orchestrator.handlePlannerReply("Use node:test.\nIMPLEMENTER_ANSWER: ready");
+	assert.ok(agent("Implementer 2").prompts.at(-1)?.includes("Use node:test."));
+	assert.ok(!agent("Implementer").prompts.at(-1)?.includes("Use node:test."));
+	assert.equal(recorded.plannerQuestions.length, 2);
+	assert.ok(recorded.plannerQuestions[1].includes("which currency?"));
+	orchestrator.handlePlannerReply("EUR cents.\nIMPLEMENTER_ANSWER: ready");
+	assert.ok(agent("Implementer").prompts.at(-1)?.includes("EUR cents."));
+	assert.ok(!orchestrator.isWaitingForPlanner);
+});
+
+test("each implementer fixes the findings of its own work stream", async () => {
+	const { recorded, agent } = startedRun(TWO_STREAM_PLAN);
+	agent("Implementer").settle("IMPLEMENTATION: done");
+	agent("Implementer 2").settle("IMPLEMENTATION: done");
+	await settleAsync();
+	agent("Claude reviewer").settle("test/export.test.ts:3 weak assert\nREVIEW_VERDICT: fix");
+	agent("OpenAI reviewer").settle("REVIEW_VERDICT: pass");
+	await settleAsync();
+	assert.equal(phaseOf(recorded), "fix");
+	assert.ok(agent("Implementer 2").prompts.at(-1)?.includes('work stream "Tests"'));
+	assert.ok(agent("Implementer").prompts.at(-1)?.includes("Findings in files no stream owns are yours"));
+});
+
+test("a later run of the session gives its streams to the implementers that built them, with their sessions", () => {
+	const first = startedRun(TWO_STREAM_PLAN);
+	const crew = implementersOf(first.recorded);
+	const reordered = TWO_STREAM_PLAN.replace("### API\nsrc/export.ts\n### Tests\ntest/export.test.ts", "### Tests\nmore tests\n### API\nmore API");
+	const second = startedRun(reordered, crew);
+	assert.deepEqual(
+		implementersOf(second.recorded).map((seat) => [seat.role, seat.stream, seat.sessionPath]),
+		[
+			["implementer-2", "Tests", crew[1].sessionPath],
+			["implementer", "API", crew[0].sessionPath],
+		],
+	);
+	assert.equal(second.agent("Implementer").sessionPath, crew[0].sessionPath);
+});
+
+test("a plan change that adds a work stream starts a third implementer; one that drops a stream stops its implementer", async () => {
+	const { orchestrator, recorded, agent } = startedRun(TWO_STREAM_PLAN);
+	recorded.plan = TWO_STREAM_PLAN.replace("## Files", "### Docs\nREADME.md\n\n## Files");
+	assert.equal(await orchestrator.tellImplementersAboutPlanChange(), undefined);
+	assert.deepEqual(agent("Implementer 3").prompts.length, 1);
+	assert.ok(agent("Implementer 3").prompts[0].includes('work stream "Docs"'));
+	assert.ok(agent("Implementer").prompts.at(-1)?.includes("## Updated plan"));
+	recorded.plan = TWO_STREAM_PLAN.replace("### Tests\ntest/export.test.ts\n", "");
+	assert.equal(await orchestrator.tellImplementersAboutPlanChange(), undefined);
+	assert.equal(implementersOf(recorded).length, 1);
+	assert.ok(!agent("Implementer 2").isRunning && !agent("Implementer 3").isRunning);
+	agent("Implementer").settle("IMPLEMENTATION: done");
+	await settleAsync();
+	assert.equal(phaseOf(recorded), "review", "the dropped implementers are not waited for");
 });

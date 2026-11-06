@@ -21,7 +21,7 @@ const PHASE_LABELS: Record<WorkflowPhase, string> = {
 	idle: "",
 	plan: "plan (expert)",
 	"awaiting-implementation": "plan agreed",
-	implement: "implementer working · Alt+A",
+	implement: "implementing · Alt+A",
 	review: "reviewers working · Alt+A",
 	fix: "implementer fixing · Alt+A",
 	"re-review": "reviewers re-reviewing · Alt+A",
@@ -30,7 +30,7 @@ const PHASE_LABELS: Record<WorkflowPhase, string> = {
 	"awaiting-ship": "review passed, /build ship",
 };
 
-/** "build: implementer working · Alt+A", "issue #42: investigate (expert)"; empty when idle. */
+/** "build: implementing · Alt+A", "issue #42: investigate (expert)"; empty when idle. */
 export function phaseLabel(state: WorkflowState): string {
 	if (state.phase === "idle") return "";
 	const prefix = state.issue ? `issue #${state.issue.number}` : "build";

@@ -8,7 +8,7 @@ function row(agent: StageRow["agent"], status: StageRow["status"]): StageRow {
 }
 
 function timeline(phase: BuildTimeline["phase"], stages: StageRow[], isFinished = false): BuildTimeline {
-	return { task: "x", phase, planRevision: 1, isFinished, stages, activeMs: 0, costUsd: 0 };
+	return { task: "x", phase, planRevision: 1, isFinished, steps: [], stages, activeMs: 0, costUsd: 0 };
 }
 
 const keysOf = (controls: ReturnType<typeof controlsFor>) => controls.map((control) => control.key);

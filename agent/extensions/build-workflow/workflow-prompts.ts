@@ -12,8 +12,10 @@ import {
 	REVIEWER_NAMES,
 	type ReviewerVendor,
 	type StageRecord,
+	SUBAGENT_NAMES,
 	type TrackedIssue,
 } from "./workflow-state.ts";
+import { MAX_IMPLEMENTERS, WORK_STREAMS_HEADING, type WorkStream } from "./work-streams.ts";
 import { SAVE_PLAN_TOOL_NAME } from "../project-memory/agreed-plan-files.ts";
 import type { GithubIssue } from "./github-issue.ts";
 
@@ -35,8 +37,13 @@ const AGREE_AND_SAVE_PLAN_STEPS = [
 	"     test style), each with an existing file to copy the style from.",
 	"   - Acceptance criteria: the observable behavior plus the exact typecheck, lint and test commands.",
 	"   - Files: every file to create or change, one line each.",
-	"5. After saving, tell me the plan path. I then choose whether to post the plan as a GitHub issue, and the implementer",
-	"   starts on its own as a subagent; if it gets stuck, its question comes back to you here.",
+	`   - Work streams (optional): up to ${MAX_IMPLEMENTERS} implementers can build in parallel, in the same folder. When the work`,
+	`     splits into parts that touch different files, add a \`${WORK_STREAMS_HEADING}\` section with one \`### <short name>\``,
+	"     subsection per part: the files it owns and its Approach steps. No file may be in two streams. Use one stream",
+	"     (no section) when the parts would share files or the work is small. In a later plan of this session, keep the",
+	"     names of the streams that continue, so the implementer that built a stream keeps building it with its context.",
+	"5. After saving, tell me the plan path. I then choose whether to post the plan as a GitHub issue, and the implementers",
+	"   start on their own as subagents; if one gets stuck, its question comes back to you here.",
 	`6. If I want the plan changed later, even while the implementer works, update it and call ${SAVE_PLAN_TOOL_NAME} again`,
 	"   with the full updated plan. The run keeps one plan file and passes the change on; never edit files yourself.",
 ];
@@ -99,18 +106,44 @@ function planSourceLines(planPath: string, planIssue: TrackedIssue | undefined):
 	];
 }
 
+/** An implementer's part when the plan has several work streams; undefined when one implementer builds it all. */
+export interface StreamAssignment {
+	/** "Implementer 2". */
+	implementerName: string;
+	stream: WorkStream;
+	/** The streams the other implementers build at the same time. */
+	otherStreams: { implementerName: string; streamName: string }[];
+}
+
+function assignmentLines(assignment: StreamAssignment | undefined): string[] {
+	if (!assignment) return [];
+	const others = assignment.otherStreams.map((other) => `- ${other.implementerName}: "${other.streamName}"`);
+	return [
+		"## Your part",
+		"",
+		`You are ${assignment.implementerName}. You build only the work stream "${assignment.stream.name}" of the plan's`,
+		`${WORK_STREAMS_HEADING} section. Other implementers build the other streams at the same time, in this same folder:`,
+		...others,
+		"Change only the files of your stream. Their files may be half done while you work: do not edit them, and checks",
+		"that fail in their files are not yours to fix; mention them in your report.",
+		"",
+	];
+}
+
 export function implementationBrief(
 	planPath: string,
 	plan: string,
 	ruleFilePaths: readonly string[],
 	issue?: IssueRef,
 	planIssue?: TrackedIssue,
+	assignment?: StreamAssignment,
 ): string {
 	return [
 		"[/build, phase 2 of 3: IMPLEMENT] You are the implementer. An expert planned this work with me and I agreed to the",
 		`plan below (saved at ${planPath}). Implement exactly this plan. An expert reviews your work against it afterwards.`,
 		"",
 		...issueLine(issue),
+		...assignmentLines(assignment),
 		"## What to implement",
 		"",
 		...planSourceLines(planPath, planIssue),
@@ -199,10 +232,16 @@ export function reviewPrompt(
 }
 
 /** Quotes the review so the fix request is self-contained: the router rates its difficulty from this prompt. */
-export function fixPrompt(reviewReport: string): string {
+export function fixPrompt(reviewReport: string, assignment?: StreamAssignment): string {
+	const scope = assignment
+		? [
+				`Fix the must-fix findings in the files of your work stream "${assignment.stream.name}"; the other implementers fix`,
+				`the findings in theirs.${assignment.implementerName === SUBAGENT_NAMES.implementer ? " Findings in files no stream owns are yours." : ""}`,
+			]
+		: ["Fix every must-fix finding of their reviews:"];
 	return [
-		"[/build: FIX] You are the implementer again. Two expert reviewers reviewed your work.",
-		"Fix every must-fix finding of their reviews:",
+		"[/build: FIX] You are the implementer again. Two expert reviewers reviewed the work.",
+		...scope,
 		"",
 		reviewReport.trim(),
 		"",
@@ -233,10 +272,10 @@ function quoteAnswerEnd(answer: string): string {
 	return `…${trimmed.slice(trimmed.length - MAX_QUOTED_ANSWER_CHARS)}`;
 }
 
-/** Sent to the planner when the implementer stops without finishing. */
-export function plannerQuestionPrompt(implementerAnswer: string): string {
+/** Sent to the planner when an implementer stops without finishing; asker names it when several work in parallel. */
+export function plannerQuestionPrompt(implementerAnswer: string, asker?: string): string {
 	return [
-		"[/build: IMPLEMENTER QUESTION] The implementer stopped before finishing. Its last reply:",
+		`[/build: IMPLEMENTER QUESTION] ${asker ?? "The implementer"} stopped before finishing. Its last reply:`,
 		"",
 		quoteAnswerEnd(implementerAnswer),
 		"",
@@ -270,7 +309,13 @@ export function resumePrompt(): string {
  * Sent to the implementer when the plan changed during the run: the full new plan, and the findings of a review
  * of the previous version when there was one.
  */
-export function planChangePrompt(planPath: string, plan: string, planIssue: TrackedIssue | undefined, reviewFindings?: string): string {
+export function planChangePrompt(
+	planPath: string,
+	plan: string,
+	planIssue: TrackedIssue | undefined,
+	reviewFindings?: string,
+	assignment?: StreamAssignment,
+): string {
 	const findings = reviewFindings?.trim()
 		? [
 				"",
@@ -287,6 +332,7 @@ export function planChangePrompt(planPath: string, plan: string, planIssue: Trac
 		"still matches it. Follow the same rules and code style as in your original brief, do not commit, and rerun the",
 		"typecheck, lint and test commands. Then both expert reviewers review the work against the new plan.",
 		"",
+		...assignmentLines(assignment),
 		"## Updated plan",
 		"",
 		plan.trim(),
@@ -304,8 +350,9 @@ const STAGE_ROLES: Record<StageRecord["stage"], string> = {
 	"re-review": "Re-reviewer",
 };
 
-/** "Claude reviewer", "OpenAI re-reviewer", "Implementer". */
-export function stageRoleName(stage: StageRecord["stage"], reviewer: ReviewerVendor | undefined): string {
+/** "Claude reviewer", "OpenAI re-reviewer", "Implementer", "Implementer 2 (fix)". */
+export function stageRoleName(stage: StageRecord["stage"], reviewer: ReviewerVendor | undefined, agent?: StageRecord["agent"]): string {
+	if (agent && !reviewer) return stage === "fix" ? `${SUBAGENT_NAMES[agent]} (fix)` : SUBAGENT_NAMES[agent];
 	if (!reviewer) return STAGE_ROLES[stage];
 	const vendorName = REVIEWER_NAMES[reviewer].replace(/ reviewer$/, "");
 	return `${vendorName} ${STAGE_ROLES[stage].toLowerCase()}`;
@@ -335,7 +382,7 @@ function formatMinutes(durationMs: number): string {
 export function runReport(summary: string, stages: readonly StageRecord[], changes: string | undefined): string {
 	const rows = stages.map((stage) => {
 		const model = stage.model ? `${stage.model}${stage.thinkingLevel ? ` · ${stage.thinkingLevel}` : ""}` : "unknown";
-		return `| ${stageRoleName(stage.stage, stage.reviewer)} | ${model} | ${formatMinutes(stage.activeMs)} | $${stage.costUsd.toFixed(2)} |`;
+		return `| ${stageRoleName(stage.stage, stage.reviewer, stage.agent)} | ${model} | ${formatMinutes(stage.activeMs)} | $${stage.costUsd.toFixed(2)} |`;
 	});
 	const reviewReports = lastReviews(stages).flatMap((review) => [
 		"",

@@ -89,7 +89,7 @@ export class PlanChanges {
 				await this.startDialog.ask();
 				return;
 			case "tell-implementer":
-				this.report(this.orchestrator.tellImplementerAboutPlanChange(), "The implementer got the changed plan");
+				this.report(await this.orchestrator.tellImplementersAboutPlanChange(), "The implementers got the changed plan");
 				await this.updatePlanIssue();
 				return;
 			case "ask-about-review":

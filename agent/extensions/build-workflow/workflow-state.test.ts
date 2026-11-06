@@ -4,6 +4,7 @@ import {
 	canEditFiles,
 	canPlannerEditFiles,
 	type FeatureWork,
+	findCrew,
 	findLastRunPlan,
 	findPlannerWorkflowState,
 	findWorkflowState,
@@ -79,7 +80,8 @@ test("the planner's answer goes to the implementer without its marker; needs-use
 });
 
 test("the subagents keep their session files when the run moves on", () => {
-	const sessions = { implementerSession: "/s/impl.jsonl", reviewerSessions: { anthropic: "/s/claude-review.jsonl", openai: "/s/openai-review.jsonl" } };
+	const implementers = [{ role: "implementer" as const, stream: "", sessionPath: "/s/impl.jsonl" }];
+	const sessions = { implementers, reviewerSessions: { anthropic: "/s/claude-review.jsonl", openai: "/s/openai-review.jsonl" } };
 	const step = stepAfterTurn({ phase: "review", ...work, ...sessions }, "REVIEW_VERDICT: fix");
 	assert.deepEqual(step, { kind: "advance", next: { phase: "fix", ...work, ...sessions } });
 });
@@ -233,4 +235,17 @@ test("a /build started later in a resumed subagent session is followed like any 
 test("the planner's own session keeps its run, including an interrupted one", () => {
 	const entries = [stateEntry({ phase: "plan", task: "x" }), userEntry, stateEntry({ phase: "implement", ...work })];
 	assert.equal(findPlannerWorkflowState(entries).phase, "implement");
+});
+
+test("the session's crew is the implementers of its latest run, also from states written before parallel implementers", () => {
+	const legacy = stateEntry({ phase: "implement", ...work, implementerSession: "/s/old.jsonl" });
+	assert.deepEqual(findCrew([legacy]), [{ role: "implementer", stream: "", sessionPath: "/s/old.jsonl" }]);
+	assert.deepEqual(findWorkflowState([legacy]), { phase: "implement", ...work, implementers: [{ role: "implementer", stream: "", sessionPath: "/s/old.jsonl" }] });
+	const two = [
+		{ role: "implementer", stream: "API", sessionPath: "/s/1.jsonl" },
+		{ role: "implementer-2", stream: "Tests", sessionPath: "/s/2.jsonl" },
+	];
+	const entries = [legacy, stateEntry({ phase: "fix", ...work, implementers: two }), stateEntry({ phase: "idle" })];
+	assert.deepEqual(findCrew(entries), two);
+	assert.deepEqual(findCrew([stateEntry({ phase: "plan", task: "x" })]), []);
 });

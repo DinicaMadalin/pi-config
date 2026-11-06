@@ -46,6 +46,11 @@ const busySnapshot: OverviewSnapshot = {
 		isFinished: false,
 		activeMs: 1_000_000,
 		costUsd: 5.13,
+		steps: [
+			{ key: "plan", status: "done" },
+			{ key: "implement", status: "working" },
+			{ key: "review", status: "waiting" },
+		],
 		stages: [
 			{ key: "plan", agent: "planner", role: "Planner", status: "done", model: "claude-opus-5-5", thinkingLevel: "high", activeMs: 724_000, costUsd: 4.1, upcomingHint: "expert tier" },
 			{ key: "implement", agent: "implementer", role: "Implementer", status: "working", model: "claude-opus-5-5", thinkingLevel: "high", routeReason: "rated expert (82%): deep architecture or long autonomous work", activeMs: 372_000, costUsd: 1.03, upcomingHint: "model picked by difficulty" },

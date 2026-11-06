@@ -26,9 +26,8 @@ import type { PlannerSession } from "./planner-session.ts";
 import { findRepoRoot } from "./repo-files.ts";
 import { type GaugeEntry, readSessionGauge, type SessionGauge } from "./session-gauge.ts";
 import { type FileChange, loadWorkChanges } from "./work-changes.ts";
-import { REVIEWER_VENDORS, reviewerRole, WORKFLOW_STATE_ENTRY_TYPE } from "./workflow-state.ts";
+import { SUBAGENT_ROLES, WORKFLOW_STATE_ENTRY_TYPE } from "./workflow-state.ts";
 
-const SUBAGENT_ROLES: readonly SubagentRole[] = ["implementer", ...REVIEWER_VENDORS.map(reviewerRole)];
 /** While agents work the files change all the time; otherwise edits and turn ends mark the count stale. */
 const BUSY_CHANGES_REFRESH_MS = 3000;
 const IDLE_CHANGES_REFRESH_MS = 15_000;
@@ -233,6 +232,7 @@ export class WorkspaceFeed {
 			const stats = live.process.tracker.stats;
 			return {
 				stage: live.stage,
+				agent: live.role,
 				reviewer: live.reviewer,
 				model: stats.model,
 				thinkingLevel: stats.thinkingLevel,

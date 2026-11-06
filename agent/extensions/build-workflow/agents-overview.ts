@@ -24,6 +24,7 @@ import type { FileDiffResult } from "./file-diff.ts";
 import { FileDiffView, type HighlightCode } from "./file-diff-view.ts";
 import { markdownLines, TextPager } from "./text-pager.ts";
 import type { FileChange, WorkChangesResult } from "./work-changes.ts";
+import { SUBAGENT_NAMES } from "./workflow-state.ts";
 
 export type { BuildAgentKey };
 export type DelegateKey = `delegate:${string}`;
@@ -113,30 +114,8 @@ const TABS: readonly { tab: OverviewTab; key: string }[] = [
 /** Outside a /build there is no plan or report. */
 const WORKSPACE_TABS = TABS.slice(0, 2);
 
-const AGENT_NAMES: Record<BuildAgentKey, string> = {
-	planner: "Planner",
-	implementer: "Implementer",
-	"anthropic-reviewer": "Claude reviewer",
-	"openai-reviewer": "OpenAI reviewer",
-};
+const AGENT_NAMES: Record<BuildAgentKey, string> = { planner: "Planner", ...SUBAGENT_NAMES };
 
-/** When the stepper merges the rows of one stage (both reviewers), the first status here wins. */
-const MERGED_STATUS_ORDER: readonly StageStatus[] = ["working", "paused", "your-turn", "done", "skipped", "waiting"];
-
-/** One stepper step per stage: the rows of the two reviewers become one step. */
-function stepsOf(stages: readonly StageRow[]): { key: StageKey; status: StageStatus }[] {
-	const steps: { key: StageKey; status: StageStatus }[] = [];
-	for (const stage of stages) {
-		const previous = steps.at(-1);
-		if (previous?.key !== stage.key) {
-			steps.push({ key: stage.key, status: stage.status });
-			continue;
-		}
-		const rank = (status: StageStatus) => MERGED_STATUS_ORDER.indexOf(status);
-		if (rank(stage.status) < rank(previous.status)) previous.status = stage.status;
-	}
-	return steps;
-}
 const ACTIVITY_LINES_SHOWN = 12;
 
 /** The tab bar and the blank line under it. */
@@ -584,9 +563,10 @@ export class AgentsOverview implements Component, Focusable {
 	private agentsTab(timeline: BuildTimeline, snapshot: OverviewSnapshot, innerWidth: number): string[] {
 		const selectedAgent = this.currentAgent(snapshot);
 		return [
-			this.stepper(timeline.stages),
+			this.stepper(timeline.steps),
 			"",
 			...timeline.stages.flatMap((stage) => this.stageLines(stage, snapshot, innerWidth, selectedAgent)),
+			...this.stepHintLines(timeline),
 			...this.delegateSection(snapshot, innerWidth, selectedAgent),
 			...(selectedAgent ? ["", ...this.activityLines(selectedAgent, snapshot, innerWidth)] : []),
 			...this.controlLines(snapshot, innerWidth),
@@ -780,9 +760,15 @@ export class AgentsOverview implements Component, Focusable {
 		}
 	}
 
-	private stepper(stages: readonly StageRow[]): string {
+	/** A your-turn step that no row stands for: the decision after a failed re-review. */
+	private stepHintLines(timeline: BuildTimeline): string[] {
+		const reReview = timeline.steps.find((step) => step.key === "re-review" && step.status === "your-turn");
+		return reReview ? [`${DETAIL_INDENT}${this.theme.fg("warning", this.yourTurnHint("re-review"))}`] : [];
+	}
+
+	private stepper(steps: BuildTimeline["steps"]): string {
 		const theme = this.theme;
-		return stepsOf(stages)
+		return steps
 			.map((stage, index) => {
 				const isReached = stage.status !== "waiting" && stage.status !== "skipped";
 				const label = isReached ? STAGE_SHORT_NAMES[stage.key] : theme.fg("dim", STAGE_SHORT_NAMES[stage.key]);
@@ -813,6 +799,7 @@ export class AgentsOverview implements Component, Focusable {
 		const pointer = isSelected ? theme.fg("accent", "❯ ") : "  ";
 		const row = `${pointer}${this.statusIcon(stage.status)}  ${role}${model}${time}${cost}`;
 		const lines = [isSelected ? theme.bg("selectedBg", padEndToWidth(row, innerWidth)) : row];
+		if (stage.stream) lines.push(`${DETAIL_INDENT}${theme.fg("dim", "builds")} ${theme.fg("muted", stage.stream)}`);
 
 		const isCurrent = stage.status === "working" || stage.status === "paused" || stage.status === "your-turn";
 		if (isCurrent && stage.routeReason) {
