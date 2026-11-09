@@ -24,7 +24,7 @@ test("a reply without either tag is unreadable", () => {
 test("the request keeps only the recent conversation and cuts long messages", () => {
 	const conversation = Array.from({ length: 10 }, (_, index) => ({ role: "user" as const, text: `message ${index}` }));
 	conversation.push({ role: "user", text: "x".repeat(3000) });
-	const text = rewriteRequestText({ prompt: "fix it", recentConversation: conversation, workspaceName: "pi-config" });
+	const text = rewriteRequestText({ prompt: "fix it", recentConversation: conversation, workspaceName: "pi-config", mayAskQuestions: true });
 	assert.ok(!text.includes("message 4"));
 	assert.ok(text.includes("message 5"));
 	assert.ok(text.includes(`${"x".repeat(1500)}…`) && !text.includes("x".repeat(1501)));
@@ -36,9 +36,27 @@ test("with answers, the request forbids more questions and marks empty answers a
 		prompt: "export it",
 		recentConversation: [],
 		workspaceName: "app",
+		mayAskQuestions: true,
 		answers: [{ question: "CSV or JSON?", answer: "JSON" }, { question: "Which command?", answer: "" }],
 	});
 	assert.match(text, /Q: CSV or JSON\?\nA: JSON/);
 	assert.match(text, /A: \(no answer: pick the most likely reading/);
 	assert.match(text, /do not ask more questions/);
+});
+
+test("a message judged clear must be rewritten without questions", () => {
+	const text = rewriteRequestText({ prompt: "add a json flag", recentConversation: [], workspaceName: "app", mayAskQuestions: false });
+	assert.match(text, /reply with <rewrite>/);
+});
+
+test("a corrected attempt shows the rejected rewrite and what was wrong with it", () => {
+	const text = rewriteRequestText({
+		prompt: "maybe log a warning",
+		recentConversation: [],
+		workspaceName: "app",
+		mayAskQuestions: false,
+		correction: { previousRewrite: "Log a warning.", problems: ["may have turned a maybe or a question into an order"] },
+	});
+	assert.match(text, /which a check rejected\n\nLog a warning\./);
+	assert.match(text, /found that it may have turned a maybe/);
 });

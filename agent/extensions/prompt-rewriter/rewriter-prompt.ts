@@ -59,8 +59,12 @@ export interface RewriteInput {
 	recentConversation: readonly ConversationMessage[];
 	/** The repository or folder the developer works in, e.g. "pi-config". */
 	workspaceName: string;
+	/** False when the message was judged clear enough that a guess costs little: then it must rewrite. */
+	mayAskQuestions: boolean;
 	/** Answers to the clarifying questions; once given, the rewriter must rewrite. */
 	answers?: readonly ClarifyingAnswer[];
+	/** A previous rewrite and what a check found wrong with it, for one more attempt. */
+	correction?: { previousRewrite: string; problems: readonly string[] };
 }
 
 export interface ClarifyingAnswer {
@@ -78,12 +82,21 @@ export function rewriteRequestText(input: RewriteInput): string {
 		);
 	}
 	sections.push("## The developer's new message to rewrite", input.prompt.trim());
+	if (input.correction) {
+		sections.push(
+			"## Your previous rewrite, which a check rejected",
+			input.correction.previousRewrite,
+			`The check found that it ${input.correction.problems.join("; and it ")}. Rewrite the original message again and fix that; follow every hard rule.`,
+		);
+	}
 	if (input.answers && input.answers.length > 0) {
 		sections.push(
 			"## The developer's answers to your questions",
 			input.answers.map(({ question, answer }) => `Q: ${question}\nA: ${answer?.trim() || "(no answer: pick the most likely reading and list it under Assumptions)"}`).join("\n\n"),
 			"Now reply with <rewrite>; do not ask more questions. Fold the answers into the rewrite as if the developer had written them.",
 		);
+	} else if (!input.mayAskQuestions) {
+		sections.push("This message was judged clear enough to rewrite without questions: reply with <rewrite>, and put any small guess under Assumptions.");
 	}
 	return sections.join("\n\n");
 }

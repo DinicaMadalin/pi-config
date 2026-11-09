@@ -83,7 +83,7 @@ const THINKING_CRITERIA: Partial<Record<RoutedThinkingLevel, string>> = {
 	xhigh: "Exhaustive reasoning: proofs, subtle concurrency or security analysis, or long chains of dependent decisions",
 };
 
-function resolveTypesafeApiKey(): string | undefined {
+export function resolveTypesafeApiKey(): string | undefined {
 	const envKey = process.env.TYPESAFE_API_KEY?.trim();
 	if (envKey) return envKey;
 	if (!existsSync(TYPESAFE_KEY_FILE)) return undefined;
