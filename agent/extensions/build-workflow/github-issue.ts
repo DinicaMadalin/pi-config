@@ -29,7 +29,13 @@ export type StepResult<T> = { ok: true; value: T } | { ok: false; error: string 
 
 const ISSUE_URL_PATTERN = /^https:\/\/github\.com\/([\w.-]+\/[\w.-]+)\/issues\/(\d+)\/?(?:[?#].*)?$/;
 const ISSUE_NUMBER_PATTERN = /^#?(\d+)$/;
-const MAX_BRANCH_SLUG_LENGTH = 40;
+/** A branch without an issue is named after the first few meaningful words of the plan title: `fix-eslint`. */
+const MAX_BRANCH_WORDS = 3;
+const MAX_BRANCH_NAME_LENGTH = 24;
+const FILLER_WORDS = new Set([
+	"a", "an", "the", "and", "or", "in", "on", "of", "to", "for", "with", "from", "by", "into", "at", "as",
+	"is", "are", "be", "it", "its", "this", "that", "all", "some", "tiny", "small", "simple", "new", "existing",
+]);
 
 export function parseIssueArgument(text: string): IssueArgument | undefined {
 	const trimmed = text.trim();
@@ -40,17 +46,23 @@ export function parseIssueArgument(text: string): IssueArgument | undefined {
 	return undefined;
 }
 
-function branchSlug(title: string): string {
-	return title
+/** The title's first meaningful words, lowercase and dash-joined; empty when it has none in a-z/0-9. */
+function shortBranchSlug(title: string): string {
+	const meaningfulWords = title
 		.toLowerCase()
-		.replace(/[^a-z0-9]+/g, "-")
-		.slice(0, MAX_BRANCH_SLUG_LENGTH)
-		.replace(/^-+|-+$/g, "");
+		.split(/[^a-z0-9]+/)
+		.filter((word) => word && !FILLER_WORDS.has(word));
+	let slug = "";
+	for (const word of meaningfulWords.slice(0, MAX_BRANCH_WORDS)) {
+		const longer = slug ? `${slug}-${word}` : word;
+		if (longer.length > MAX_BRANCH_NAME_LENGTH) break;
+		slug = longer;
+	}
+	return slug || (meaningfulWords[0]?.slice(0, MAX_BRANCH_NAME_LENGTH) ?? "");
 }
 
-export function issueBranchName(issueNumber: number, title: string): string {
-	const slug = branchSlug(title);
-	return slug ? `issue-${issueNumber}-${slug}` : `issue-${issueNumber}`;
+export function issueBranchName(issueNumber: number): string {
+	return `issue-${issueNumber}`;
 }
 
 export function pullRequestTitle(issue: Pick<IssueRef, "number" | "title">): string {
@@ -138,7 +150,7 @@ export async function createIssueBranch(run: RunCommand, issue: GithubIssue): Pr
 	const fetch = await run("git", ["fetch", "origin", baseBranch.value]);
 	if (fetch.code !== 0) return { ok: false, error: commandError(`fetch origin/${baseBranch.value}`, fetch) };
 
-	const branch = issueBranchName(issue.number, issue.title);
+	const branch = issueBranchName(issue.number);
 	const create = await run("git", ["switch", "-c", branch, "--no-track", `origin/${baseBranch.value}`]);
 	if (create.code !== 0) return { ok: false, error: commandError(`create branch ${branch} from origin/${baseBranch.value}`, create) };
 	return { ok: true, value: { number: issue.number, title: issue.title, url: issue.url, branch, baseBranch: baseBranch.value } };
@@ -236,9 +248,8 @@ export async function listFilesToShip(run: RunCommand): Promise<StepResult<strin
 }
 
 function shipBaseName(title: string, planIssue: TrackedIssue | undefined): string {
-	if (planIssue) return issueBranchName(planIssue.number, planIssue.title);
-	const slug = branchSlug(title);
-	return slug ? `build-${slug}` : "build";
+	if (planIssue) return issueBranchName(planIssue.number);
+	return shortBranchSlug(title) || "build";
 }
 
 /** A branch name no local branch uses yet: the base name, then -2, -3, ... */

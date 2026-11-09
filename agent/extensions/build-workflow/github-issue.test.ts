@@ -48,10 +48,21 @@ test("reads an issue as a URL, #number or number", () => {
 	assert.equal(parseIssueArgument("https://github.com/acme/shop/pull/12"), undefined);
 });
 
-test("branch names are issue-<number>-<slug of the title>", () => {
-	assert.equal(issueBranchName(42, "Crash on EMPTY cart!"), "issue-42-crash-on-empty-cart");
-	assert.equal(issueBranchName(42, "日本"), "issue-42");
-	assert.ok(issueBranchName(42, "a ".repeat(100)).length <= "issue-42-".length + 40);
+test("an issue's branch is just issue-<number>", () => {
+	assert.equal(issueBranchName(42), "issue-42");
+});
+
+test("a branch without an issue is named after the plan title's first meaningful words", async () => {
+	const { run } = fakeRunner([["git rev-parse", failed("")]]);
+	const cases: [string, string][] = [
+		["Fix ESLint", "fix-eslint"],
+		["Fix the ESLint errors in the dashboard", "fix-eslint-errors"],
+		["Add tiny string and numeric utilities", "add-string-numeric"],
+		["Internationalization of the configuration subsystem", "internationalization"],
+		["Supercalifragilisticexpialidocious-word-here", "supercalifragilisticexpi"],
+		["日本", "build"],
+	];
+	for (const [title, expected] of cases) assert.deepEqual(await shipBranchName(run, title), { ok: true, value: expected }, title);
 });
 
 test("refuses an issue URL from another repo", async () => {
@@ -70,9 +81,9 @@ test("refuses to branch from a dirty working tree", async () => {
 test("branches from the fetched default branch", async () => {
 	const { run, calls } = fakeRunner([["git symbolic-ref", ok("origin/main\n")]]);
 	const result = await createIssueBranch(run, issue);
-	assert.deepEqual(result, { ok: true, value: { number: 7, title: "Crash", url: "u", branch: "issue-7-crash", baseBranch: "main" } });
+	assert.deepEqual(result, { ok: true, value: { number: 7, title: "Crash", url: "u", branch: "issue-7", baseBranch: "main" } });
 	assert.ok(calls.includes("git fetch origin main"));
-	assert.ok(calls.includes("git switch -c issue-7-crash --no-track origin/main"));
+	assert.ok(calls.includes("git switch -c issue-7 --no-track origin/main"));
 });
 
 test("reports a failed push and does not open a PR", async () => {
@@ -135,12 +146,12 @@ test("creating the plan issue reads its number from the URL gh prints", async ()
 
 test("the ship branch skips names that already exist", async () => {
 	const { run } = fakeRunner([
-		["git rev-parse --verify --quiet refs/heads/issue-9-add-csv-export-2", failed("")],
+		["git rev-parse --verify --quiet refs/heads/issue-9-2", failed("")],
 		["git rev-parse --verify --quiet refs/heads/", ok("abc")],
 	]);
-	assert.deepEqual(await shipBranchName(run, "Add CSV export", planIssue), { ok: true, value: "issue-9-add-csv-export-2" });
+	assert.deepEqual(await shipBranchName(run, "Add CSV export", planIssue), { ok: true, value: "issue-9-2" });
 	const { run: noneExist } = fakeRunner([["git rev-parse", failed("")]]);
-	assert.deepEqual(await shipBranchName(noneExist, "Add CSV export"), { ok: true, value: "build-add-csv-export" });
+	assert.deepEqual(await shipBranchName(noneExist, "Add CSV export"), { ok: true, value: "add-csv-export" });
 });
 
 test("the ship commit closes the plan issue", () => {
