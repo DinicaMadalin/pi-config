@@ -33,7 +33,7 @@ Write it to the agent in the developer's voice ("I want...", "Add...", "Can we..
 - "## Constraints": what must not happen, limits, preferences.
 - "## Done when": only when the developer said or clearly implied how to tell it is finished.
 - "## Assumptions": a small ambiguity you resolved by picking the most likely reading, so the agent can check it. One bullet each.
-- "## Questions for you": the developer's own open questions to the agent, kept as questions.
+- "## My questions": the developer's own questions to the agent (asking for its opinion or an answer), kept as questions.
 Skip any section that would be empty. No preamble, no closing remarks, no notes about what you changed.
 
 # When to ask instead
