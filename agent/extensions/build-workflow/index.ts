@@ -25,6 +25,7 @@ import { TASK_KIND_EVENT } from "../auto-model/route-pin.ts";
 import { SAVE_PLAN_TOOL_NAME } from "../project-memory/agreed-plan-files.ts";
 import { answerText } from "./agent-activity.ts";
 import { registerDashboard } from "./dashboard.ts";
+import { requestRewrite } from "../prompt-rewriter/rewrite-request.ts";
 import { BuildOrchestrator } from "./build-orchestrator.ts";
 import { ISSUE_USAGE, openPullRequest, promptForPullRequest, startIssueWorkflow } from "./issue-workflow.ts";
 import { PlanChanges } from "./plan-changes.ts";
@@ -281,12 +282,17 @@ export default function (pi: ExtensionAPI) {
 						ctx.ui.notify("Wait for the agent to finish, then run /build again", "warning");
 						return;
 					}
+					const rewrittenTask = await requestRewrite(pi.events, argument, ctx);
+					if (rewrittenTask.kind === "cancelled") {
+						ctx.ui.setEditorText(`/build ${argument}`);
+						return;
+					}
 					const buildRefusal = await makeRoomForNewRun();
 					if (buildRefusal) {
 						ctx.ui.notify(buildRefusal, "warning");
 						return;
 					}
-					await startWorkflow(argument, ctx);
+					await startWorkflow(rewrittenTask.text, ctx);
 			}
 		},
 	});

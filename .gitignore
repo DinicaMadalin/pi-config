@@ -19,6 +19,8 @@ agent/extensions/*
 !agent/extensions/build-workflow/**
 !agent/extensions/project-memory
 !agent/extensions/project-memory/**
+!agent/extensions/prompt-rewriter
+!agent/extensions/prompt-rewriter/**
 
 # Everything below is credentials, chat history, or machine-generated state.
 # Keep these lines even though they are redundant with the deny-all above:
