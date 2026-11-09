@@ -74,7 +74,7 @@ export interface ClarifyingAnswer {
 }
 
 export function rewriteRequestText(input: RewriteInput): string {
-	const sections = [`Workspace: ${input.workspaceName}`];
+	const sections = [`Workspace (for your understanding only; do not mention it unless the message does): ${input.workspaceName}`];
 	const conversation = input.recentConversation.slice(-RECENT_MESSAGE_COUNT);
 	if (conversation.length > 0) {
 		sections.push(
