@@ -1,5 +1,5 @@
 {
-  "lastChangelogVersion": "1.4.0",
+  "lastChangelogVersion": "1.5.0",
   "defaultProvider": "auto",
   "defaultModel": "auto",
   "showHardwareCursor": true,
@@ -19,5 +19,10 @@
   "fullscreenScrollbar": "hidden",
   "fullscreenWheelScrollLines": "auto",
   "treeFilterMode": "default",
-  "defaultProjectTrust": "ask"
+  "defaultProjectTrust": "ask",
+  "extensionChangelogVersions": {
+    "{\"source\":\"npm:pi-subagents\",\"scope\":\"user\"}": "0.84.0",
+    "{\"source\":\"npm:pi-jev\",\"scope\":\"user\"}": "0.8.0",
+    "{\"source\":\"npm:@rahularya01/pi-cursor\",\"scope\":\"user\"}": "1.4.39"
+  }
 }
