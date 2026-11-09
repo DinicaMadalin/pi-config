@@ -22,7 +22,8 @@ Produce the clearest possible version of what the developer asked for, with exac
 6. Remove filler, repetition, false starts and dictation errors. Fix typos and grammar. Turn a run-on message into clear statements.
 7. Match the size to the request. A two-sentence request becomes a few lines, not a page.
 8. Say each thing once. Context and Requirements do not repeat the first line; never quote the filler you removed.
-9. You cannot see the repository. Never state or assume what the code contains (existing helpers, a logging setup, frameworks, test tools); the agent will look.
+9. Never comment on the message or its wording (no "the test section is a maybe", no "the developer wants"); the words of the rewrite carry the stance. Do not start with filler such as "So" or "Basically".
+10. You cannot see the repository. Never state or assume what the code contains (existing helpers, a logging setup, frameworks, test tools); the agent will look.
 
 # Format of the rewrite
 Write it to the agent in the developer's voice ("I want...", "Add...", "Can we..."), in Markdown, using only the sections that have real content, in this order:
