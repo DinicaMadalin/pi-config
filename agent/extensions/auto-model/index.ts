@@ -43,10 +43,13 @@ import {
 import {
 	applyQualityBias,
 	applyThinkingFloor,
+	capTier,
 	DIFFICULTY_TIERS,
 	type DifficultyTier,
 	IMPORTANT_TASK_TIER,
+	MAX_TIER_ENV_VAR,
 	modelKey,
+	parseTierCeiling,
 	pickModelForTier,
 	preferProvider,
 	type RoutedThinkingLevel,
@@ -200,7 +203,7 @@ async function routeNewTask(
 	const isDifficultyOnly = pin.route !== "normal";
 	const rated = await rateTier(request, policies, memory.announceTaskKind, isDifficultyOnly, ctx);
 	// A pinned tier keeps Jev's thinking depth, raised to that tier's minimum.
-	const { tier, thinkingLevel, basis } =
+	const chosen =
 		pin.route === "tier"
 			? {
 					tier: pin.tier,
@@ -208,7 +211,12 @@ async function routeNewTask(
 					basis: { kind: "pinned" } as const,
 				}
 			: rated;
-	memory.recordRouteDecision({ tier, thinkingLevel, reason: describeTierBasis(basis, tier) });
+	const ceiling = parseTierCeiling(process.env[MAX_TIER_ENV_VAR]);
+	const tier = capTier(chosen.tier, ceiling);
+	const isCapped = tier !== chosen.tier;
+	const thinkingLevel = isCapped ? applyThinkingFloor(chosen.thinkingLevel, policies[tier]) : chosen.thinkingLevel;
+	const reason = describeTierBasis(chosen.basis, chosen.tier);
+	memory.recordRouteDecision({ tier, thinkingLevel, reason: isCapped ? `${reason}, capped at ${tier}` : reason });
 
 	// Same tier as the running model: keep it instead of paying a cache miss for an equal model.
 	const previous = request.previous?.model;

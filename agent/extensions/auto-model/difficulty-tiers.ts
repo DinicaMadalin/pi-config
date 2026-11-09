@@ -66,6 +66,22 @@ export function applyQualityBias(classifiedTier: DifficultyTier, selectedLevel: 
 	return shiftTier(classifiedTier, tierShiftByLevel[selectedLevel] ?? 0);
 }
 
+/**
+ * A process-wide ceiling on the routed tier, set by whoever launches Pi (the /build workflow caps its implementer
+ * subagents at cheap tiers, because the expert planner hands them exact steps). Unset or unknown: no ceiling.
+ */
+export const MAX_TIER_ENV_VAR = "PI_AUTO_MODEL_MAX_TIER";
+
+export function parseTierCeiling(rawTier: string | undefined): DifficultyTier | undefined {
+	return DIFFICULTY_TIERS.find((tier) => tier === rawTier?.trim());
+}
+
+/** The tier, lowered to the ceiling when it is above it. */
+export function capTier(tier: DifficultyTier, ceiling: DifficultyTier | undefined): DifficultyTier {
+	if (!ceiling) return tier;
+	return DIFFICULTY_TIERS.indexOf(tier) > DIFFICULTY_TIERS.indexOf(ceiling) ? ceiling : tier;
+}
+
 /** Moves a tier up (positive steps) or down, stopping at trivial and expert. */
 export function shiftTier(tier: DifficultyTier, steps: number): DifficultyTier {
 	const index = DIFFICULTY_TIERS.indexOf(tier) + steps;

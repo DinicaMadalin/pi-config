@@ -14,6 +14,7 @@ import { IDLE_WORKFLOW, type StageRecord, type WorkflowState } from "./workflow-
 class FakeSubagent implements Subagent {
 	readonly name: string;
 	readonly sessionPath: string;
+	readonly maxTier: SubagentOptions["maxTier"];
 	readonly tracker = new AgentTracker();
 	readonly prompts: string[] = [];
 	isRunning = false;
@@ -25,6 +26,7 @@ class FakeSubagent implements Subagent {
 		this.options = options;
 		this.name = options.name;
 		this.sessionPath = options.sessionPath;
+		this.maxTier = options.maxTier;
 	}
 
 	start(): void {
@@ -251,6 +253,10 @@ test("a re-review that still finds problems waits for your call, and fixing agai
 	agent("OpenAI reviewer").settle("REVIEW_VERDICT: pass");
 	await settleAsync();
 	assert.equal(phaseOf(recorded), "fix");
+	assert.ok(recorded.plannerQuestions.at(-1)?.includes("a.ts:3 off by one"), "the planner writes the fix steps");
+	assert.equal(agent("Implementer").prompts.length, 1, "the implementer waits for the fix steps");
+	orchestrator.handlePlannerReply("1. Use <= in a.ts:3 and add a boundary test\nIMPLEMENTER_ANSWER: ready");
+	assert.ok(agent("Implementer").prompts.at(-1)?.includes("Use <= in a.ts:3"));
 	agent("Implementer").settle("Fixed a.ts:3 with a boundary test\nIMPLEMENTATION: done");
 	await settleAsync();
 	assert.equal(phaseOf(recorded), "re-review");
@@ -261,7 +267,9 @@ test("a re-review that still finds problems waits for your call, and fixing agai
 	assert.equal(recorded.finished.at(-1)?.next.phase, "review-failed");
 	assert.equal(orchestrator.fixAgain(), undefined);
 	assert.equal(phaseOf(recorded), "fix");
-	assert.ok(agent("Implementer").prompts.at(-1)?.includes("still off by one"));
+	assert.ok(recorded.plannerQuestions.at(-1)?.includes("still off by one"));
+	orchestrator.handlePlannerReply("1. Also cover n = 0\nIMPLEMENTER_ANSWER: ready");
+	assert.ok(agent("Implementer").prompts.at(-1)?.includes("Also cover n = 0"));
 });
 
 test("accepting a failed re-review releases the work for shipping", async () => {
@@ -352,8 +360,8 @@ test("the planner answers parallel questions one at a time, each back to the imp
 	assert.ok(!orchestrator.isWaitingForPlanner);
 });
 
-test("each implementer fixes the findings of its own work stream", async () => {
-	const { recorded, agent } = startedRun(TWO_STREAM_PLAN);
+test("each implementer gets its own section of the planner's fix steps", async () => {
+	const { orchestrator, recorded, agent } = startedRun(TWO_STREAM_PLAN);
 	agent("Implementer").settle("IMPLEMENTATION: done");
 	agent("Implementer 2").settle("IMPLEMENTATION: done");
 	await settleAsync();
@@ -361,8 +369,27 @@ test("each implementer fixes the findings of its own work stream", async () => {
 	agent("OpenAI reviewer").settle("REVIEW_VERDICT: pass");
 	await settleAsync();
 	assert.equal(phaseOf(recorded), "fix");
-	assert.ok(agent("Implementer 2").prompts.at(-1)?.includes('work stream "Tests"'));
-	assert.ok(agent("Implementer").prompts.at(-1)?.includes("Findings in files no stream owns are yours"));
+	assert.ok(orchestrator.isWaitingForPlanner);
+	orchestrator.handlePlannerReply("### Implementer 2\n1. Assert the CSV header in test/export.test.ts:3\n### Implementer\nNothing to change.\nIMPLEMENTER_ANSWER: ready");
+	const testsPrompt = agent("Implementer 2").prompts.at(-1) ?? "";
+	assert.ok(testsPrompt.includes("Assert the CSV header"));
+	assert.ok(testsPrompt.includes('the "Tests" work stream'));
+	assert.ok(!(agent("Implementer").prompts.at(-1) ?? "").includes("Assert the CSV header"));
+	assert.ok(!orchestrator.isWaitingForPlanner);
+});
+
+test("implementers run under the cheap tier ceiling unless their stream needs a strong model", () => {
+	const strongPlan = TWO_STREAM_PLAN.replace("### Tests", "### Tests (needs a strong model)");
+	const { agent } = startedRun(strongPlan);
+	assert.equal(agent("Implementer").maxTier, "standard");
+	assert.equal(agent("Implementer 2").maxTier, "complex");
+});
+
+test("reviewers have no tier ceiling", async () => {
+	const { agent } = startedRun();
+	agent("Implementer").settle("IMPLEMENTATION: done");
+	await settleAsync();
+	assert.equal(agent("Claude reviewer").maxTier, undefined);
 });
 
 test("a later run of the session gives its streams to the implementers that built them, with their sessions", () => {
@@ -394,4 +421,18 @@ test("a plan change that adds a work stream starts a third implementer; one that
 	agent("Implementer").settle("IMPLEMENTATION: done");
 	await settleAsync();
 	assert.equal(phaseOf(recorded), "review", "the dropped implementers are not waited for");
+});
+
+test("a plan change that marks a finished stream as needing a strong model relaunches its implementer under the higher ceiling", async () => {
+	const { orchestrator, recorded, agent, launched } = startedRun(TWO_STREAM_PLAN);
+	const firstTestsImplementer = agent("Implementer 2");
+	firstTestsImplementer.settle("IMPLEMENTATION: done");
+	recorded.plan = TWO_STREAM_PLAN.replace("### Tests", "### Tests (needs a strong model)");
+	assert.equal(await orchestrator.tellImplementersAboutPlanChange(), undefined);
+	const relaunched = agent("Implementer 2");
+	assert.notEqual(relaunched, firstTestsImplementer);
+	assert.equal(relaunched.maxTier, "complex");
+	assert.equal(relaunched.sessionPath, firstTestsImplementer.sessionPath, "it keeps its session");
+	assert.ok(!firstTestsImplementer.isRunning);
+	assert.equal(launched.filter((subagent) => subagent.name === "Implementer").length, 1, "the working implementer keeps running");
 });

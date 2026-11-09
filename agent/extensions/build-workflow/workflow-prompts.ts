@@ -15,7 +15,7 @@ import {
 	SUBAGENT_NAMES,
 	type TrackedIssue,
 } from "./workflow-state.ts";
-import { MAX_IMPLEMENTERS, WORK_STREAMS_HEADING, type WorkStream } from "./work-streams.ts";
+import { MAX_IMPLEMENTERS, STRONG_MODEL_MARKER, WORK_STREAMS_HEADING, type WorkStream } from "./work-streams.ts";
 import { SAVE_PLAN_TOOL_NAME } from "../project-memory/agreed-plan-files.ts";
 import type { GithubIssue } from "./github-issue.ts";
 
@@ -27,12 +27,17 @@ function listRuleFiles(ruleFilePaths: readonly string[]): string {
 /** Steps 3 to 5 of planning: agreement, then a plan the implementer can follow without this conversation. */
 const AGREE_AND_SAVE_PLAN_STEPS = [
 	"3. Discuss with me until I explicitly agree with both the goal and the approach. Do not edit any file in this phase.",
-	`4. Once I agree, call ${SAVE_PLAN_TOOL_NAME}. The plan is the implementer's only brief, so write it for a capable`,
-	"   developer who has never seen this repo, and it may be posted as a GitHub issue, so it must stand on its own and",
-	"   hold no secrets, tokens or personal data:",
+	`4. Once I agree, call ${SAVE_PLAN_TOOL_NAME}. The plan is the implementers' only brief, and they run on cheaper models`,
+	"   that follow instructions well but should not have to design anything. So you do the thinking: write the plan",
+	"   implementation-ready, for a capable developer who has never seen this repo. It may be posted as a GitHub issue,",
+	"   so it must stand on its own and hold no secrets, tokens or personal data:",
 	"   - Goal: start with the problem (what is wrong or missing, why it matters, how to see it), then the result we want.",
-	"   - Approach: numbered steps in order, each naming the file, the functions or types to add or change with their",
-	"     signatures, the data shapes, the error and edge cases, and the tests to add with their names.",
+	"   - Approach: small numbered steps in order, each one change an implementer can make and check on its own. Each",
+	"     step names the file, the exact functions or types to add or change with their full signatures, the data shapes,",
+	"     the behavior on each edge case and error (with the exact error messages), and where the logic is subtle, the",
+	"     algorithm or a short code sketch. Leave no decision open: if you catch yourself writing \"decide\", \"choose\",",
+	"     \"handle appropriately\" or \"as needed\", make the decision in the plan.",
+	"   - Tests: each test with its name, its input and the exact expected result, including the edge cases and failures.",
 	"   - Constraints: the repo rules that matter here, and the local conventions to imitate (naming, error handling,",
 	"     test style), each with an existing file to copy the style from.",
 	"   - Acceptance criteria: the observable behavior plus the exact typecheck, lint and test commands.",
@@ -42,6 +47,10 @@ const AGREE_AND_SAVE_PLAN_STEPS = [
 	"     subsection per part: the files it owns and its Approach steps. No file may be in two streams. Use one stream",
 	"     (no section) when the parts would share files or the work is small. In a later plan of this session, keep the",
 	"     names of the streams that continue, so the implementer that built a stream keeps building it with its context.",
+	`   - Strong model (rare): an implementer gets a cheap model unless its stream's heading ends with \`${STRONG_MODEL_MARKER}\`.`,
+	"     Mark a stream only when its steps still need real design work you cannot spell out (a tricky concurrency or",
+	"     algorithm change); a hard task with exact steps does not need it. For a plan without streams, add the section",
+	"     with a single stream to mark it.",
 	"5. After saving, tell me the plan path. I then choose whether to post the plan as a GitHub issue, and the implementers",
 	"   start on their own as subagents; if one gets stuck, its question comes back to you here.",
 	`6. If I want the plan changed later, even while the implementer works, update it and call ${SAVE_PLAN_TOOL_NAME} again`,
@@ -330,33 +339,76 @@ export function reviewPrompt(
 	].join("\n");
 }
 
-/** Quotes the review so the fix request is self-contained: the router rates its difficulty from this prompt. */
-export function fixPrompt(reviewReport: string, assignment?: StreamAssignment): string {
-	const scope = assignment
+/** The implementers a fix round has, so the planner can address its fix steps to each. */
+export interface FixCrewMember {
+	implementerName: string;
+	/** Empty when one implementer builds the whole plan. */
+	streamName: string;
+}
+
+/**
+ * Sent to the planner when the reviewers ask for fixes: the implementers run on cheap models, so the planner checks
+ * the findings and writes the exact steps they follow.
+ */
+export function fixStepsPrompt(reviewReport: string, crew: readonly FixCrewMember[]): string {
+	const isSeveral = crew.length > 1;
+	const grouping = isSeveral
 		? [
-				`Fix the must-fix findings in the files of your work stream "${assignment.stream.name}"; the other implementers fix`,
-				`the findings in theirs.${assignment.implementerName === SUBAGENT_NAMES.implementer ? " Findings in files no stream owns are yours." : ""}`,
+				"4. Group the steps under one `### <Implementer name>` heading per implementer that has work, using these names:",
+				...crew.map(({ implementerName, streamName }) => `   - ${implementerName}: owns the files of the "${streamName}" stream`),
+				"   A finding in a file no stream owns goes to the implementer whose work it touches most.",
 			]
-		: ["Fix the must-fix findings of their reviews."];
+		: ["4. Write the steps as one ordered list for the implementer."];
 	return [
-		"[/build: FIX] You are the implementer again. Two expert reviewers reviewed your work independently.",
+		"[/build: FIX STEPS] Both expert reviewers reviewed the implementation and asked for fixes; their reviews are below.",
+		"The implementers run on cheaper models: they follow your fix steps exactly and design nothing themselves, so the",
+		"thinking is yours.",
+		"",
+		reviewReport.trim(),
+		"",
+		"1. Check each must-fix finding against the code yourself: read it, and run a command or a probe under /tmp when",
+		"   that settles it. Do not edit any file. A finding is real, or wrong (say why, with the evidence).",
+		"2. For each real finding, fix the root cause, not the symptom. Write small ordered steps, each naming the file and",
+		"   function, the exact change (show the code when it is short), and for a behavior bug the test to add first with",
+		"   its input and expected result.",
+		"3. Add the command that proves each fix, and the full check commands to run at the end. Include a suggestion only",
+		"   when it is cheap and inside the plan's scope.",
+		...grouping,
+		"",
+		`If a finding needs a decision only I can make (a business rule, a change of scope), ask me and end with the line`,
+		`\`${PLANNER_NEEDS_USER_MARKER}\`; once I reply, write the steps. Otherwise end with the line \`${PLANNER_ANSWER_READY_MARKER}\`.`,
+	].join("\n");
+}
+
+/** The fix round for one implementer: the planner's steps for it, with the reviews for context. */
+export function fixPrompt(reviewReport: string, fixSteps: string, assignment?: StreamAssignment): string {
+	const scope = assignment
+		? [`These are your steps for the "${assignment.stream.name}" work stream; the other implementers fix the rest.`]
+		: [];
+	return [
+		"[/build: FIX] You are the implementer again. Two expert reviewers reviewed your work, and the planner who wrote",
+		"the plan checked their findings and wrote the exact fix steps below. They are your brief for this round.",
 		...scope,
+		"",
+		"## Fix steps",
+		"",
+		fixSteps.trim(),
+		"",
+		"## The reviews, for context",
 		"",
 		reviewReport.trim(),
 		"",
 		"## How to fix",
 		"",
-		"1. Confirm each must-fix finding before you change code: reproduce it, or trace the code path it names.",
-		"2. Fix the root cause, not the symptom. For a behavior bug, first add a test that fails without the fix.",
-		"3. If a finding is wrong, do not change the code: explain why, with evidence (the code path, a command's output).",
-		"   If the reviewers contradict each other, follow the plan. If the plan does not decide it, ask the planner",
-		`   (end with \`${IMPLEMENTATION_BLOCKED_MARKER}: <your question>\`).`,
-		"4. Apply a suggestion only when it is cheap and inside the plan's scope; say which ones you applied.",
-		"5. Change nothing else, follow the same rules and code style as in your original brief, and do not commit.",
-		"6. Rerun the full typecheck, lint and test commands, and walk the review checklist of your brief over your new changes.",
+		"1. Follow the steps in order, exactly. For a behavior bug, add the test first and see it fail, then fix.",
+		"2. If a step does not match the code (the file, function or line differs) or would break something, do not",
+		`   improvise: say what you found and ask (end with \`${IMPLEMENTATION_BLOCKED_MARKER}: <your question>\`).`,
+		"3. Change nothing else, follow the same rules and code style as in your original brief, and do not commit.",
+		"4. Rerun the full typecheck, lint and test commands, read your new diff, and walk the review checklist of your",
+		"   brief over it.",
 		"",
-		"Report each must-fix finding as fixed (how, and the test that covers it) or rejected (why, with evidence), then the",
-		`checks you ran with their results. ${HONEST_REPORTING}`,
+		"Report each step as done (and the test that covers it) or not done (why), then the checks you ran with their",
+		`results. ${HONEST_REPORTING}`,
 		`End your reply with the line \`${IMPLEMENTATION_DONE_MARKER}\`.`,
 	].join("\n");
 }

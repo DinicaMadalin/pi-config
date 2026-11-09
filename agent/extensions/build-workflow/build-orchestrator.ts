@@ -14,6 +14,7 @@ import { activeMsOf } from "./agent-activity.ts";
 import { createSubagentSessionFile, type LaunchSubagent, launchSubagentProcess, type Subagent, type SubagentDialogs } from "./subagent-process.ts";
 import {
 	fixPrompt,
+	fixStepsPrompt,
 	planChangePrompt,
 	plannerAnswerPrompt,
 	plannerQuestionPrompt,
@@ -23,7 +24,8 @@ import {
 	runReport,
 	type StreamAssignment,
 } from "./workflow-prompts.ts";
-import { assignStreams, capWorkStreams, type ImplementerSeat, parseWorkStreams, streamOf, type WorkStream } from "./work-streams.ts";
+import type { DifficultyTier } from "../auto-model/difficulty-tiers.ts";
+import { assignStreams, capWorkStreams, type ImplementerSeat, implementerMaxTier, parseWorkStreams, streamOf, type WorkStream } from "./work-streams.ts";
 import {
 	type DelegatedPhase,
 	type DelegatedState,
@@ -31,6 +33,7 @@ import {
 	type FeatureWork,
 	agentOfRecord,
 	featureWorkOf,
+	fixStepsFor,
 	hasReviewVerdict,
 	isImplementerRole,
 	isAwaitingUser,
@@ -99,6 +102,8 @@ export interface LiveStage {
 	startActiveMs: number;
 }
 
+type FixState = Extract<DelegatedState, { phase: "fix" }>;
+
 /** An implementer stage runs one implementer per work stream; a review stage runs a reviewer of each vendor. */
 interface StageSeat {
 	role: SubagentRole;
@@ -160,6 +165,8 @@ export class BuildOrchestrator {
 	/** The implementer whose question the planner is answering now, and the questions waiting behind it. */
 	private askingRole: SubagentRole | undefined;
 	private readonly queuedQuestions: PlannerQuestion[] = [];
+	/** The fix round waiting for the planner's fix steps; no implementer works until they arrive. */
+	private isWaitingForFixSteps = false;
 	/** Bumped by stop(): a step of a stopped run that was waiting on I/O sees the change and drops out. */
 	private generation = 0;
 
@@ -178,7 +185,7 @@ export class BuildOrchestrator {
 	}
 
 	get isWaitingForPlanner(): boolean {
-		return this.askingRole !== undefined;
+		return this.askingRole !== undefined || this.isWaitingForFixSteps;
 	}
 
 	/**
@@ -204,7 +211,11 @@ export class BuildOrchestrator {
 	resume(): ActionRefusal {
 		const state = this.seat.state();
 		if (!isDelegatedState(state)) return "No subagent stage to resume";
-		if (this.agents.size > 0) return "The run is already going; Alt+A shows it";
+		if (this.agents.size > 0 || this.isWaitingForFixSteps) return "The run is already going; Alt+A shows it";
+		if (state.phase === "fix" && state.findings !== undefined && state.fixSteps === undefined) {
+			this.requestFixSteps(state, state.findings);
+			return undefined;
+		}
 		const missing = seatsOfStage(state).find((seat) => {
 			const sessionPath = sessionOfSeat(state, seat);
 			return !sessionPath || !existsSync(sessionPath);
@@ -218,6 +229,10 @@ export class BuildOrchestrator {
 
 	/** The planner's turn settled; if it answered the implementer that asked, pass the answer on and ask the next question. */
 	handlePlannerReply(reply: string): void {
+		if (this.isWaitingForFixSteps) {
+			this.handleFixSteps(reply);
+			return;
+		}
 		const asker = this.askingRole;
 		if (!asker) return;
 		const plannerAnswer = readPlannerAnswer(reply);
@@ -233,6 +248,10 @@ export class BuildOrchestrator {
 
 	/** The planner's turn was aborted while an implementer waited on it. */
 	handlePlannerAborted(): void {
+		if (this.isWaitingForFixSteps) {
+			this.seat.notify("The fix round waits for the planner's fix steps: ask the planner to write them", "warning");
+			return;
+		}
 		const asker = this.askingRole;
 		if (!asker) return;
 		const name = SUBAGENT_NAMES[asker];
@@ -359,9 +378,9 @@ export class BuildOrchestrator {
 	fixAgain(): ActionRefusal {
 		const state = this.seat.state();
 		if (state.phase !== "review-failed") return "Another fix round works after a failed re-review";
-		const next: DelegatedState = { phase: "fix", ...featureWorkOf(state) };
+		const next: FixState = { phase: "fix", ...featureWorkOf(state), findings: state.findings };
 		this.seat.enterPhase(next);
-		this.beginStage(next, this.fixPromptFor(next, state.findings));
+		this.requestFixSteps(next, state.findings);
 		return undefined;
 	}
 
@@ -411,9 +430,27 @@ export class BuildOrchestrator {
 		return sessionPath;
 	}
 
+	/** Reviewers route freely (the expert tier); an implementer gets a cheap model unless its stream is marked. */
+	private maxTierOf(seat: StageSeat, state: FeatureWork): DifficultyTier | undefined {
+		if (seat.reviewer) return undefined;
+		const implementer = state.implementers?.find((candidate) => candidate.role === seat.role);
+		const plan = this.seat.readPlan(state.planPath);
+		const streams = plan === undefined ? [] : capWorkStreams(parseWorkStreams(plan));
+		return implementerMaxTier(implementer ? streamOf(streams, implementer.stream) : undefined);
+	}
+
+	/**
+	 * The seat's process, launched when it has none. An idle process whose tier ceiling no longer fits its stream
+	 * (the plan marked or unmarked it) is replaced on the same session; a working one finishes its turn first.
+	 */
 	private ensureProcess(seat: StageSeat, state: FeatureWork): Subagent | undefined {
+		const maxTier = this.maxTierOf(seat, state);
 		const running = this.processes.get(seat.role);
-		if (running?.isRunning) return running;
+		if (running?.isRunning && (running.maxTier === maxTier || running.isWorking)) return running;
+		if (running?.isRunning) {
+			this.processes.delete(seat.role);
+			void running.stop();
+		}
 		const sessionPath = sessionOfSeat(state, seat);
 		if (!sessionPath) return undefined;
 		const name = SUBAGENT_NAMES[seat.role];
@@ -422,6 +459,7 @@ export class BuildOrchestrator {
 			cwd: this.seat.cwd(),
 			sessionPath,
 			dialogs: this.seat.dialogs,
+			...(maxTier && { maxTier }),
 			onSettled: (lastAnswer, isAborted) => {
 				if (this.processes.get(seat.role) === subagent) this.handleSubagentSettled(seat.role, lastAnswer, isAborted);
 			},
@@ -504,10 +542,34 @@ export class BuildOrchestrator {
 		return [...replyByAgent].map(([agent, reply]) => ({ implementerName: SUBAGENT_NAMES[agent], reply }));
 	}
 
-	private fixPromptFor(state: DelegatedState, findings: string): (seat: StageSeat) => string {
+	/** The reviewers asked for fixes: the planner checks the findings and writes the steps the implementers follow. */
+	private requestFixSteps(state: FixState, findings: string): void {
+		this.isWaitingForFixSteps = true;
+		const crew = (state.implementers ?? []).map((seat) => ({ implementerName: SUBAGENT_NAMES[seat.role], streamName: seat.stream }));
+		this.seat.notify("The reviewers asked for fixes; the planner checks the findings and writes the fix steps", "info");
+		this.seat.askPlanner(fixStepsPrompt(findings, crew));
+	}
+
+	/** The planner's reply while the fix round waits: once it has the steps, each implementer gets its part. */
+	private handleFixSteps(reply: string): void {
+		const plannerAnswer = readPlannerAnswer(reply);
+		if (plannerAnswer.kind === "none") return;
+		if (plannerAnswer.kind === "needs-user") {
+			this.seat.notify("The fix round waits for you: answer the planner's question, then it writes the fix steps", "info");
+			return;
+		}
+		this.isWaitingForFixSteps = false;
+		const state = this.seat.state();
+		if (state.phase !== "fix" || state.findings === undefined) return;
+		const next: FixState = { ...state, fixSteps: plannerAnswer.answer };
+		this.seat.enterPhase(next);
+		this.beginStage(next, this.fixPromptFor(next, state.findings, plannerAnswer.answer));
+	}
+
+	private fixPromptFor(state: FixState, findings: string, fixSteps: string): (seat: StageSeat) => string {
 		const plan = this.seat.readPlan(state.planPath);
 		const assignments = plan === undefined ? new Map<SubagentRole, StreamAssignment | undefined>() : streamAssignments(state.implementers ?? [], plan);
-		return (seat) => fixPrompt(findings, assignments.get(seat.role));
+		return (seat) => fixPrompt(findings, fixStepsFor(fixSteps, SUBAGENT_NAMES[seat.role]), assignments.get(seat.role));
 	}
 
 	private askPlanner(question: PlannerQuestion): void {
@@ -541,6 +603,7 @@ export class BuildOrchestrator {
 	private clearQuestions(): void {
 		this.askingRole = undefined;
 		this.queuedQuestions.length = 0;
+		this.isWaitingForFixSteps = false;
 	}
 
 	private liveStageOf(stage: DelegatedPhase, seat: StageSeat, subagent: Subagent): LiveStage {
@@ -679,10 +742,12 @@ export class BuildOrchestrator {
 				this.beginStage(changeState, (seat) => planChangePrompt(next.planPath, plan, next.planIssue, stageAnswer, assignments.get(seat.role)));
 				return;
 			}
-			case "fix":
-				this.seat.enterPhase(next);
-				this.beginStage(next, this.fixPromptFor(next, stageAnswer));
+			case "fix": {
+				const fixState: FixState = { ...next, findings: next.findings ?? stageAnswer };
+				this.seat.enterPhase(fixState);
+				this.requestFixSteps(fixState, fixState.findings ?? stageAnswer);
 				return;
+			}
 			case "re-review":
 				this.seat.enterPhase(next);
 				this.beginStage(next, () => reReviewPrompt(next.baseCommit, this.latestFixReplies()));

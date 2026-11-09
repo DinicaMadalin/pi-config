@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import {
 	fixPrompt,
+	fixStepsPrompt,
 	implementationBrief,
 	issueInvestigationPrompt,
 	plannerQuestionPrompt,
@@ -66,12 +67,21 @@ test("the review diffs against the commit implementation started from", () => {
 	assert.match(prompt, /REVIEW_VERDICT: pass/);
 });
 
-test("the fix request quotes the review findings", () => {
-	const prompt = fixPrompt("Must fix\n1. price.js:4 rounds wrong\nREVIEW_VERDICT: fix");
+test("the fix request gives the planner's fix steps and quotes the review for context", () => {
+	const prompt = fixPrompt("Must fix\n1. price.js:4 rounds wrong\nREVIEW_VERDICT: fix", "1. In price.js:4 use Math.round on cents");
+	assert.match(prompt, /Math\.round on cents/);
 	assert.match(prompt, /price\.js:4 rounds wrong/);
-	assert.match(prompt, /Fix the root cause/);
-	assert.match(prompt, /If a finding is wrong, do not change the code/);
 	assert.match(prompt, /IMPLEMENTATION: done`\.$/);
+});
+
+test("the planner is asked to verify the findings and write steps per implementer", () => {
+	const prompt = fixStepsPrompt("a.ts:3 off by one", [
+		{ implementerName: "Implementer", streamName: "API" },
+		{ implementerName: "Implementer 2", streamName: "Tests" },
+	]);
+	assert.match(prompt, /a\.ts:3 off by one/);
+	assert.match(prompt, /Implementer 2: owns the files of the "Tests" stream/);
+	assert.match(prompt, /IMPLEMENTER_ANSWER: ready/);
 });
 
 test("issue prompts carry the issue to the investigator, implementer and reviewer", () => {

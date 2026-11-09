@@ -96,7 +96,12 @@ export type WorkflowState =
 	| { phase: "idle" }
 	| { phase: "plan"; task: string; issue?: IssueRef }
 	| { phase: "awaiting-implementation"; task: string; planPath: string; issue?: IssueRef }
-	| ({ phase: "implement" | "fix" } & FeatureWork)
+	| ({ phase: "implement" } & FeatureWork)
+	/**
+	 * findings: the merged review the round fixes (missing in states written before fix steps existed).
+	 * fixSteps: the planner's exact steps for the implementers; until it wrote them, no implementer is working.
+	 */
+	| ({ phase: "fix"; findings?: string; fixSteps?: string } & FeatureWork)
 	/** planChangeAfterReview: the plan changed during the review; its outcome goes into a change round. */
 	| ({ phase: ReviewPhase; planChangeAfterReview?: boolean } & FeatureWork)
 	/** The re-review still has findings and the fix round is used up: you decide what happens next. */
@@ -292,7 +297,7 @@ export function stepAfterTurn(state: DelegatedState, stageAnswer: string): Workf
 			const verdict = lastMarker(stageAnswer, [REVIEW_PASS_MARKER, REVIEW_FIX_MARKER]);
 			if (verdict === REVIEW_PASS_MARKER) return { kind: "advance", next: releaseStateOf(state) };
 			if (verdict === undefined) return { kind: "wait", reason: "a reviewer ended without a verdict" };
-			if (state.phase === "review") return { kind: "advance", next: { phase: "fix", ...featureWorkOf(state) } };
+			if (state.phase === "review") return { kind: "advance", next: { phase: "fix", ...featureWorkOf(state), findings: stageAnswer } };
 			return { kind: "advance", next: { phase: "review-failed", ...featureWorkOf(state), findings: stageAnswer } };
 		}
 	}
@@ -373,6 +378,28 @@ export function readPlannerAnswer(reply: string): PlannerAnswer {
 		.join("\n")
 		.trim();
 	return { kind: "ready", answer };
+}
+
+/**
+ * The planner's fix steps for one implementer: its "### <Implementer name>" section when the planner wrote one per
+ * implementer, else all of them (one implementer, or sections the planner did not name).
+ */
+export function fixStepsFor(fixSteps: string, implementerName: string): string {
+	const sections = new Map<string, string[]>();
+	let current: string[] | undefined;
+	for (const line of fixSteps.split("\n")) {
+		const heading = /^###\s+(.*?)\s*$/.exec(line);
+		const name = heading?.[1].replace(/[`*_:]/g, "").trim().toLowerCase();
+		if (name && Object.values(SUBAGENT_NAMES).some((known) => known.toLowerCase() === name)) {
+			current = [];
+			sections.set(name, current);
+			continue;
+		}
+		current?.push(line);
+	}
+	if (sections.size === 0) return fixSteps.trim();
+	const own = sections.get(implementerName.toLowerCase());
+	return own ? own.join("\n").trim() : "The planner wrote no fix steps for you: change nothing, rerun the checks and report.";
 }
 
 export const BUILD_STAGE_ENTRY_TYPE = "build-workflow-stage";

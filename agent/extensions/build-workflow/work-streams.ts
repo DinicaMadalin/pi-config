@@ -6,6 +6,8 @@
  * stream of that name before (else in order), so each keeps its context. Pure, so it can be unit tested.
  */
 
+import type { DifficultyTier } from "../auto-model/difficulty-tiers.ts";
+
 /** More implementers would mostly step on each other's files and multiply the cost. */
 export const MAX_IMPLEMENTERS = 3;
 
@@ -18,7 +20,14 @@ export interface WorkStream {
 	name: string;
 	/** The subsection's text: the files the stream owns and what to do in them. */
 	text: string;
+	/** The planner marked the heading STRONG_MODEL_MARKER: its implementer may get a complex-tier model. */
+	needsStrongModel: boolean;
 }
+
+/** Written after a stream's name in its heading when its steps still need real design work. */
+export const STRONG_MODEL_MARKER = "(needs a strong model)";
+
+const WHOLE_PLAN_STREAM: WorkStream = { name: "", text: "", needsStrongModel: false };
 
 /** An implementer of the planner's session: its stream in the current plan and its session file. */
 export interface ImplementerSeat {
@@ -31,25 +40,28 @@ export interface ImplementerSeat {
 export function parseWorkStreams(plan: string): WorkStream[] {
 	const lines = plan.split("\n");
 	const sectionStart = lines.findIndex((line) => line.trim().toLowerCase() === WORK_STREAMS_HEADING.toLowerCase());
-	if (sectionStart === -1) return [{ name: "", text: "" }];
+	if (sectionStart === -1) return [{ ...WHOLE_PLAN_STREAM }];
 	const streams: WorkStream[] = [];
 	for (const line of lines.slice(sectionStart + 1)) {
 		if (/^##\s/.test(line)) break;
 		const heading = /^###\s+(.*)$/.exec(line);
 		if (heading) {
-			streams.push({ name: streamName(heading[1]), text: "" });
+			const needsStrongModel = heading[1].toLowerCase().includes(STRONG_MODEL_MARKER);
+			streams.push({ name: streamName(heading[1]), text: "", needsStrongModel });
 			continue;
 		}
 		const current = streams.at(-1);
 		if (current) current.text = current.text ? `${current.text}\n${line}` : line;
 	}
 	for (const stream of streams) stream.text = stream.text.trim();
-	return streams.length > 0 ? streams : [{ name: "", text: "" }];
+	return streams.length > 0 ? streams : [{ ...WHOLE_PLAN_STREAM }];
 }
 
-/** "1. `API` endpoints" -> "API endpoints". */
+/** "1. `API` endpoints (needs a strong model)" -> "API endpoints". */
 function streamName(heading: string): string {
-	return heading
+	const markerAt = heading.toLowerCase().indexOf(STRONG_MODEL_MARKER);
+	const withoutMarker = markerAt === -1 ? heading : heading.slice(0, markerAt) + heading.slice(markerAt + STRONG_MODEL_MARKER.length);
+	return withoutMarker
 		.replace(/^\d+[.)]\s*/, "")
 		.replace(/[`*_]/g, "")
 		.trim();
@@ -63,6 +75,7 @@ export function capWorkStreams(streams: readonly WorkStream[]): WorkStream[] {
 	kept.push({
 		name: merged.map((stream) => stream.name).join(" + "),
 		text: merged.map((stream) => `#### ${stream.name}\n${stream.text}`).join("\n\n"),
+		needsStrongModel: merged.some((stream) => stream.needsStrongModel),
 	});
 	return kept;
 }
@@ -104,4 +117,15 @@ export function assignStreams(
 /** The stream an implementer builds, by name; the single unnamed stream is the whole plan. */
 export function streamOf(streams: readonly WorkStream[], name: string): WorkStream | undefined {
 	return streams.find((stream) => stream.name === name);
+}
+
+/**
+ * The strongest tier an implementer's model may come from. The expert planner spells out every step, so a cheap
+ * model (trivial or standard, as the difficulty rating picks) builds it; a stream the planner marked gets up to complex.
+ */
+export const IMPLEMENTER_MAX_TIER: DifficultyTier = "standard";
+export const STRONG_STREAM_MAX_TIER: DifficultyTier = "complex";
+
+export function implementerMaxTier(stream: WorkStream | undefined): DifficultyTier {
+	return stream?.needsStrongModel ? STRONG_STREAM_MAX_TIER : IMPLEMENTER_MAX_TIER;
 }

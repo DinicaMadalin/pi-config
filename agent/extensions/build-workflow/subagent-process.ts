@@ -8,6 +8,7 @@ import { randomUUID } from "node:crypto";
 import { readFileSync, writeFileSync } from "node:fs";
 import { ROUTE_DECISION_ENTRY_TYPE } from "../auto-model/route-decision.ts";
 import { AgentTracker, type AssistantMessageLike } from "./agent-activity.ts";
+import { type DifficultyTier, MAX_TIER_ENV_VAR } from "../auto-model/difficulty-tiers.ts";
 import { SUBAGENT_ENV_VAR } from "./workflow-state.ts";
 
 const SESSION_FORMAT_VERSION = 3;
@@ -27,6 +28,8 @@ export interface SubagentOptions {
 	cwd: string;
 	sessionPath: string;
 	dialogs: SubagentDialogs;
+	/** The strongest tier its model may come from; unset routes it freely. */
+	maxTier?: DifficultyTier;
 	onSettled: (lastAnswer: string, isAborted: boolean) => void;
 	onExit: (reason: string) => void;
 }
@@ -105,6 +108,8 @@ interface UiRequest {
 /** What the orchestrator uses of a subagent; tests stand in a fake for the real process. */
 export interface Subagent {
 	readonly name: string;
+	/** The tier ceiling it was launched with; a different ceiling needs a new process. */
+	readonly maxTier?: DifficultyTier;
 	readonly tracker: AgentTracker;
 	readonly isRunning: boolean;
 	readonly isWorking: boolean;
@@ -117,11 +122,19 @@ export interface Subagent {
 
 export type LaunchSubagent = (options: SubagentOptions) => Subagent;
 
+function subagentEnvironment(maxTier: DifficultyTier | undefined): NodeJS.ProcessEnv {
+	const env: NodeJS.ProcessEnv = { ...process.env, [SUBAGENT_ENV_VAR]: "1" };
+	if (maxTier) env[MAX_TIER_ENV_VAR] = maxTier;
+	else delete env[MAX_TIER_ENV_VAR];
+	return env;
+}
+
 export const launchSubagentProcess: LaunchSubagent = (options) => new SubagentProcess(options);
 
 export class SubagentProcess implements Subagent {
 	readonly name: string;
 	readonly sessionPath: string;
+	readonly maxTier: DifficultyTier | undefined;
 	readonly tracker = new AgentTracker();
 	private readonly options: SubagentOptions;
 	private child: ChildProcess | undefined;
@@ -134,6 +147,7 @@ export class SubagentProcess implements Subagent {
 		this.options = options;
 		this.name = options.name;
 		this.sessionPath = options.sessionPath;
+		this.maxTier = options.maxTier;
 	}
 
 	get isRunning(): boolean {
@@ -148,7 +162,7 @@ export class SubagentProcess implements Subagent {
 		const { command, args } = piCommand();
 		const child = spawn(command, [...args, "--mode", "rpc", "--session", this.sessionPath, "--model", "auto/auto"], {
 			cwd: this.options.cwd,
-			env: { ...process.env, [SUBAGENT_ENV_VAR]: "1" },
+			env: subagentEnvironment(this.maxTier),
 			stdio: ["pipe", "pipe", "pipe"],
 		});
 		this.child = child;

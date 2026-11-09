@@ -5,15 +5,23 @@ import { assignStreams, capWorkStreams, type ImplementerSeat, parseWorkStreams, 
 const plan = (streams: string) => `# Export\n\n## Goal\nCSV\n\n## Work streams\n${streams}\n## Files\n- a.ts\n`;
 
 test("a plan without work streams is one unnamed stream", () => {
-	assert.deepEqual(parseWorkStreams("# Export\n\n## Goal\nCSV"), [{ name: "", text: "" }]);
+	assert.deepEqual(parseWorkStreams("# Export\n\n## Goal\nCSV"), [{ name: "", text: "", needsStrongModel: false }]);
 });
 
 test("reads each stream's name and text up to the next section", () => {
 	const streams = parseWorkStreams(plan("### 1. `API`\nsrc/api.ts\n\n### Tests\ntest/api.test.ts\n"));
 	assert.deepEqual(streams, [
-		{ name: "API", text: "src/api.ts" },
-		{ name: "Tests", text: "test/api.test.ts" },
+		{ name: "API", text: "src/api.ts", needsStrongModel: false },
+		{ name: "Tests", text: "test/api.test.ts", needsStrongModel: false },
 	]);
+});
+
+test("a stream marked as needing a strong model keeps its plain name", () => {
+	const [sync, docs] = parseWorkStreams(plan("### 2. `sync` (Needs a strong model)\nsrc/sync.ts\n### docs\nREADME.md\n"));
+	assert.deepEqual(sync, { name: "sync", text: "src/sync.ts", needsStrongModel: true });
+	assert.equal(docs.needsStrongModel, false);
+	const merged = capWorkStreams(parseWorkStreams(plan("### A\na\n### B\nb\n### C\nc\n### D (needs a strong model)\nd\n")));
+	assert.equal(merged[2].needsStrongModel, true, "a merged stream needs a strong model when one of its parts does");
 });
 
 test("more streams than implementers join the last one, so no work is dropped", () => {

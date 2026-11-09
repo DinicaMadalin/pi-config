@@ -14,6 +14,7 @@ import {
 	readPlannerAnswer,
 	reviewerRoute,
 	routeForPhase,
+	fixStepsFor,
 	stepAfterTurn,
 	WORKFLOW_STATE_ENTRY_TYPE,
 	withPlanRevision,
@@ -83,7 +84,7 @@ test("the subagents keep their session files when the run moves on", () => {
 	const implementers = [{ role: "implementer" as const, stream: "", sessionPath: "/s/impl.jsonl" }];
 	const sessions = { implementers, reviewerSessions: { anthropic: "/s/claude-review.jsonl", openai: "/s/openai-review.jsonl" } };
 	const step = stepAfterTurn({ phase: "review", ...work, ...sessions }, "REVIEW_VERDICT: fix");
-	assert.deepEqual(step, { kind: "advance", next: { phase: "fix", ...work, ...sessions } });
+	assert.deepEqual(step, { kind: "advance", next: { phase: "fix", ...work, ...sessions, findings: "REVIEW_VERDICT: fix" } });
 });
 
 test("the planner stays on the expert and never edits while the subagents work", () => {
@@ -117,7 +118,7 @@ test("the plan issue is carried to the next phase", () => {
 test("review findings get exactly one fix round and a re-review", () => {
 	assert.deepEqual(stepAfterTurn({ phase: "review", ...work }, "REVIEW_VERDICT: fix"), {
 		kind: "advance",
-		next: { phase: "fix", ...work },
+		next: { phase: "fix", ...work, findings: "REVIEW_VERDICT: fix" },
 	});
 	assert.deepEqual(stepAfterTurn({ phase: "fix", ...work }, "IMPLEMENTATION: done"), {
 		kind: "advance",
@@ -148,7 +149,7 @@ test("issue work keeps its issue through implement, review and fix", () => {
 	const reviewStep = stepAfterTurn({ phase: "implement", ...work, issue }, "IMPLEMENTATION: done");
 	assert.deepEqual(reviewStep, { kind: "advance", next: { phase: "review", ...work, issue } });
 	const fixStep = stepAfterTurn({ phase: "review", ...work, issue }, "REVIEW_VERDICT: fix");
-	assert.deepEqual(fixStep, { kind: "advance", next: { phase: "fix", ...work, issue } });
+	assert.deepEqual(fixStep, { kind: "advance", next: { phase: "fix", ...work, issue, findings: "REVIEW_VERDICT: fix" } });
 });
 
 test("issue work whose re-review still fails waits for your decision instead of opening a PR", () => {
@@ -201,7 +202,7 @@ test("one reviewer asking for fixes sends the work to the fixer with both review
 		{ vendor: "openai", answer: "a.ts:3 off by one.\nREVIEW_VERDICT: fix" },
 	]);
 	assert.equal(merged.match(/REVIEW_VERDICT/g)?.length, 1);
-	assert.deepEqual(stepAfterTurn({ phase: "review", ...work }, merged), { kind: "advance", next: { phase: "fix", ...work } });
+	assert.deepEqual(stepAfterTurn({ phase: "review", ...work }, merged), { kind: "advance", next: { phase: "fix", ...work, findings: merged } });
 });
 
 test("a reviewer without a verdict holds the review even when the other passed", () => {
@@ -248,4 +249,12 @@ test("the session's crew is the implementers of its latest run, also from states
 	const entries = [legacy, stateEntry({ phase: "fix", ...work, implementers: two }), stateEntry({ phase: "idle" })];
 	assert.deepEqual(findCrew(entries), two);
 	assert.deepEqual(findCrew([stateEntry({ phase: "plan", task: "x" })]), []);
+});
+
+test("each implementer gets its own section of the planner's fix steps", () => {
+	const steps = "Both findings are real.\n\n### Implementer\n1. a.ts:3 use >=\n\n### Implementer 2\n1. b.ts:9 add the test";
+	assert.equal(fixStepsFor(steps, "Implementer"), "1. a.ts:3 use >=");
+	assert.equal(fixStepsFor(steps, "Implementer 2"), "1. b.ts:9 add the test");
+	assert.match(fixStepsFor(steps, "Implementer 3"), /no fix steps for you/);
+	assert.equal(fixStepsFor("1. a.ts:3 use >=\n### Notes\nx", "Implementer"), "1. a.ts:3 use >=\n### Notes\nx", "unnamed sections go to everyone");
 });

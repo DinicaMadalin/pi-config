@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import type { Api, Model } from "@earendil-works/pi-ai";
-import { applyQualityBias, applyThinkingFloor, DEFAULT_TIER_POLICIES, pickModelForTier, preferProvider, type TierPolicy } from "./difficulty-tiers.ts";
+import { applyQualityBias, applyThinkingFloor, capTier, DEFAULT_TIER_POLICIES, parseTierCeiling, pickModelForTier, preferProvider, type TierPolicy } from "./difficulty-tiers.ts";
 
 function fakeModel(provider: string, id: string, outputPrice: number, readsImages = true): Model<Api> {
 	return {
@@ -65,4 +65,14 @@ test("preferring a provider tries its models first and keeps the others as fallb
 	assert.deepEqual(preferProvider(expert, "anthropic").models, ["anthropic/claude-opus-5-5", "openai/gpt-6-astra", "openai/gpt-6.1-sol"]);
 	assert.deepEqual(preferProvider(expert, "openai").models, expert.models);
 	assert.deepEqual(preferProvider(expert, "xai").models, expert.models);
+});
+
+test("a tier ceiling lowers stronger tiers and keeps cheaper ones", () => {
+	assert.equal(capTier("complex", "standard"), "standard");
+	assert.equal(capTier("expert", "standard"), "standard");
+	assert.equal(capTier("trivial", "standard"), "trivial");
+	assert.equal(capTier("complex", undefined), "complex");
+	assert.equal(parseTierCeiling(" standard "), "standard");
+	assert.equal(parseTierCeiling("cheap"), undefined);
+	assert.equal(parseTierCeiling(undefined), undefined);
 });
