@@ -1,6 +1,12 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { MAX_CLARIFYING_QUESTIONS, parseRewriterReply, rewriteRequestText } from "./rewriter-prompt.ts";
+import { MAX_CLARIFYING_QUESTIONS, parseRewriterReply, REWRITER_SYSTEM_PROMPT, rewriteRequestText } from "./rewriter-prompt.ts";
+
+test("requires a direct, ready-to-send rewrite rather than an explanation", () => {
+	assert.match(REWRITER_SYSTEM_PROMPT, /ready-to-send message to the AI coding agent/);
+	assert.match(REWRITER_SYSTEM_PROMPT, /Never replace it with a description, recap, or explanation/);
+	assert.match(REWRITER_SYSTEM_PROMPT, /Can you check whether this network matches anything in the same trace\?/);
+});
 
 test("reads a rewrite, ignoring text around the tags", () => {
 	assert.deepEqual(parseRewriterReply("Sure.\n<rewrite>\nAdd a --json flag.\n</rewrite>"), { kind: "rewrite", prompt: "Add a --json flag." });

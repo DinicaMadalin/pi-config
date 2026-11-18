@@ -16,8 +16,6 @@ export interface ProjectChecks {
 	source: string;
 	/** Directory the commands run in. */
 	workingDir: string;
-	/** Run the checks automatically when the agent finishes a turn that changed files. */
-	autoVerify: boolean;
 	timeoutMs: number;
 }
 
@@ -96,7 +94,6 @@ function parseChecksConfig(configPath: string, repoRoot: string): ProjectChecks 
 		checks: raw.checks,
 		source: configPath,
 		workingDir: repoRoot,
-		autoVerify: raw.autoVerify !== false,
 		timeoutMs: timeoutSeconds === undefined ? DEFAULT_TIMEOUT_MS : timeoutSeconds * 1000,
 	};
 }
@@ -113,7 +110,7 @@ export function findProjectChecks(cwd: string): ProjectChecks {
 	const configPath = join(root, CHECKS_CONFIG_RELATIVE_PATH);
 	if (existsSync(configPath)) return parseChecksConfig(configPath, root);
 
-	const detected = { autoVerify: true, timeoutMs: DEFAULT_TIMEOUT_MS };
+	const detected = { timeoutMs: DEFAULT_TIMEOUT_MS };
 	const packageJsonPath = findNearestFile(cwd, root, "package.json");
 	if (packageJsonPath) {
 		const scripts = (JSON.parse(readFileSync(packageJsonPath, "utf8")) as { scripts?: Record<string, string> }).scripts ?? {};

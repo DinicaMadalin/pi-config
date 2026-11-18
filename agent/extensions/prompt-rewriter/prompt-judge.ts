@@ -67,6 +67,12 @@ export const FIDELITY_CHECKS = {
 			"'I think'), and a question stays a question instead of becoming an order?",
 		problem: "may have turned a maybe or a question into an order",
 	},
+	isReadyToSend: {
+		instructions:
+			"Is `rewrite` itself a ready-to-send message to the AI coding agent, in the developer's voice, leading with the actual task or question? " +
+			"It must not merely describe, recap, or explain the developer's request or its context, and must not answer the request.",
+		problem: "may explain or summarize the request instead of rewriting it as a message to the agent",
+	},
 } as const;
 
 export type FidelityCheckName = keyof typeof FIDELITY_CHECKS;

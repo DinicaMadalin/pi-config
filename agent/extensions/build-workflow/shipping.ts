@@ -18,10 +18,10 @@ function shipConfirmationText(branch: string, isCommitted: boolean, files: reado
 
 export class Shipping {
 	private readonly session: PlannerSession;
-	private readonly endRun: (summary: string) => void;
+	private readonly endRun: (summary: string, isWorkReleased: boolean) => void;
 	private isShipping = false;
 
-	constructor(session: PlannerSession, endRun: (summary: string) => void) {
+	constructor(session: PlannerSession, endRun: (summary: string, isWorkReleased: boolean) => void) {
 		this.session = session;
 		this.endRun = endRun;
 	}
@@ -56,7 +56,7 @@ export class Shipping {
 		}
 		const isCommitted = workflow.committedBranch !== undefined;
 		if (files.value.length === 0 && !isCommitted) {
-			this.endRun("the review passed, but there are no changes to ship");
+			this.endRun("the review passed, but there are no changes to ship", true);
 			return "Nothing to ship: the working tree has no changes (were they committed already?). The run is finished.";
 		}
 		const isConfirmed = await context.ui.confirm("Review passed. Ship it?", shipConfirmationText(branch.value, isCommitted, files.value));
@@ -78,7 +78,7 @@ export class Shipping {
 			case "shipped": {
 				const closes = workflow.planIssue ? `; merging it closes issue #${workflow.planIssue.number}` : "";
 				const summary = `shipped on branch ${shipped.branch}, pushed to origin${closes}`;
-				this.endRun(summary);
+				this.endRun(summary, true);
 				return `Shipped: ${summary}. The run is finished.`;
 			}
 		}
@@ -87,5 +87,5 @@ export class Shipping {
 
 function notReadyToShip(phase: string): string {
 	if (phase === "idle") return "No /build run is waiting to ship";
-	return `Not ready to ship: the /build run is in its ${phase} phase; it can ship once both reviewers pass`;
+	return `Not ready to ship: the /build run is in its ${phase} phase; it can ship once every reviewer passes`;
 }

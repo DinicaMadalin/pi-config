@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import {
+	checkFailuresFixPrompt,
 	fixPrompt,
 	fixStepsPrompt,
 	implementationBrief,
@@ -124,4 +125,31 @@ test("the run report names each reviewer and quotes both reports of the last rev
 	assert.ok(report.includes("### OpenAI re-reviewer's report\n\nopenai ok"), report);
 	assert.ok(report.includes("### Claude re-reviewer's report\n\nclaude ok"), report);
 	assert.ok(!report.includes("old claude"), report);
+});
+
+const lintFailure = "`npm run lint` (lint) fails:\n```\nsrc/a.ts: e2\n```";
+
+test("the implementers get the new check failures, fix what their work caused and end with the done marker", () => {
+	const prompt = checkFailuresFixPrompt(lintFailure);
+	assert.ok(prompt.startsWith("[/build: CHECKS]"));
+	assert.ok(prompt.includes(lintFailure));
+	assert.match(prompt, /IMPLEMENTATION: done/);
+	assert.match(prompt, /Not caused by this work/);
+	const streamPrompt = checkFailuresFixPrompt(lintFailure, { implementerName: "Implementer 2", stream: { name: "Tests", text: "test/", needsStrongModel: false }, otherStreams: [] });
+	assert.match(streamPrompt, /"Tests" work stream/);
+});
+
+test("the reviewers see checks that still fail after the implementers' round, and nothing extra without them", () => {
+	const review = reviewPrompt("p.md", "abc123", [], undefined, undefined, lintFailure);
+	assert.match(review, /## Checks that newly fail since the run began/);
+	assert.ok(review.includes(lintFailure));
+	assert.equal(reviewPrompt("p.md", "abc123", [], undefined, undefined, ""), reviewPrompt("p.md", "abc123", []));
+	assert.match(reReviewPrompt("abc123", [], lintFailure), /## Checks that newly fail since the run began/);
+	assert.doesNotMatch(reReviewPrompt("abc123"), /newly fail/);
+});
+
+test("the review prompts do not assume two reviewers", () => {
+	for (const prompt of [reviewPrompt("p.md", "abc123", []), reReviewPrompt("abc123")]) {
+		assert.doesNotMatch(prompt, /other expert reviewer|both reviewers|two expert reviewers/i);
+	}
 });

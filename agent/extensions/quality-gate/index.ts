@@ -1,40 +1,14 @@
 /**
- * Quality gate: the project's typecheck, lint, and test commands guard "done" and "ship".
- *
- * - Auto-verify: when the agent finishes a prompt that changed files, the checks run. A failure
- *   goes back to the agent to fix what its changes broke (at most two fix rounds per prompt); errors
- *   already in the repo are only reported, unless the user asked for them to be fixed. A pass is a short notice.
- * - /checks: show and run the checks now. /checks off|on toggles auto-verify for this session.
- * - /ship: run the checks, then have the agent review the diff, commit in the repo's style, and push.
- *
- * Checks come from <repo>/.pi/checks.json, else package.json scripts, else Makefile targets.
+ * Quality gate: checks run on demand with /checks, before /ship, and inside /build at its start (baseline), after the
+ * implementers and before shipping. Checks come from <repo>/.pi/checks.json, else package.json scripts, else Makefile.
  */
-import { createHash } from "node:crypto";
-import type { AgentBeforeSettleEvent, BoundaryResult, ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { checkFailureMessage } from "./check-failure-report.ts";
-import { type CheckRun, describeFailedCheck, runProjectChecks } from "./check-runner.ts";
-import { CHECK_STATUS_EVENT, type CheckStatus } from "./check-events.ts";
+import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { HerdrClient } from "../herdr-tools/herdr-cli.ts";
+import { CommandPane } from "../herdr-tools/command-pane.ts";
+import { backgroundCheckExecutor, canOpenChecksPane, type CheckExecutor, type CheckRun, describeFailedCheck, runProjectChecks } from "./check-runner.ts";
 import { CHECKS_CONFIG_RELATIVE_PATH, findProjectChecks, type ProjectChecks } from "./project-checks.ts";
 
-const MAX_FIX_ROUNDS_PER_PROMPT = 2;
 const STATUS_KEY = "checks";
-const FILE_EDITING_TOOLS = new Set(["edit", "write"]);
-const FAILURE_MESSAGE_TYPE = "quality-gate-failure";
-
-/** One user prompt from input until Pi settles, including the fix rounds this extension adds. */
-interface PromptCycle {
-	/** Hash of `git status` + `git diff HEAD` when the prompt arrived; undefined outside a git repo. */
-	workingTreeAtStart?: string;
-	/** Commit holding the tracked files as they were when the prompt arrived (HEAD when clean); undefined outside git. */
-	commitAtStart?: string;
-	untrackedFilesAtStart: ReadonlySet<string>;
-	/** Working tree hash when the last failure went back to the agent; unchanged since means it chose not to fix. */
-	workingTreeAtLastFailureReport?: string;
-	editedFilesWithTools: boolean;
-	fixRounds: number;
-	/** A /ship prompt commits files; verifying its own commit would be noise. */
-	isShipping: boolean;
-}
 
 const SHIP_PROMPT = (passedChecks: string) =>
 	[
@@ -46,40 +20,6 @@ const SHIP_PROMPT = (passedChecks: string) =>
 		"Never force push, amend, or rewrite existing commits. If the push is rejected, stop and report why.",
 	].join("\n");
 
-async function snapshotWorkingTree(pi: ExtensionAPI, cwd: string): Promise<string | undefined> {
-	const status = await pi.exec("git", ["status", "--porcelain=v1", "-uall"], { cwd });
-	if (status.code !== 0) return undefined;
-	const diff = await pi.exec("git", ["diff", "HEAD", "--no-ext-diff"], { cwd });
-	return createHash("sha256").update(status.stdout).update(diff.stdout).digest("hex");
-}
-
-/** `git stash create` records the working tree as a commit without touching it; it prints nothing for a clean tree. */
-async function snapshotCommit(pi: ExtensionAPI, cwd: string): Promise<string | undefined> {
-	const stash = await pi.exec("git", ["stash", "create"], { cwd });
-	if (stash.code === 0 && stash.stdout.trim()) return stash.stdout.trim();
-	const head = await pi.exec("git", ["rev-parse", "HEAD"], { cwd });
-	return head.code === 0 ? head.stdout.trim() : undefined;
-}
-
-async function listUntrackedFiles(pi: ExtensionAPI, cwd: string): Promise<Set<string>> {
-	const untracked = await pi.exec("git", ["ls-files", "--others", "--exclude-standard"], { cwd });
-	return new Set(untracked.code === 0 ? untracked.stdout.split("\n").filter(Boolean) : []);
-}
-
-async function listFilesChangedSince(pi: ExtensionAPI, cycle: PromptCycle, cwd: string): Promise<string[]> {
-	if (!cycle.commitAtStart) return [];
-	const tracked = await pi.exec("git", ["diff", "--name-only", cycle.commitAtStart], { cwd });
-	const trackedChanges = tracked.code === 0 ? tracked.stdout.split("\n").filter(Boolean) : [];
-	const newUntracked = [...(await listUntrackedFiles(pi, cwd))].filter((path) => !cycle.untrackedFilesAtStart.has(path));
-	return [...new Set([...trackedChanges, ...newUntracked])];
-}
-
-async function hasChangedFiles(pi: ExtensionAPI, cycle: PromptCycle, cwd: string): Promise<boolean> {
-	if (cycle.editedFilesWithTools) return true;
-	if (cycle.workingTreeAtStart === undefined) return false;
-	return (await snapshotWorkingTree(pi, cwd)) !== cycle.workingTreeAtStart;
-}
-
 function describeChecks(projectChecks: ProjectChecks): string {
 	if (projectChecks.checks.length === 0) {
 		return `No checks found. Add package.json scripts (typecheck, lint, test) or ${CHECKS_CONFIG_RELATIVE_PATH}:\n{ "checks": [{ "name": "test", "command": "npm test" }] }`;
@@ -89,88 +29,44 @@ function describeChecks(projectChecks: ProjectChecks): string {
 }
 
 export default function (pi: ExtensionAPI) {
-	let cycle: PromptCycle | undefined;
-	let isShipRequested = false;
-	/** Session override from /checks on|off; undefined follows the project's autoVerify setting. */
-	let autoVerifyOverride: boolean | undefined;
+	const runInBackground = backgroundCheckExecutor(pi);
+	const herdrPaneId = process.env.HERDR_PANE_ID;
+	const checksPane = canOpenChecksPane() && herdrPaneId ? new CommandPane(new HerdrClient(), herdrPaneId, "down") : undefined;
+
+	function checkExecutorFor(ctx: ExtensionContext): CheckExecutor {
+		if (!checksPane) return runInBackground;
+		return async (check, projectChecks) => {
+			try {
+				return await checksPane.run({
+					title: `${check.name}: ${check.command}`,
+					argv: ["env", "CI=1", "sh", "-c", check.command],
+					cwd: projectChecks.workingDir,
+					timeoutMs: projectChecks.timeoutMs,
+				});
+			} catch (error) {
+				ctx.ui.notify(`Running ${check.name} in the background: ${(error as Error).message}`, "warning");
+				return runInBackground(check, projectChecks);
+			}
+		};
+	}
 
 	async function runChecksWithStatus(projectChecks: ProjectChecks, ctx: ExtensionContext): Promise<CheckRun> {
-		const publish = (status: CheckStatus) => pi.events.emit(CHECK_STATUS_EVENT, status);
 		try {
-			const run = await runProjectChecks(pi, projectChecks, (check) => {
+			return await runProjectChecks(checkExecutorFor(ctx), projectChecks, (check) => {
 				ctx.ui.setStatus(STATUS_KEY, `checks: ${check.name}…`);
-				publish({ kind: "running", checkName: check.name });
 			});
-			publish(run.kind === "passed" ? { kind: "passed", checkNames: run.passedNames } : { kind: "failed", checkName: run.failedCheck.name });
-			return run;
 		} finally {
 			ctx.ui.setStatus(STATUS_KEY, undefined);
 		}
 	}
 
-	async function verifyBeforeSettle(event: AgentBeforeSettleEvent, ctx: ExtensionContext): Promise<BoundaryResult | undefined> {
-		if (event.outcome !== "completed" || !cycle || cycle.isShipping) return undefined;
-		const projectChecks = findProjectChecks(ctx.cwd);
-		if (!(autoVerifyOverride ?? projectChecks.autoVerify) || projectChecks.checks.length === 0) return undefined;
-		if (!(await hasChangedFiles(pi, cycle, ctx.cwd))) return undefined;
-
-		const run = await runChecksWithStatus(projectChecks, ctx);
-		if (run.kind === "passed") {
-			ctx.ui.notify(`Checks passed: ${run.passedNames.join(", ")}`, "info");
-			return undefined;
-		}
-		const failure = describeFailedCheck(run, projectChecks.timeoutMs);
-		const workingTreeNow = await snapshotWorkingTree(pi, ctx.cwd);
-		const agentLeftFailureAsIs =
-			cycle.workingTreeAtLastFailureReport !== undefined && workingTreeNow === cycle.workingTreeAtLastFailureReport;
-		if (agentLeftFailureAsIs) {
-			ctx.ui.notify(`Checks still fail, left as is (the agent reports it as pre-existing): ${failure}`, "warning");
-			return undefined;
-		}
-		if (cycle.fixRounds >= MAX_FIX_ROUNDS_PER_PROMPT) {
-			ctx.ui.notify(`Checks still failing after ${MAX_FIX_ROUNDS_PER_PROMPT} fix rounds: ${failure}`, "error");
-			return undefined;
-		}
-		cycle.fixRounds++;
-		cycle.workingTreeAtLastFailureReport = workingTreeNow;
-		const changedFiles = await listFilesChangedSince(pi, cycle, ctx.cwd);
-		const content = checkFailureMessage({ description: failure, outputTail: run.outputTail, changedFiles });
-		return { entries: [{ type: "custom_message", customType: FAILURE_MESSAGE_TYPE, content, display: true }], continue: true };
-	}
-
-	pi.on("input", async (_event, ctx) => {
-		if (cycle) return; // a steer or follow-up joins the running prompt
-		cycle = {
-			workingTreeAtStart: await snapshotWorkingTree(pi, ctx.cwd),
-			commitAtStart: await snapshotCommit(pi, ctx.cwd),
-			untrackedFilesAtStart: await listUntrackedFiles(pi, ctx.cwd),
-			editedFilesWithTools: false,
-			fixRounds: 0,
-			isShipping: isShipRequested,
-		};
-		isShipRequested = false;
-	});
-
-	pi.on("tool_execution_end", (event) => {
-		if (cycle && !event.isError && FILE_EDITING_TOOLS.has(event.toolName)) cycle.editedFilesWithTools = true;
-	});
-
-	pi.on("agent_before_settle", verifyBeforeSettle);
-
-	pi.on("agent_settled", () => {
-		cycle = undefined;
-		isShipRequested = false;
+	pi.on("session_shutdown", async (_event, ctx) => {
+		await checksPane?.close().catch((error: unknown) => ctx.ui.notify(`Could not close the checks pane: ${(error as Error).message}`, "warning"));
 	});
 
 	pi.registerCommand("checks", {
-		description: "Run the project's checks now; /checks off|on toggles running them after the agent changes files",
-		handler: async (args, ctx) => {
-			const toggle = args.trim().toLowerCase();
-			if (toggle === "on" || toggle === "off") {
-				autoVerifyOverride = toggle === "on";
-				ctx.ui.notify(`Auto-verify ${toggle} for this session`, "info");
-				return;
-			}
+		description: "Run the project's checks now",
+		handler: async (_args, ctx) => {
 			const projectChecks = findProjectChecks(ctx.cwd);
 			ctx.ui.notify(describeChecks(projectChecks), "info");
 			if (projectChecks.checks.length === 0) return;
@@ -206,7 +102,6 @@ export default function (pi: ExtensionAPI) {
 				return;
 			}
 			const passedChecks = run.passedNames.length > 0 ? `Checks already passed: ${run.passedNames.join(", ")}.` : "This project has no checks configured.";
-			isShipRequested = true;
 			pi.sendUserMessage(SHIP_PROMPT(passedChecks));
 		},
 	});

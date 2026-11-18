@@ -17,25 +17,23 @@ const middle = fakeModel("b", "middle", 10, false);
 const strong = fakeModel("a", "strong", 50);
 const policy: TierPolicy = { models: ["x/not-logged-in", "b/middle", "a/strong"], thinkingLevel: "medium" };
 
-test("picks the first logged-in preferred model, skipping ones not logged in", () => {
-	assert.equal(pickModelForTier([cheap, middle, strong], policy, "standard", false)?.model, middle);
+test("picks the first available configured model, skipping unavailable entries", () => {
+	assert.equal(pickModelForTier([cheap, middle, strong], policy, false)?.model, middle);
 });
 
-test("skips preferred models that cannot read an attached image", () => {
-	const choice = pickModelForTier([cheap, middle, strong], policy, "standard", true);
+test("skips configured models that cannot read an attached image", () => {
+	const choice = pickModelForTier([cheap, middle, strong], policy, true);
 	assert.equal(choice?.model, strong);
-	assert.equal(choice?.source, "preferred");
 });
 
-test("falls back to price rank when no preferred model is logged in", () => {
-	const noneLoggedIn: TierPolicy = { models: ["x/missing"], thinkingLevel: "low" };
-	assert.equal(pickModelForTier([strong, cheap, middle], noneLoggedIn, "trivial", false)?.model, cheap);
-	assert.equal(pickModelForTier([strong, cheap, middle], noneLoggedIn, "expert", false)?.model, strong);
-	assert.equal(pickModelForTier([strong, cheap, middle], noneLoggedIn, "expert", false)?.source, "price-rank");
+test("does not route to an unlisted model when the configured model is unavailable", () => {
+	const policy: TierPolicy = { models: ["openai/gpt-6-astra"], thinkingLevel: "high" };
+	const unrelatedModels = [fakeModel("openai", "o1-pro", 100), fakeModel("openai", "gpt-5.5-pro", 90)];
+	assert.equal(pickModelForTier(unrelatedModels, policy, false), undefined);
 });
 
-test("returns nothing when no model is logged in", () => {
-	assert.equal(pickModelForTier([], policy, "complex", false), undefined);
+test("returns nothing when none of the tier's configured models are available", () => {
+	assert.equal(pickModelForTier([], policy, false), undefined);
 });
 
 test("quality bias shifts one tier and clamps at the ends", () => {

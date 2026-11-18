@@ -1,5 +1,8 @@
 /** The orchestrator's view of the planner's session (PlannerSeat), built on the Pi API. */
 import { tmpdir } from "node:os";
+import { currentReviewerLineup } from "./reviewer-lineup.ts";
+import { listFilesChangedSince, runBuildChecks } from "./build-checks.ts";
+import { finalizeBuildContracts } from "./contract-verification.ts";
 import type { PlannerSeat } from "./build-orchestrator.ts";
 import type { PlannerSession } from "./planner-session.ts";
 import { findRuleFiles } from "./repo-files.ts";
@@ -39,7 +42,7 @@ export function createPlannerSeat(session: PlannerSession, finish: (next: Workfl
 	const pi = session.pi;
 	const branch = () => session.context.sessionManager.getBranch();
 	return {
-		cwd: () => session.context.cwd,
+		cwd: () => session.workDir,
 		sessionDirectory: () => (session.context.sessionManager.getSessionFile() ? session.context.sessionManager.getSessionDir() : tmpdir()),
 		plannerSessionPath: () => session.context.sessionManager.getSessionFile(),
 		state: () => session.workflow,
@@ -52,7 +55,7 @@ export function createPlannerSeat(session: PlannerSession, finish: (next: Workfl
 		},
 		readPlan: (planPath) => session.readPlan(planPath),
 		crew: () => findCrew(branch()),
-		ruleFiles: () => findRuleFiles(session.run, session.context.cwd),
+		ruleFiles: () => findRuleFiles(session.run, session.workDir),
 		describeChanges: async (baseCommit) => {
 			if (!baseCommit) return undefined;
 			const changes = await loadWorkChanges(session.run, baseCommit);
@@ -63,6 +66,15 @@ export function createPlannerSeat(session: PlannerSession, finish: (next: Workfl
 		askPlanner: (prompt) => session.sendToPlanner(prompt),
 		postReport: (report) => pi.sendMessage({ customType: REPORT_MESSAGE_TYPE, content: report, display: true }),
 		notify: (message, level) => session.notify(message, level),
+		callUser: (message) => session.callUser(message),
+		isProjectTrusted: () => session.context.isProjectTrusted(),
+		reviewerLineup: () => currentReviewerLineup(session.context),
+		runChecks: (signal) => runBuildChecks(pi, session.workDir, session.context.isProjectTrusted(), signal, (message) => session.notify(message, "info")),
+		changedFiles: (baseCommit, signal) => listFilesChangedSince(pi, session.workDir, baseCommit, signal),
+		finalizeContracts: (work, signal) => {
+			if (!session.context.isProjectTrusted()) return Promise.resolve("Trust the project before running post-cleanup checks");
+			return finalizeBuildContracts(pi, session.workDir, work.baseCommit, work.checkBaseline, signal, (message) => session.notify(message, "info"));
+		},
 		finish,
 		dialogs: queuedDialogs(session),
 	};

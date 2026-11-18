@@ -1,6 +1,6 @@
 /**
  * Pure state machine of the /build workflow: plan (expert, in your session) -> implement (a subagent, model
- * picked by difficulty) -> review (two expert subagents, one on Claude and one on OpenAI, in parallel) -> at
+ * picked by difficulty) -> review (one complex-tier reviewer per vendor with a usable model) -> at
  * most one fix (the implementer again) and re-review (both reviewers again). The implementer's questions go to
  * the planner, which answers or asks you. A re-review that still has findings waits for your decision.
  * Work started from a GitHub issue (/issue) waits for the user to open a draft PR after a passing review;
@@ -9,17 +9,23 @@
  * No Pi runtime imports, so every transition can be unit tested.
  */
 import type { RoutePin } from "../auto-model/route-pin.ts";
+import type { CheckResult } from "../quality-gate/check-baseline.ts";
 import { IMPLEMENTER_ROLES, type ImplementerRole, type ImplementerSeat } from "./work-streams.ts";
 
 export const WORKFLOW_STATE_ENTRY_TYPE = "build-workflow-state";
 
 /** Marker lines the agent ends a turn with; the workflow reads them to move to the next phase. */
+export const DESIGN_DONE_MARKER = "DESIGN: done";
+export const DESIGN_BLOCKED_MARKER = "DESIGN: blocked";
 export const IMPLEMENTATION_DONE_MARKER = "IMPLEMENTATION: done";
 export const IMPLEMENTATION_BLOCKED_MARKER = "IMPLEMENTATION: blocked";
 export const REVIEW_PASS_MARKER = "REVIEW_VERDICT: pass";
 export const REVIEW_FIX_MARKER = "REVIEW_VERDICT: fix";
 /** The planner ends its answer to an implementer question with one of these. */
 export const PLANNER_ANSWER_READY_MARKER = "IMPLEMENTER_ANSWER: ready";
+/** Tells a subagent whether you trust the project, so it decides the same in the run's worktree without asking. */
+export const PROJECT_TRUST_ENV_VAR = "PI_BUILD_PROJECT_TRUSTED";
+
 export const PLANNER_NEEDS_USER_MARKER = "IMPLEMENTER_ANSWER: needs-user";
 
 /** Set in the environment of the subagent processes, so their build-workflow only guards file edits. */
@@ -37,6 +43,15 @@ export interface IssueRef extends TrackedIssue {
 	branch: string;
 	/** Default branch the work branched from and the PR targets, e.g. "main". */
 	baseBranch: string;
+	/** Inside herdr the issue branch is checked out in its own worktree, so your checkout stays as it is. */
+	worktree?: RunWorktree;
+}
+
+/** A git worktree a run works in, opened as its own herdr workspace; the subagents' panes live there. */
+export interface RunWorktree {
+	path: string;
+	workspaceId: string;
+	rootPaneId: string;
 }
 
 /** Each review is done twice, by an expert of each vendor, so one vendor's blind spots do not pass unseen. */
@@ -44,11 +59,12 @@ export const REVIEWER_VENDORS = ["anthropic", "openai"] as const;
 /** Also the Pi provider the reviewer's route prefers. */
 export type ReviewerVendor = (typeof REVIEWER_VENDORS)[number];
 
-export type SubagentRole = ImplementerRole | `${ReviewerVendor}-reviewer`;
+export type SubagentRole = "designer" | ImplementerRole | `${ReviewerVendor}-reviewer`;
 
 export const REVIEWER_NAMES: Record<ReviewerVendor, string> = { anthropic: "Claude reviewer", openai: "OpenAI reviewer" };
 
 export const SUBAGENT_NAMES: Record<SubagentRole, string> = {
+	designer: "Designer",
 	implementer: "Implementer",
 	"implementer-2": "Implementer 2",
 	"implementer-3": "Implementer 3",
@@ -61,7 +77,7 @@ export function reviewerRole(vendor: ReviewerVendor): SubagentRole {
 }
 
 /** Every subagent of a run, implementers first. */
-export const SUBAGENT_ROLES: readonly SubagentRole[] = [...IMPLEMENTER_ROLES, ...REVIEWER_VENDORS.map(reviewerRole)];
+export const SUBAGENT_ROLES: readonly SubagentRole[] = ["designer", ...IMPLEMENTER_ROLES, ...REVIEWER_VENDORS.map(reviewerRole)];
 
 export function isImplementerRole(role: SubagentRole): role is ImplementerRole {
 	return role === "implementer" || role.startsWith("implementer-");
@@ -80,28 +96,41 @@ export interface FeatureWork {
 	 */
 	implementers?: ImplementerSeat[];
 	reviewerSessions?: Partial<Record<ReviewerVendor, string>>;
+	designerSession?: string;
 	/** The plan's version since implementation started: missing for the first, 2 after the first change. */
 	planRevision?: number;
 	/** Shipping committed the work on this branch but has not pushed it yet; shipping again only pushes. */
 	committedBranch?: string;
+	/** Where the subagents work and the run ships from; undefined means the planner's own checkout. */
+	worktree?: RunWorktree;
+	/**
+	 * Every check's result when the run began (passed checks without output): later checks report only the
+	 * failures the run added. Undefined when the project had no checks or was not trusted; then every failure is new.
+	 */
+	checkBaseline?: CheckResult[];
 }
 
 /** Phases where the subagents work. */
-export type DelegatedPhase = "implement" | "review" | "fix" | "re-review";
-export const DELEGATED_PHASES: readonly DelegatedPhase[] = ["implement", "review", "fix", "re-review"];
+export type DelegatedPhase = "design" | "implement" | "review" | "fix" | "re-review";
+export const DELEGATED_PHASES: readonly DelegatedPhase[] = ["design", "implement", "review", "fix", "re-review"];
 
 export type ReviewPhase = "review" | "re-review";
 
 export type WorkflowState =
 	| { phase: "idle" }
 	| { phase: "plan"; task: string; issue?: IssueRef }
-	| { phase: "awaiting-implementation"; task: string; planPath: string; issue?: IssueRef }
-	| ({ phase: "implement" } & FeatureWork)
+	/** startedFromChat: the plan was saved in a normal chat, not a /build; declining the start returns to idle. */
+	| { phase: "awaiting-implementation"; task: string; planPath: string; issue?: IssueRef; startedFromChat?: boolean }
+	| ({ phase: "design" } & FeatureWork)
+	/** checksFixRequested: the implementers already got their one round on new check failures in this stage. */
+	| ({ phase: "implement"; checksFixRequested?: boolean } & FeatureWork)
+	| ({ phase: "cleanup" } & FeatureWork)
+	| ({ phase: "cleanup-failed"; failure: string } & FeatureWork)
 	/**
 	 * findings: the merged review the round fixes (missing in states written before fix steps existed).
 	 * fixSteps: the planner's exact steps for the implementers; until it wrote them, no implementer is working.
 	 */
-	| ({ phase: "fix"; findings?: string; fixSteps?: string } & FeatureWork)
+	| ({ phase: "fix"; findings?: string; fixSteps?: string; checksFixRequested?: boolean } & FeatureWork)
 	/** planChangeAfterReview: the plan changed during the review; its outcome goes into a change round. */
 	| ({ phase: ReviewPhase; planChangeAfterReview?: boolean } & FeatureWork)
 	/** The re-review still has findings and the fix round is used up: you decide what happens next. */
@@ -112,13 +141,15 @@ export type WorkflowState =
 export type WorkflowPhase = WorkflowState["phase"];
 export type DelegatedState = Extract<WorkflowState, { phase: DelegatedPhase }>;
 /** States once implementation started: they carry the run's plan, commit and subagent sessions. */
-export type FeatureState = Extract<WorkflowState, { phase: DelegatedPhase | "review-failed" | "awaiting-pr" | "awaiting-ship" }>;
+export type FeatureState = Extract<WorkflowState, { phase: DelegatedPhase | "cleanup" | "cleanup-failed" | "review-failed" | "awaiting-pr" | "awaiting-ship" }>;
 
 const WORKFLOW_PHASES: readonly WorkflowPhase[] = [
 	"idle",
 	"plan",
 	"awaiting-implementation",
 	...DELEGATED_PHASES,
+	"cleanup",
+	"cleanup-failed",
 	"review-failed",
 	"awaiting-pr",
 	"awaiting-ship",
@@ -137,24 +168,24 @@ export function isDelegatedPhase(phase: WorkflowPhase): phase is DelegatedPhase 
 
 /** Implementation started: the state carries the run's plan, commit and subagent sessions. */
 export function isFeatureState(state: WorkflowState): state is FeatureState {
-	return isDelegatedState(state) || isAwaitingUser(state.phase);
+	return isDelegatedState(state) || state.phase === "cleanup" || isAwaitingUser(state.phase);
 }
 
 /** The run waits for you: a decision after a failed re-review, a draft PR for /issue, shipping for /build. */
-export function isAwaitingUser(phase: WorkflowPhase): phase is "review-failed" | "awaiting-pr" | "awaiting-ship" {
-	return phase === "review-failed" || phase === "awaiting-pr" || phase === "awaiting-ship";
+export function isAwaitingUser(phase: WorkflowPhase): phase is "cleanup-failed" | "review-failed" | "awaiting-pr" | "awaiting-ship" {
+	return phase === "cleanup-failed" || phase === "review-failed" || phase === "awaiting-pr" || phase === "awaiting-ship";
 }
 
 /** Route of a subagent's session: the reviewer uses the expert; Jev picks the implementer's model by difficulty. */
 export function routeForPhase(phase: WorkflowPhase): RoutePin {
 	if (phase === "implement" || phase === "fix") return { route: "difficulty" };
-	if (phase === "review" || phase === "re-review") return { route: "tier", tier: "expert" };
+	if (phase === "review" || phase === "re-review") return { route: "tier", tier: "complex" };
 	return plannerRouteForPhase(phase);
 }
 
-/** A reviewer's route: the expert tier with its vendor's models first, the other vendor's as fallback. */
+/** A reviewer's route: the complex tier with its vendor's configured models first. */
 export function reviewerRoute(vendor: ReviewerVendor): RoutePin {
-	return { route: "tier", tier: "expert", preferredProvider: vendor };
+	return { route: "tier", tier: "complex", preferredProvider: vendor };
 }
 
 /** Route of the planner's session: the expert for the whole run, since it answers the implementer's questions. */
@@ -164,7 +195,7 @@ export function plannerRouteForPhase(phase: WorkflowPhase): RoutePin {
 
 /** In a subagent's session: only the implementer edits; the reviewers must not change files. */
 export function canEditFiles(phase: WorkflowPhase): boolean {
-	return phase === "idle" || phase === "implement" || phase === "fix";
+	return phase === "idle" || phase === "design" || phase === "implement" || phase === "fix";
 }
 
 /**
@@ -233,16 +264,6 @@ export function findCrew(branchEntries: readonly SessionEntryLike[]): Implemente
 	return [];
 }
 
-/** The plan of the session's last run that got as far as an agreed plan, e.g. to start a new run from it. */
-export function findLastRunPlan(branchEntries: readonly SessionEntryLike[]): { task: string; planPath: string } | undefined {
-	for (let index = branchEntries.length - 1; index >= 0; index--) {
-		const entry = branchEntries[index];
-		if (entry.type !== "custom" || entry.customType !== WORKFLOW_STATE_ENTRY_TYPE) continue;
-		const state = parseWorkflowState(entry.data);
-		if (state?.phase === "awaiting-implementation") return { task: state.task, planPath: state.planPath };
-	}
-	return undefined;
-}
 
 /** Last marker line wins, so a quoted marker earlier in the answer does not count. */
 function lastMarker(answer: string, markers: readonly string[]): string | undefined {
@@ -271,9 +292,19 @@ export function featureWorkOf(state: FeatureWork): FeatureWork {
 	if (state.planIssue) work.planIssue = state.planIssue;
 	if (state.implementers) work.implementers = state.implementers;
 	if (state.reviewerSessions) work.reviewerSessions = state.reviewerSessions;
+	if (state.designerSession) work.designerSession = state.designerSession;
 	if (state.planRevision) work.planRevision = state.planRevision;
 	if (state.committedBranch) work.committedBranch = state.committedBranch;
+	if (state.worktree) work.worktree = state.worktree;
+	if (state.checkBaseline) work.checkBaseline = state.checkBaseline;
 	return work;
+}
+
+/** The worktree the run works in: the feature work's, or during an issue's investigation the issue's. */
+export function runWorktreeOf(state: WorkflowState): RunWorktree | undefined {
+	if (state.phase === "idle") return undefined;
+	if ("worktree" in state && state.worktree) return state.worktree;
+	return state.issue?.worktree;
 }
 
 /** After a passing review the user releases the work: /issue opens a draft PR, /build ships a branch. */
@@ -285,6 +316,11 @@ export function releaseStateOf(work: FeatureWork): WorkflowState {
 /** What a subagent stage's settled turn means for the run; the implementer's questions and stalls go to the planner. */
 export function stepAfterTurn(state: DelegatedState, stageAnswer: string): WorkflowStep {
 	switch (state.phase) {
+		case "design": {
+			const marker = lastMarker(stageAnswer, [DESIGN_DONE_MARKER, DESIGN_BLOCKED_MARKER]);
+			if (marker !== DESIGN_DONE_MARKER) return { kind: "ask-planner", implementerAnswer: stageAnswer };
+			return { kind: "advance", next: { phase: "implement", ...featureWorkOf(state) } };
+		}
 		case "implement":
 		case "fix": {
 			const marker = lastMarker(stageAnswer, [IMPLEMENTATION_DONE_MARKER, IMPLEMENTATION_BLOCKED_MARKER]);
@@ -293,9 +329,9 @@ export function stepAfterTurn(state: DelegatedState, stageAnswer: string): Workf
 		}
 		case "review":
 		case "re-review": {
-			if (state.planChangeAfterReview) return { kind: "advance", next: { phase: "implement", ...featureWorkOf(state) } };
+			if (state.planChangeAfterReview) return { kind: "advance", next: { phase: "design", ...featureWorkOf(state) } };
 			const verdict = lastMarker(stageAnswer, [REVIEW_PASS_MARKER, REVIEW_FIX_MARKER]);
-			if (verdict === REVIEW_PASS_MARKER) return { kind: "advance", next: releaseStateOf(state) };
+			if (verdict === REVIEW_PASS_MARKER) return { kind: "advance", next: { phase: "cleanup", ...featureWorkOf(state) } };
 			if (verdict === undefined) return { kind: "wait", reason: "a reviewer ended without a verdict" };
 			if (state.phase === "review") return { kind: "advance", next: { phase: "fix", ...featureWorkOf(state), findings: stageAnswer } };
 			return { kind: "advance", next: { phase: "review-failed", ...featureWorkOf(state), findings: stageAnswer } };
@@ -318,12 +354,15 @@ export function planChangeReaction(phase: WorkflowPhase): PlanChangeReaction {
 		case "plan":
 		case "awaiting-implementation":
 			return "ask-to-start";
+		case "design":
 		case "implement":
 		case "fix":
 			return "tell-implementer";
 		case "review":
 		case "re-review":
 			return "ask-about-review";
+		case "cleanup":
+		case "cleanup-failed":
 		case "review-failed":
 		case "awaiting-pr":
 		case "awaiting-ship":

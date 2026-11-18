@@ -47,7 +47,7 @@ export function parseIssueArgument(text: string): IssueArgument | undefined {
 }
 
 /** The title's first meaningful words, lowercase and dash-joined; empty when it has none in a-z/0-9. */
-function shortBranchSlug(title: string): string {
+export function shortBranchSlug(title: string): string {
 	const meaningfulWords = title
 		.toLowerCase()
 		.split(/[^a-z0-9]+/)
@@ -88,7 +88,7 @@ export function pullRequestBody(issueNumber: number, plan: string): string {
 	return [`Fixes #${issueNumber}`, ...sections, "Planned and reviewed by the expert model with /issue."].join("\n\n");
 }
 
-function commandError(action: string, result: CommandResult): string {
+export function commandError(action: string, result: CommandResult): string {
 	const detail = (result.stderr || result.stdout).trim().split("\n").slice(-3).join(" ");
 	return `Failed to ${action} (exit ${result.code})${detail ? `: ${detail}` : ""}`;
 }
@@ -139,11 +139,19 @@ async function defaultBranch(run: RunCommand): Promise<StepResult<string>> {
 	return { ok: true, value: viaGh.stdout.trim() };
 }
 
-/** Fresh branch from the up-to-date default branch; refuses a dirty tree so no unrelated change rides along. */
-export async function createIssueBranch(run: RunCommand, issue: GithubIssue): Promise<StepResult<IssueRef>> {
-	const status = await run("git", ["status", "--porcelain"]);
-	if (status.code !== 0) return { ok: false, error: commandError("read git status", status) };
-	if (status.stdout.trim()) return { ok: false, error: "The working tree has uncommitted changes; commit or stash them before /issue" };
+/** Creates the issue branch at the start point somewhere other than your checkout, e.g. in a new worktree. */
+export type BranchElsewhere = (branch: string, startPoint: string) => Promise<StepResult<Pick<IssueRef, "worktree">>>;
+
+/**
+ * Fresh branch from the up-to-date default branch. In place it refuses a dirty tree so no unrelated change rides
+ * along; given branchElsewhere (a worktree) your checkout is not touched, so its changes do not matter.
+ */
+export async function createIssueBranch(run: RunCommand, issue: GithubIssue, branchElsewhere?: BranchElsewhere): Promise<StepResult<IssueRef>> {
+	if (!branchElsewhere) {
+		const status = await run("git", ["status", "--porcelain"]);
+		if (status.code !== 0) return { ok: false, error: commandError("read git status", status) };
+		if (status.stdout.trim()) return { ok: false, error: "The working tree has uncommitted changes; commit or stash them before /issue" };
+	}
 
 	const baseBranch = await defaultBranch(run);
 	if (!baseBranch.ok) return baseBranch;
@@ -151,9 +159,15 @@ export async function createIssueBranch(run: RunCommand, issue: GithubIssue): Pr
 	if (fetch.code !== 0) return { ok: false, error: commandError(`fetch origin/${baseBranch.value}`, fetch) };
 
 	const branch = issueBranchName(issue.number);
-	const create = await run("git", ["switch", "-c", branch, "--no-track", `origin/${baseBranch.value}`]);
-	if (create.code !== 0) return { ok: false, error: commandError(`create branch ${branch} from origin/${baseBranch.value}`, create) };
-	return { ok: true, value: { number: issue.number, title: issue.title, url: issue.url, branch, baseBranch: baseBranch.value } };
+	const startPoint = `origin/${baseBranch.value}`;
+	const issueRef = { number: issue.number, title: issue.title, url: issue.url, branch, baseBranch: baseBranch.value };
+	if (branchElsewhere) {
+		const elsewhere = await branchElsewhere(branch, startPoint);
+		return elsewhere.ok ? { ok: true, value: { ...issueRef, ...elsewhere.value } } : elsewhere;
+	}
+	const create = await run("git", ["switch", "-c", branch, "--no-track", startPoint]);
+	if (create.code !== 0) return { ok: false, error: commandError(`create branch ${branch} from ${startPoint}`, create) };
+	return { ok: true, value: issueRef };
 }
 
 /** Commits everything on the issue branch, pushes it, and opens a draft PR; returns the PR URL. */

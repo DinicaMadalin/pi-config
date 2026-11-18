@@ -34,7 +34,7 @@ export type DifficultyRating =
 	  }
 	| { kind: "unavailable"; reason: string };
 
-export const TASK_KINDS = ["feature_planning", "code_review", "issue_investigation", "feature_build", "other"] as const;
+export const TASK_KINDS = ["feature_planning", "code_review", "issue_investigation", "plan_implementation", "feature_build", "other"] as const;
 export type TaskKind = (typeof TASK_KINDS)[number];
 
 /** Routed to IMPORTANT_TASK_TIER whatever their rated difficulty. */
@@ -48,11 +48,15 @@ const TASK_KIND_CRITERIA: Record<TaskKind, string> = {
 	issue_investigation:
 		"Asks to investigate, triage, reproduce, or find the root cause of a GitHub issue (a link, an issue number, " +
 		"or pasted issue text), or continues such an investigation",
+	plan_implementation:
+		"Asks to implement a plan supplied in the current prompt or already discussed in this session, whether rough or detailed; " +
+		"includes short approvals such as 'implement it', 'go', or 'yes, do it' when an earlier plan is the task being accepted. " +
+		"Choose this only when the plan commits to nontrivial code changes, not for a small mechanical edit, question, or planning-only request.",
 	feature_build:
 		"Asks to directly implement a new feature or an architecture change of medium or larger size, with no agreed plan yet",
 	other:
-		"Anything else: planning or making a small change (a rename, a one-line fix), implementing an already agreed plan, " +
-		"ordinary coding, questions, or chit-chat",
+		"Anything else: planning or making a small change (a rename, a one-line fix), ordinary coding, questions, or chit-chat. " +
+		"Do not choose this for implementing an already discussed nontrivial plan; use plan_implementation.",
 };
 
 const TIER_FIT_CRITERIA: Record<PreviousTierFit, string> = {
@@ -154,6 +158,15 @@ export async function rateTaskDifficulty(
 	const earlierPrompts = userPrompts
 		.slice(-1 - EARLIER_PROMPTS_FOR_CONTEXT, -1)
 		.map((prompt) => prompt.slice(0, MAX_EARLIER_PROMPT_CHARS));
+	const previousAssistantAnswer = messages
+		.slice(0, messages.findLastIndex((message) => message.role === "user"))
+		.findLast((message) => message.role === "assistant");
+	const previousAssistantPlanText = previousAssistantAnswer
+		? typeof previousAssistantAnswer.content === "string"
+			? previousAssistantAnswer.content
+			: previousAssistantAnswer.content.flatMap((block) => (block.type === "text" ? [block.text] : [])).join("\n")
+		: "";
+	const previousAssistantPlan = previousAssistantPlanText.slice(-MAX_PREVIOUS_ANSWER_CHARS);
 
 	const tierFitQuestion = {
 		type: "choice" as const,
@@ -169,6 +182,7 @@ export async function rateTaskDifficulty(
 			state: {
 				prompt: latestPrompt.slice(0, MAX_PROMPT_CHARS),
 				earlierPrompts,
+				...(previousAssistantPlan ? { previousAssistantPlan } : {}),
 				pastCorrections: corrections,
 				...(previousExchange ? { previousExchange: { ...previousExchange } } : {}),
 			},
@@ -177,8 +191,11 @@ export async function rateTaskDifficulty(
 				taskKind: {
 					type: "choice",
 					instructions:
-						"What kind of work does `prompt` ask for? `earlierPrompts` are previous requests in the same session; " +
-						"a follow-up that continues a planning, review, or investigation discussion keeps that kind.",
+						"What kind of work does `prompt` ask for? `earlierPrompts` are previous requests and `previousAssistantPlan` " +
+						"is the latest assistant answer before this prompt (bounded to its last 2,000 characters). Use them to resolve " +
+						"short approvals and pronouns. When the user commits to implementing a previously discussed nontrivial plan, " +
+						"choose plan_implementation, not feature_planning or other. Planning without commitment stays feature_planning. " +
+						"A direct substantial feature request without a plan is feature_build.",
 					criteria: TASK_KIND_CRITERIA,
 				},
 				difficulty: {

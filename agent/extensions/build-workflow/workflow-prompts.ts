@@ -2,6 +2,8 @@
  * The messages each /build phase sends. Pure text builders, so they can be read and tested in one place.
  */
 import {
+	DESIGN_DONE_MARKER,
+	DESIGN_BLOCKED_MARKER,
 	IMPLEMENTATION_BLOCKED_MARKER,
 	IMPLEMENTATION_DONE_MARKER,
 	PLANNER_ANSWER_READY_MARKER,
@@ -52,14 +54,14 @@ const AGREE_AND_SAVE_PLAN_STEPS = [
 	"     algorithm change); a hard task with exact steps does not need it. For a plan without streams, add the section",
 	"     with a single stream to mark it.",
 	"5. After saving, tell me the plan path. I then choose whether to post the plan as a GitHub issue, and the implementers",
-	"   start on their own as subagents; if one gets stuck, its question comes back to you here.",
+	"   start after a separate expert designer prepares contracts and tests; if a helper gets stuck, it asks you here.",
 	`6. If I want the plan changed later, even while the implementer works, update it and call ${SAVE_PLAN_TOOL_NAME} again`,
 	"   with the full updated plan. The run keeps one plan file and passes the change on; never edit files yourself.",
 ];
 
 export function planningPrompt(task: string): string {
 	return [
-		"[/build, phase 1 of 3: PLAN] You are the expert planner. Another model will implement your plan in a fresh",
+		"[/build: PLAN] You are the expert planner. Another model will implement your plan in a fresh",
 		"session with no access to this conversation, and you will review its work afterwards.",
 		"",
 		`Task: ${task}`,
@@ -79,11 +81,15 @@ function formatIssue(issue: GithubIssue): string {
 	);
 }
 
-export function issueInvestigationPrompt(issue: GithubIssue, branch: string): string {
+/** worktreePath: the issue branch is checked out there, not in this session's directory. */
+export function issueInvestigationPrompt(issue: GithubIssue, branch: string, worktreePath?: string): string {
+	const where = worktreePath
+		? [`Branch ${branch}, fresh from the default branch, is checked out in the worktree ${worktreePath}, not in this`, "directory: read and run the code there (absolute paths, `cd` in bash). The issue to fix:"]
+		: [`We are on branch ${branch}, fresh from the default branch. The issue to fix:`];
 	return [
-		"[/issue, phase 1 of 3: INVESTIGATE] You are the expert investigator and planner. Another model will implement",
+		"[/issue: INVESTIGATE] You are the expert investigator and planner. Another model will implement",
 		"your plan in a fresh session with no access to this conversation, and you will review its work afterwards.",
-		`We are on branch ${branch}, fresh from the default branch. The issue to fix:`,
+		...where,
 		"",
 		formatIssue(issue),
 		"",
@@ -144,6 +150,9 @@ function assignmentLines(assignment: StreamAssignment | undefined): string[] {
  * it over the work, so both sides aim at the same bar.
  */
 const REVIEW_CHECKLIST = [
+	"- Contracts: every @handoff-contract agrees with the approved plan and is satisfied by the implementation;",
+	"  no stubs remain. Verify signatures, invariants, edge cases and acceptance tests. Leave contract comments intact:",
+	"  the workflow removes them only after every reviewer passes, then reruns checks before shipping.",
 	"- Plan: every Approach step is done, nothing outside the plan changed, and the acceptance criteria hold.",
 	"- Correctness: trace each changed path with the ugly inputs: empty, missing, duplicate, boundary values, wrong type,",
 	"  a failing dependency, a repeated or concurrent call. Errors are never swallowed, and their messages name the",
@@ -178,6 +187,40 @@ const CODE_QUALITY_RULES = [
 
 const HONEST_REPORTING = "Never claim a command you did not run or a result you did not see; say what you could not verify.";
 
+export function designPrompt(planPath: string, plan: string, baseCommit?: string): string {
+	return [
+		"[/build: DESIGN] You are the expert designer. Work in this run's checkout, not the planner's checkout.",
+		`Read the agreed plan at ${planPath} and the repo rules. The plan is also included below:`,
+		"", plan.trim(), "",
+		"Prepare the files for cheaper implementers; do not implement the production function bodies.",
+		"1. Inspect the current code and callers. Create exact signatures, domain types and stub bodies for new functions.",
+		"   For existing functions, preserve working bodies and unrelated behavior; annotate the changes they need.",
+		"2. Put each temporary behavior contract immediately above its function, using standalone comment lines:",
+		"   // @handoff-contract begin",
+		"   // Behavior, invariants, edge cases, exact errors, dependencies and acceptance cases.",
+		"   // @handoff-contract end",
+		"   Use //, #, -- or ; line comments, or one complete /* ... */ or <!-- ... --> comment per line.",
+		"   Every line inside a block must be a whole comment or blank. Never enclose executable code, documentation",
+		"   that must survive shipping, multiline comment delimiters, strings or docstrings in the block.",
+		"   Resolve cross-stream APIs before anyone implements. Keep file ownership disjoint as the plan specifies.",
+		"3. Write the acceptance tests named in the plan; do not weaken existing tests. Run the focused tests to confirm",
+		"   expected stub failures, not broken imports or syntax. Record the baseline and exact check commands.",
+		"   Ensure the full verification commands are discoverable from .pi/checks.json, package.json or Makefile;",
+		"   if none exist, ask the planner to agree a check configuration rather than inventing commands.",
+		"4. For non-code changes, do not invent functions or contracts: prepare only what applies and explain why.",
+		`5. Inspect ${diffCommand(baseCommit)} and untracked files. Do not commit, invoke another handoff tool or launch helpers.`,
+		"If the plan is unclear, stop and ask the planner with file:line and a recommendation, ending with",
+		`\`${DESIGN_BLOCKED_MARKER}: <question>\`. Otherwise report files, signatures, contracts and real test results,`,
+		`then end with \`${DESIGN_DONE_MARKER}\`. Implementers start only after that marker.`,
+	].join("\n");
+}
+
+const IMPLEMENT_CONTRACT_RULES = [
+	"- Fill the designer's stubs and satisfy every @handoff-contract in your files. Keep signatures and contract",
+	"  comments unchanged; do not delete them. Keep the designer's tests, and never weaken tests to get green.",
+	"- If a contract or signature is wrong, stop and ask the planner; do not redesign it yourself.",
+];
+
 export function implementationBrief(
 	planPath: string,
 	plan: string,
@@ -188,10 +231,10 @@ export function implementationBrief(
 	baseCommit?: string,
 ): string {
 	return [
-		"[/build, phase 2 of 3: IMPLEMENT] You are the implementer: a senior engineer who owns this change end to end.",
-		`An expert planned it with me and I agreed to the plan below (saved at ${planPath}). Afterwards two expert reviewers`,
-		"from different AI vendors review your work against the plan, independently, and they verify every claim you make.",
-		"Your goal: both pass it on the first round. That takes correct code, tests that prove it, and an honest report,",
+		"[/build: IMPLEMENT] You are the implementer: a senior engineer who owns this change end to end.",
+		`An expert planned it with me and I agreed to the plan below (saved at ${planPath}). Afterwards one complex-tier`,
+		"reviewer per available AI vendor reviews your work against the plan, independently, and they verify every claim you make.",
+		"Your goal: every reviewer passes it on the first round. That takes correct code, tests that prove it, and an honest report,",
 		"not speed.",
 		"",
 		...issueLine(issue),
@@ -207,7 +250,8 @@ export function implementationBrief(
 		"   For each function, type or data shape you will change, find its callers and its tests (`rg -n <name>`), so you",
 		"   know what else depends on it.",
 		"2. Take a baseline. Before your first edit, run the plan's typecheck, lint and test commands once and note what",
-		"   already fails. Those failures are pre-existing: list them in your report, and fix them only if the plan says so.",
+		"   already fails. Designer stub failures are expected work for you, not pre-existing exemptions. Other baseline",
+		"   failures must be reported separately.",
 		"3. Turn the plan's Approach into a checklist and work through it in order. After each step run the narrowest check",
 		"   that covers it (the typecheck, the one test file) before moving on: small verified steps, not one big leap.",
 		"4. Write the tests the plan names. Each one states a rule and would fail if the code were wrong. A bug fix starts",
@@ -235,6 +279,7 @@ export function implementationBrief(
 		"- The coding rules in these files apply in full. They are in your context; reread them if unsure:",
 		...indented(ruleFileLines(ruleFilePaths), "  "),
 		...CODE_QUALITY_RULES,
+		...IMPLEMENT_CONTRACT_RULES,
 		"",
 		"## Review checklist (yours before you report, the reviewers' after)",
 		"",
@@ -293,6 +338,7 @@ export function reviewPrompt(
 	ruleFilePaths: readonly string[],
 	issue?: IssueRef,
 	planIssue?: TrackedIssue,
+	newCheckFailures?: string,
 ): string {
 	const planSource = planIssue
 		? `GitHub issue #${planIssue.number} (${planIssue.url}; read it with ${readPlanIssueCommand(planIssue)}, local copy at ${planPath})`
@@ -300,10 +346,19 @@ export function reviewPrompt(
 	const issueCheck = issue
 		? [`- Issue: the change fixes issue #${issue.number}'s root cause, and a test reproduces the issue and now passes.`]
 		: [];
+	const checkFailures = newCheckFailures
+		? [
+				"## Checks that newly fail since the run began",
+				"",
+				"The implementers had one round to fix these and they still fail. Judge whether the work caused them; a failure the work caused is a must-fix finding.",
+				newCheckFailures,
+				"",
+			]
+		: [];
 	return [
-		"[/build, phase 3 of 3: REVIEW] You are an expert code reviewer and the last gate before this work ships. The",
+		"[/build: REVIEW] You are a complex-tier code reviewer and the last gate before this work ships. The",
 		"implementer says it is done. Assume the work has bugs until you have looked; your job is to find every real",
-		"problem, and to block only on real problems. An expert from another AI vendor reviews the same work in parallel:",
+		"problem, and to block only on real problems. Other configured vendors may review the same work in parallel:",
 		"review on your own.",
 		`Review it against ${planSource}.`,
 		"",
@@ -332,6 +387,7 @@ export function reviewPrompt(
 		"",
 		...REVIEW_SEVERITY,
 		"",
+		...checkFailures,
 		"## Your report",
 		"",
 		...reviewReportFormat("pass, or fix with the number of must-fix findings"),
@@ -360,7 +416,7 @@ export function fixStepsPrompt(reviewReport: string, crew: readonly FixCrewMembe
 			]
 		: ["4. Write the steps as one ordered list for the implementer."];
 	return [
-		"[/build: FIX STEPS] Both expert reviewers reviewed the implementation and asked for fixes; their reviews are below.",
+		"[/build: FIX STEPS] Reviewers reviewed the implementation and asked for fixes; their reports are below.",
 		"The implementers run on cheaper models: they follow your fix steps exactly and design nothing themselves, so the",
 		"thinking is yours.",
 		"",
@@ -386,7 +442,7 @@ export function fixPrompt(reviewReport: string, fixSteps: string, assignment?: S
 		? [`These are your steps for the "${assignment.stream.name}" work stream; the other implementers fix the rest.`]
 		: [];
 	return [
-		"[/build: FIX] You are the implementer again. Two expert reviewers reviewed your work, and the planner who wrote",
+		"[/build: FIX] You are the implementer again. The reviewers reviewed your work, and the planner who wrote",
 		"the plan checked their findings and wrote the exact fix steps below. They are your brief for this round.",
 		...scope,
 		"",
@@ -400,6 +456,7 @@ export function fixPrompt(reviewReport: string, fixSteps: string, assignment?: S
 		"",
 		"## How to fix",
 		"",
+		...IMPLEMENT_CONTRACT_RULES,
 		"1. Follow the steps in order, exactly. For a behavior bug, add the test first and see it fail, then fix.",
 		"2. If a step does not match the code (the file, function or line differs) or would break something, do not",
 		`   improvise: say what you found and ask (end with \`${IMPLEMENTATION_BLOCKED_MARKER}: <your question>\`).`,
@@ -423,16 +480,31 @@ function fixReplyLines(fixReplies: readonly { implementerName: string; reply: st
 	];
 }
 
-export function reReviewPrompt(baseCommit: string | undefined, fixReplies: readonly { implementerName: string; reply: string }[] = []): string {
+export function reReviewPrompt(
+	baseCommit: string | undefined,
+	fixReplies: readonly { implementerName: string; reply: string }[] = [],
+	newCheckFailures?: string,
+): string {
+	const checkFailures = newCheckFailures
+		? [
+				"## Checks that newly fail since the run began",
+				"",
+				"The implementers had one round to fix these and they still fail. Judge whether the work caused them; a failure the work caused is a must-fix finding.",
+				newCheckFailures,
+				"",
+			]
+		: [];
 	return [
-		"[/build: RE-REVIEW] You are the expert reviewer again. The implementer answered the must-fix findings of your",
-		"review and of the other expert reviewer's: each is fixed or rejected with reasons.",
+		"[/build: RE-REVIEW] You are the complex-tier reviewer again. The implementer answered the must-fix findings of the review",
+		"and any other reviewer's: each is fixed or rejected with reasons.",
 		"",
 		...fixReplyLines(fixReplies),
-		"1. For each must-fix finding, yours and the other reviewer's, decide with evidence: resolved, rightly rejected, or",
+		...checkFailures,
+		"1. For each must-fix finding, yours and any other reviewer's, decide with evidence: resolved, rightly rejected, or",
 		`   still open. Use ${diffCommand(baseCommit)} and the changed files; rerun a reproduction when you had one.`,
 		"2. Rerun the typecheck, lint and test commands.",
-		"3. Look for regressions: read the lines the fixes changed and their callers.",
+		"3. Look for regressions: read the lines the fixes changed and their callers; verify every remaining contract.",
+		"   Leave contract comments intact for programmatic removal after every reviewer passes.",
 		"4. Do not raise new nitpicks. Something you did not flag before blocks now only if it is a must-fix bug with",
 		"   evidence. The same ground rules and severity as your review apply: the repo is read-only, probes go under /tmp.",
 		"",
@@ -469,18 +541,35 @@ export function plannerQuestionPrompt(implementerAnswer: string, asker?: string)
 	].join("\n");
 }
 
-export function plannerAnswerPrompt(answer: string): string {
+export function plannerAnswerPrompt(answer: string, isDesigner = false): string {
 	return [
 		"[/build: ANSWER FROM THE PLANNER]",
 		"",
 		answer.trim(),
 		"",
-		`Continue the implementation. End your reply with \`${IMPLEMENTATION_DONE_MARKER}\` when done, or with`,
-		`\`${IMPLEMENTATION_BLOCKED_MARKER}: <your question>\` if you are stuck again.`,
+		`Continue your assigned phase. End your reply with \`${isDesigner ? DESIGN_DONE_MARKER : IMPLEMENTATION_DONE_MARKER}\` when done, or with`,
+		`\`${isDesigner ? DESIGN_BLOCKED_MARKER : IMPLEMENTATION_BLOCKED_MARKER}: <your question>\` if you are stuck again.`,
 	].join("\n");
 }
 
 /** Sent to a subagent restarted on its session: after Pi was reloaded, it crashed, or you restarted it. */
+export function checkFailuresFixPrompt(newFailures: string, assignment?: StreamAssignment): string {
+	const scope = assignment
+		? [`These are shared results; fix only what the "${assignment.stream.name}" work stream's files caused, leaving the rest to the other implementers.`]
+		: [];
+	return [
+		"[/build: CHECKS] The project's checks fail in ways they did not when the run began:",
+		"",
+		newFailures,
+		"",
+		...scope,
+		"1. Fix each failure the work caused at its cause. Never skip, delete or loosen a check or test.",
+		"2. Leave failures the work did not cause and list them under \"Not caused by this work\".",
+		"3. Rerun the failing checks, inspect the diff, and report what you fixed and what you left.",
+		`End your reply with the line \`${IMPLEMENTATION_DONE_MARKER}\`, or with \`${IMPLEMENTATION_BLOCKED_MARKER}: <your question>\` when stuck.`,
+	].join("\n");
+}
+
 export function resumePrompt(): string {
 	return [
 		"[/build: RESUME] Your previous run was interrupted (stopped, crashed or Pi reloaded). Check the current state of the work,",
@@ -513,7 +602,7 @@ export function planChangePrompt(
 		`[/build: PLAN CHANGED] I agreed to a change of the plan (saved at ${planPath}${planIssue ? `, and in issue #${planIssue.number}` : ""}).`,
 		"Bring the implementation in line with the updated plan below: change what the update changes, keep the work that",
 		"still matches it. Follow the same rules and code style as in your original brief, do not commit, and rerun the",
-		"typecheck, lint and test commands. Then both expert reviewers review the work against the new plan.",
+		"typecheck, lint and test commands. Then every available reviewer reviews the work against the new plan.",
 		"",
 		...assignmentLines(assignment),
 		"## Updated plan",
@@ -530,6 +619,7 @@ export function planChangePrompt(
 }
 
 const STAGE_ROLES: Record<StageRecord["stage"], string> = {
+	design: "Designer",
 	implement: "Implementer",
 	review: "Reviewer",
 	fix: "Fixer",
@@ -548,7 +638,7 @@ function isReview(stage: StageRecord): boolean {
 	return stage.stage === "review" || stage.stage === "re-review";
 }
 
-/** Each reviewer's report from the last review stage (a single reviewer's in runs from before two reviewers). */
+/** Each reviewer's report from the last review stage. */
 function lastReviews(stages: readonly StageRecord[]): StageRecord[] {
 	const lastReview = stages.findLast(isReview);
 	if (!lastReview) return [];

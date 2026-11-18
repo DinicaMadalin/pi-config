@@ -21,6 +21,8 @@ agent/extensions/*
 !agent/extensions/project-memory/**
 !agent/extensions/prompt-rewriter
 !agent/extensions/prompt-rewriter/**
+!agent/extensions/herdr-tools
+!agent/extensions/herdr-tools/**
 
 # Everything below is credentials, chat history, or machine-generated state.
 # Keep these lines even though they are redundant with the deny-all above:

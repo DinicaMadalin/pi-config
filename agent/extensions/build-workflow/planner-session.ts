@@ -5,11 +5,14 @@
 import { readFileSync } from "node:fs";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { ROUTE_PIN_ENTRY_TYPE, type RoutePin } from "../auto-model/route-pin.ts";
+import { HerdrClient, isInsideHerdr } from "../herdr-tools/herdr-cli.ts";
 import type { RunCommand } from "./github-issue.ts";
 import {
 	findPlannerWorkflowState,
 	IDLE_WORKFLOW,
+	isAwaitingUser,
 	plannerRouteForPhase,
+	runWorktreeOf,
 	WORKFLOW_STATE_ENTRY_TYPE,
 	type WorkflowPhase,
 	type WorkflowState,
@@ -21,16 +24,19 @@ const PHASE_LABELS: Record<WorkflowPhase, string> = {
 	idle: "",
 	plan: "plan (expert)",
 	"awaiting-implementation": "plan agreed",
-	implement: "implementing · Alt+A",
-	review: "reviewers working · Alt+A",
-	fix: "implementer fixing · Alt+A",
-	"re-review": "reviewers re-reviewing · Alt+A",
-	"review-failed": "re-review has findings, your call · Alt+A",
+	design: "designer preparing contracts (expert)",
+	cleanup: "removing contracts and checking clean files",
+	"cleanup-failed": "cleanup/checks blocked shipping · /build implement retries",
+	implement: "implementing",
+	review: "reviewers working",
+	fix: "implementer fixing",
+	"re-review": "reviewers re-reviewing",
+	"review-failed": "re-review has findings, your call",
 	"awaiting-pr": "review passed, /issue pr",
 	"awaiting-ship": "review passed, /build ship",
 };
 
-/** "build: implementing · Alt+A", "issue #42: investigate (expert)"; empty when idle. */
+/** "build: implementing", "issue #42: investigate (expert)"; empty when idle. */
 export function phaseLabel(state: WorkflowState): string {
 	if (state.phase === "idle") return "";
 	const prefix = state.issue ? `issue #${state.issue.number}` : "build";
@@ -40,8 +46,16 @@ export function phaseLabel(state: WorkflowState): string {
 
 export type NoticeLevel = "info" | "warning" | "error";
 
+const AWAITING_USER_PINGS: Partial<Record<WorkflowPhase, string>> = {
+	"review-failed": "The re-review still has findings: your call",
+	"awaiting-pr": "Review passed: /issue pr opens the draft PR",
+	"awaiting-ship": "Review passed: ready to ship",
+};
+
 export class PlannerSession {
 	readonly pi: ExtensionAPI;
+	/** Undefined outside herdr: no pings, no panes, no worktrees. */
+	readonly herdr: HerdrClient | undefined = isInsideHerdr() ? new HerdrClient() : undefined;
 	private workflowState: WorkflowState = IDLE_WORKFLOW;
 	private ctx: ExtensionContext | undefined;
 
@@ -76,14 +90,39 @@ export class PlannerSession {
 		this.pi.appendEntry(WORKFLOW_STATE_ENTRY_TYPE, next);
 		this.pi.appendEntry<RoutePin>(ROUTE_PIN_ENTRY_TYPE, plannerRouteForPhase(next.phase));
 		this.showPhase();
+		const ping = isAwaitingUser(next.phase) ? AWAITING_USER_PINGS[next.phase] : undefined;
+		if (ping) this.ping(ping);
 	}
 
 	notify(message: string, level: NoticeLevel): void {
 		if (this.ctx?.hasUI) this.ctx.ui.notify(message, level);
 	}
 
-	/** Runs a command in the session's directory. */
-	readonly run: RunCommand = (command, args) => this.pi.exec(command, args, { cwd: this.context.cwd });
+	/** A herdr notification with a sound, for moments the run waits on you; nothing outside herdr. */
+	ping(message: string): void {
+		if (!this.herdr) return;
+		const prefix = phaseLabel(this.workflowState).split(":")[0] || "build";
+		this.herdr.showNotification(`Pi ${prefix}`, message, "request").catch((error: unknown) => {
+			this.notify(`${(error as Error).message}; ${message}`, "warning");
+		});
+	}
+
+	/** Notice plus ping: the run cannot go on without you. */
+	callUser(message: string): void {
+		this.notify(message, "info");
+		this.ping(message);
+	}
+
+	/** Where the run's files are: its worktree, else the session's directory. */
+	get workDir(): string {
+		return runWorktreeOf(this.workflowState)?.path ?? this.context.cwd;
+	}
+
+	/** Runs a command in the run's work directory. */
+	readonly run: RunCommand = (command, args) => this.pi.exec(command, args, { cwd: this.workDir });
+
+	/** Runs a command in the session's own directory, e.g. to create a worktree of it. */
+	readonly runInSessionDir: RunCommand = (command, args) => this.pi.exec(command, args, { cwd: this.context.cwd });
 
 	/** The plan file's text; a failure is shown and returns undefined. */
 	readPlan(planPath: string): string | undefined {

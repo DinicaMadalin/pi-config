@@ -1,6 +1,6 @@
 /**
  * Runs the delegated part of a /build run: the implementers (one per work stream of the plan, building in parallel)
- * and the two reviewers (one on Claude, one on OpenAI, reviewing in parallel) are subagent processes, the planner
+ * and one complex-tier reviewer per available vendor (Claude and/or OpenAI) is a subagent process, the planner
  * stays in your session. Moves the run along when every subagent of a stage is done, sends the implementers'
  * questions to the planner one at a time and each answer back to the one that asked, applies plan changes, lets
  * you stop, restart or message each agent, and posts a report when the run ends. The implementers stay with the
@@ -10,12 +10,17 @@ import { randomUUID } from "node:crypto";
 import { existsSync } from "node:fs";
 import { join } from "node:path";
 import { ROUTE_PIN_ENTRY_TYPE } from "../auto-model/route-pin.ts";
+import { describeNewCheckFailures, findNewCheckFailures } from "../quality-gate/check-baseline.ts";
+import type { BuildCheckRun } from "./build-checks.ts";
+import type { ReviewerLineup } from "./reviewer-lineup.ts";
 import { activeMsOf } from "./agent-activity.ts";
-import { createSubagentSessionFile, type LaunchSubagent, launchSubagentProcess, type Subagent, type SubagentDialogs } from "./subagent-process.ts";
+import { createSubagentSessionFile, type LaunchSubagent, launchSubagentProcess, type Subagent, type SubagentDialogs, type SubagentPane } from "./subagent-process.ts";
 import {
+	designPrompt,
+	implementationBrief,
 	fixPrompt,
 	fixStepsPrompt,
-	planChangePrompt,
+	checkFailuresFixPrompt,
 	plannerAnswerPrompt,
 	plannerQuestionPrompt,
 	reReviewPrompt,
@@ -80,6 +85,15 @@ export interface PlannerSeat {
 	askPlanner(prompt: string): void;
 	postReport(report: string): void;
 	notify(message: string, level: "info" | "warning" | "error"): void;
+	/** A notice that the run cannot go on without the user; inside herdr it also pings. */
+	callUser(message: string): void;
+	/** Your trust decision for the project, which its subagents take over. */
+	isProjectTrusted(): boolean;
+	/** Remove reviewed temporary contracts and verify the resulting files; failures never release work. */
+	reviewerLineup(): ReviewerLineup;
+	runChecks(signal: AbortSignal): Promise<BuildCheckRun>;
+	changedFiles(baseCommit: string | undefined, signal: AbortSignal): Promise<string[]>;
+	finalizeContracts(work: FeatureWork, signal: AbortSignal): Promise<string | undefined>;
 	/** The subagents are done: the run waits for the user (decision, PR, ship) or is idle. */
 	finish(next: WorkflowState, summary: string): void;
 	dialogs: SubagentDialogs;
@@ -111,11 +125,13 @@ interface StageSeat {
 }
 
 function seatsOfStage(state: DelegatedState): StageSeat[] {
+	if (state.phase === "design") return [{ role: "designer" }];
 	if (state.phase === "implement" || state.phase === "fix") return (state.implementers ?? []).map((seat) => ({ role: seat.role }));
-	return REVIEWER_VENDORS.map((vendor) => ({ role: reviewerRole(vendor), reviewer: vendor }));
+	return REVIEWER_VENDORS.filter((vendor) => state.reviewerSessions?.[vendor]).map((vendor) => ({ role: reviewerRole(vendor), reviewer: vendor }));
 }
 
 function sessionOfSeat(state: FeatureWork, seat: StageSeat): string | undefined {
+	if (seat.role === "designer") return state.designerSession;
 	if (seat.reviewer) return state.reviewerSessions?.[seat.reviewer];
 	return state.implementers?.find((implementer) => implementer.role === seat.role)?.sessionPath;
 }
@@ -169,6 +185,9 @@ export class BuildOrchestrator {
 	private isWaitingForFixSteps = false;
 	/** Bumped by stop(): a step of a stopped run that was waiting on I/O sees the change and drops out. */
 	private generation = 0;
+	private implementationBriefFor: ((assignment: StreamAssignment | undefined) => string) | undefined;
+	private cleanupController: AbortController | undefined;
+	private cleanupTask: Promise<void> | undefined;
 
 	constructor(seat: PlannerSeat, launchSubagent: LaunchSubagent = launchSubagentProcess) {
 		this.seat = seat;
@@ -179,7 +198,14 @@ export class BuildOrchestrator {
 		return this.processes.get(role);
 	}
 
-	/** The subagents of the current stage: the implementers, or both reviewers. */
+	/** The herdr panes of every helper still running, also those whose round is over. */
+	openPanes(): Map<SubagentRole, SubagentPane> {
+		const panes = new Map<SubagentRole, SubagentPane>();
+		for (const [role, subagent] of this.processes) if (subagent.pane) panes.set(role, subagent.pane);
+		return panes;
+	}
+
+	/** The subagents of the current stage: the implementers, or every reviewer available for the run. */
 	liveStages(): LiveStage[] {
 		return [...this.agents.values()];
 	}
@@ -196,22 +222,29 @@ export class BuildOrchestrator {
 		const implementState: DelegatedState = { phase: "implement", ...work };
 		const crew = this.seat.crew().filter((seat) => existsSync(seat.sessionPath));
 		const state: DelegatedState = { ...implementState, implementers: this.assignCrew(implementState, crew, plan) };
+		this.implementationBriefFor = briefFor;
+		this.beginDesign(state, plan);
+	}
+
+	private beginDesign(work: FeatureWork, plan: string): void {
+		const state: DelegatedState = { phase: "design", ...featureWorkOf(work) };
+		state.designerSession = this.createSession(state, { role: "designer" });
 		this.seat.enterPhase(state);
-		const assignments = streamAssignments(state.implementers ?? [], plan);
-		this.beginStage(state, (seat) => briefFor(assignments.get(seat.role)));
+		this.beginStage(state, () => designPrompt(state.planPath, plan, state.baseCommit));
 	}
 
 	/** Gives the plan's streams to the implementers, making sessions for the streams that have none. */
 	private assignCrew(state: DelegatedState, crew: readonly ImplementerSeat[], plan: string): ImplementerSeat[] {
 		const streams: WorkStream[] = capWorkStreams(parseWorkStreams(plan));
-		return assignStreams(streams, crew, (role) => this.createSession(state, { role }));
+		return assignStreams(streams, crew, (role) => this.createSession({ ...state, phase: "implement" }, { role }));
 	}
 
 	/** After a reload: restart the subagents of the current phase that still owe an answer, and let them continue. */
 	resume(): ActionRefusal {
 		const state = this.seat.state();
+		if (state.phase === "cleanup" || state.phase === "cleanup-failed") return this.retryCleanup();
 		if (!isDelegatedState(state)) return "No subagent stage to resume";
-		if (this.agents.size > 0 || this.isWaitingForFixSteps) return "The run is already going; Alt+A shows it";
+		if (this.agents.size > 0 || this.isWaitingForFixSteps) return "The run is already going; /build status shows its phase";
 		if (state.phase === "fix" && state.findings !== undefined && state.fixSteps === undefined) {
 			this.requestFixSteps(state, state.findings);
 			return undefined;
@@ -221,9 +254,23 @@ export class BuildOrchestrator {
 			return !sessionPath || !existsSync(sessionPath);
 		});
 		if (missing) return `Cannot resume: the ${SUBAGENT_NAMES[missing.role]}'s session file is missing. /build stop, then start again.`;
+		if ((state.phase === "review" || state.phase === "re-review") && !state.reviewerSessions) {
+			void this.beginReview(state);
+			return undefined;
+		}
 		const answered = this.answeredReviews(state);
 		this.beginStage(state, () => resumePrompt(), answered);
-		if (this.liveStages().every((live) => live.condition === "answered")) this.moveOnFromReviews(state);
+		if ((state.phase === "review" || state.phase === "re-review") && this.liveStages().every((live) => live.condition === "answered")) this.moveOnFromReviews(state);
+		return undefined;
+	}
+
+	async resumeOrRestart(): Promise<ActionRefusal> {
+		const stoppedAgents = this.liveStages().filter((stage) => stage.condition === "stopped" || stage.condition === "crashed");
+		if (stoppedAgents.length === 0) return this.resume();
+		for (const stage of stoppedAgents) {
+			const refusal = await this.restartAgent(stage.role);
+			if (refusal) return refusal;
+		}
 		return undefined;
 	}
 
@@ -238,11 +285,11 @@ export class BuildOrchestrator {
 		const plannerAnswer = readPlannerAnswer(reply);
 		if (plannerAnswer.kind === "none") return;
 		if (plannerAnswer.kind === "needs-user") {
-			this.seat.notify(`The ${SUBAGENT_NAMES[asker]} is waiting: answer the planner's question, and it passes your answer on`, "info");
+			this.seat.callUser(`The ${SUBAGENT_NAMES[asker]} is waiting: answer the planner's question, and it passes your answer on`);
 			return;
 		}
 		this.askingRole = undefined;
-		this.promptAgent(asker, plannerAnswerPrompt(plannerAnswer.answer));
+		this.promptAgent(asker, plannerAnswerPrompt(plannerAnswer.answer, asker === "designer"));
 		this.askNextQuestion();
 	}
 
@@ -255,27 +302,9 @@ export class BuildOrchestrator {
 		const asker = this.askingRole;
 		if (!asker) return;
 		const name = SUBAGENT_NAMES[asker];
-		this.seat.notify(`The ${name} still waits for the planner's answer: reply to the planner, or message the ${name} (Alt+A)`, "warning");
+		this.seat.notify(`The ${name} still waits for the planner's answer: reply to the planner, or type into the ${name}'s herdr pane`, "warning");
 	}
 
-	/** A message you typed in the agents overview. */
-	sendToSubagent(role: SubagentRole, text: string): ActionRefusal {
-		const subagent = this.processes.get(role);
-		if (!subagent?.isRunning) return `The ${SUBAGENT_NAMES[role]} is not running; r restarts it`;
-		subagent.sendUserMessage(text);
-		this.dropQuestionOf(role);
-		this.setCondition(role, "running");
-		return undefined;
-	}
-
-	/** Stops the agent's current turn; it keeps its process and context, waiting for a message or a restart. */
-	stopAgentTurn(role: SubagentRole): ActionRefusal {
-		const subagent = this.processes.get(role);
-		if (!subagent?.isRunning || !subagent.isWorking) return `The ${SUBAGENT_NAMES[role]} is not working`;
-		subagent.abortTurn();
-		this.setCondition(role, "stopped");
-		return undefined;
-	}
 
 	/** A fresh process on the agent's session, told to check the work and continue; also brings back a crashed agent. */
 	async restartAgent(role: SubagentRole): Promise<ActionRefusal> {
@@ -299,40 +328,9 @@ export class BuildOrchestrator {
 		return undefined;
 	}
 
-	/**
-	 * The plan changed while the implementers work on it: each gets its part of the new plan right away, a new
-	 * stream gets a new implementer, and an implementer whose stream is gone stops.
-	 */
+	/** A changed contract cannot race its implementers: stop writers, then redesign the updated plan. */
 	async tellImplementersAboutPlanChange(): Promise<ActionRefusal> {
-		const state = this.seat.state();
-		if (state.phase !== "implement" && state.phase !== "fix") return "The implementers are not working on the plan now";
-		const plan = this.seat.readPlan(state.planPath);
-		if (plan === undefined) return `Cannot read the plan ${state.planPath}`;
-		const implementers = this.assignCrew(state, state.implementers ?? [], plan);
-		const next: DelegatedState = withPlanRevision({ ...state, implementers });
-		const dropped = (state.implementers ?? []).filter((seat) => !implementers.some((kept) => kept.role === seat.role));
-		const generation = this.generation;
-		for (const seat of dropped) await this.retireImplementer(seat.role);
-		if (generation !== this.generation) return "The run was stopped";
-		this.seat.enterPhase(next);
-		const assignments = streamAssignments(implementers, plan);
-		for (const seat of implementers) {
-			const prompt = planChangePrompt(next.planPath, plan, next.planIssue, undefined, assignments.get(seat.role));
-			if (!this.agents.has(seat.role)) this.startAgent(next, { role: seat.role }, prompt);
-			else this.promptAgent(seat.role, prompt);
-		}
-		return undefined;
-	}
-
-	/** An implementer whose stream left the plan: its process ends, its work so far is recorded. */
-	private async retireImplementer(role: SubagentRole): Promise<void> {
-		const live = this.agents.get(role);
-		if (live) this.recordUnfinishedStage(live, "(its work stream left the plan)");
-		this.agents.delete(role);
-		this.dropQuestionOf(role);
-		const subagent = this.processes.get(role);
-		this.processes.delete(role);
-		await subagent?.stop();
+		return this.startChangeRound();
 	}
 
 	/** The plan changed during a review: the review finishes, then its findings go into a change round. */
@@ -344,12 +342,13 @@ export class BuildOrchestrator {
 	}
 
 	/**
-	 * The implementer applies the changed plan now, then both reviewers review again: from a running review
+	 * The implementer applies the changed plan now, then every reviewer reviews again: from a running review
 	 * (which is stopped), after a failed re-review, or from work waiting to ship or for its PR.
 	 */
 	async startChangeRound(): Promise<ActionRefusal> {
 		const state = this.seat.state();
-		if (!isFeatureState(state) || state.phase === "implement" || state.phase === "fix") return "No reviewed work to change";
+		if (!isFeatureState(state)) return "No work to change";
+		if (this.cleanupController) return "Contract cleanup is running; retry the plan change when it finishes";
 		const plan = this.seat.readPlan(state.planPath);
 		if (plan === undefined) return `Cannot read the plan ${state.planPath}`;
 		const generation = await this.stopProcesses();
@@ -357,9 +356,7 @@ export class BuildOrchestrator {
 		const work = featureWorkOf(state);
 		const changeState: DelegatedState = { phase: "implement", ...work };
 		const next: DelegatedState = withPlanRevision({ ...changeState, implementers: this.assignCrew(changeState, work.implementers ?? [], plan) });
-		this.seat.enterPhase(next);
-		const assignments = streamAssignments(next.implementers ?? [], plan);
-		this.beginStage(next, (seat) => planChangePrompt(state.planPath, plan, state.planIssue, undefined, assignments.get(seat.role)));
+		this.beginDesign(next, plan);
 		return undefined;
 	}
 
@@ -377,10 +374,11 @@ export class BuildOrchestrator {
 	/** After a failed re-review: one more fix round on the remaining findings, then a re-review. */
 	fixAgain(): ActionRefusal {
 		const state = this.seat.state();
-		if (state.phase !== "review-failed") return "Another fix round works after a failed re-review";
-		const next: FixState = { phase: "fix", ...featureWorkOf(state), findings: state.findings };
+		if (state.phase !== "review-failed" && state.phase !== "cleanup-failed") return "Another fix round works after failed review or cleanup";
+		const findings = state.phase === "cleanup-failed" ? state.failure : state.findings;
+		const next: FixState = { phase: "fix", ...featureWorkOf(state), findings };
 		this.seat.enterPhase(next);
-		this.requestFixSteps(next, state.findings);
+		this.requestFixSteps(next, findings);
 		return undefined;
 	}
 
@@ -388,6 +386,7 @@ export class BuildOrchestrator {
 	acceptAnyway(): ActionRefusal {
 		const state = this.seat.state();
 		if (state.phase !== "review-failed") return "Accepting works after a failed re-review";
+		if (state.designerSession) return "Contract builds require every reviewer to pass before cleanup and shipping; fix or re-review instead";
 		this.seat.finish(releaseStateOf(state), "you accepted the work despite the re-review's findings");
 		return undefined;
 	}
@@ -397,7 +396,16 @@ export class BuildOrchestrator {
 		void this.stopProcesses();
 	}
 
-	private async stopProcesses(): Promise<number> {
+	/** stop(), resolving once every subagent ended (and its herdr pane closed). */
+	async stopAndWait(): Promise<void> {
+		await this.stopProcesses();
+		await this.cleanupTask;
+	}
+
+
+	private async stopProcesses(cancelCleanup = true): Promise<number> {
+		if (cancelCleanup) this.cleanupController?.abort();
+		this.implementationBriefFor = undefined;
 		this.generation++;
 		const generation = this.generation;
 		const running = [...this.processes.values()];
@@ -432,7 +440,7 @@ export class BuildOrchestrator {
 
 	/** Reviewers route freely (the expert tier); an implementer gets a cheap model unless its stream is marked. */
 	private maxTierOf(seat: StageSeat, state: FeatureWork): DifficultyTier | undefined {
-		if (seat.reviewer) return undefined;
+		if (seat.reviewer || seat.role === "designer") return undefined;
 		const implementer = state.implementers?.find((candidate) => candidate.role === seat.role);
 		const plan = this.seat.readPlan(state.planPath);
 		const streams = plan === undefined ? [] : capWorkStreams(parseWorkStreams(plan));
@@ -456,9 +464,11 @@ export class BuildOrchestrator {
 		const name = SUBAGENT_NAMES[seat.role];
 		const subagent: Subagent = this.launchSubagent({
 			name,
+			agentName: seat.role,
 			cwd: this.seat.cwd(),
 			sessionPath,
 			dialogs: this.seat.dialogs,
+			isProjectTrusted: this.seat.isProjectTrusted(),
 			...(maxTier && { maxTier }),
 			onSettled: (lastAnswer, isAborted) => {
 				if (this.processes.get(seat.role) === subagent) this.handleSubagentSettled(seat.role, lastAnswer, isAborted);
@@ -466,6 +476,9 @@ export class BuildOrchestrator {
 			onExit: (reason) => {
 				if (this.processes.get(seat.role) !== subagent) return;
 				this.handleSubagentCrash(seat.role, reason);
+			},
+			onWaitingForUser: () => {
+				if (this.processes.get(seat.role) === subagent) this.seat.callUser(`The ${name} waits for you in its herdr pane (Implementers or Reviewers tab)`);
 			},
 		});
 		subagent.start();
@@ -479,7 +492,7 @@ export class BuildOrchestrator {
 		if (!live) return;
 		this.recordUnfinishedStage(live, `(the process stopped: ${reason})`);
 		this.setCondition(role, "crashed");
-		this.seat.notify(`/build: the ${SUBAGENT_NAMES[role]} stopped (${reason}). Alt+A, then r restarts it.`, "error");
+		this.seat.notify(`/build: the ${SUBAGENT_NAMES[role]} stopped (${reason}). /build implement restarts it.`, "error");
 	}
 
 	/** Prompts an agent of the current stage, restarting its process when it is gone. */
@@ -555,7 +568,7 @@ export class BuildOrchestrator {
 		const plannerAnswer = readPlannerAnswer(reply);
 		if (plannerAnswer.kind === "none") return;
 		if (plannerAnswer.kind === "needs-user") {
-			this.seat.notify("The fix round waits for you: answer the planner's question, then it writes the fix steps", "info");
+			this.seat.callUser("The fix round waits for you: answer the planner's question, then it writes the fix steps");
 			return;
 		}
 		this.isWaitingForFixSteps = false;
@@ -583,7 +596,7 @@ export class BuildOrchestrator {
 		this.askingRole = question.role;
 		this.seat.notify(`The ${name} has a question; the planner answers it`, "info");
 		const isOneOfSeveral = [...this.agents.keys()].filter(isImplementerRole).length > 1;
-		this.seat.askPlanner(plannerQuestionPrompt(question.implementerAnswer, isOneOfSeveral ? name : undefined));
+		this.seat.askPlanner(plannerQuestionPrompt(question.implementerAnswer, isOneOfSeveral || question.role === "designer" ? name : undefined));
 	}
 
 	private askNextQuestion(): void {
@@ -650,7 +663,7 @@ export class BuildOrchestrator {
 	private handleSubagentSettled(role: SubagentRole, lastAnswer: string, isAborted: boolean): void {
 		const live = this.agents.get(role);
 		const state = this.seat.state();
-		if (!live || !isDelegatedState(state) || state.phase !== live.stage) return;
+		if (!live || live.condition === "answered" || !isDelegatedState(state) || state.phase !== live.stage) return;
 		if (isAborted) {
 			this.setCondition(role, "stopped");
 			return;
@@ -678,7 +691,7 @@ export class BuildOrchestrator {
 				this.askPlanner({ role: live.role, implementerAnswer: step.implementerAnswer });
 				return;
 			case "wait":
-				this.seat.notify(`/build paused: ${step.reason}. Alt+A: message it (m) or restart it (r).`, "warning");
+				this.seat.notify(`/build paused: ${step.reason}. /build implement restarts it; inside herdr you can also type into its pane.`, "warning");
 				return;
 			case "advance": {
 				this.recordStage(live, lastAnswer);
@@ -703,7 +716,7 @@ export class BuildOrchestrator {
 			case "ask-planner":
 				return;
 			case "wait":
-				this.seat.notify(`/build paused: ${step.reason}. Alt+A: message it (m) or restart it (r).`, "warning");
+				this.seat.notify(`/build paused: ${step.reason}. /build implement restarts it; inside herdr you can also type into its pane.`, "warning");
 				return;
 			case "advance":
 				void this.advance(state, step.next, stageAnswer);
@@ -716,18 +729,25 @@ export class BuildOrchestrator {
 		this.agents.clear();
 		this.reviewAnswers.clear();
 		this.clearQuestions();
+		let newCheckFailures = "";
+		if ((previous.phase === "implement" || previous.phase === "fix") && (next.phase === "review" || next.phase === "re-review")) {
+			const checkResult = await this.checkImplementersWork(previous, generation);
+			if (checkResult.kind !== "proceed") return;
+			newCheckFailures = checkResult.newFailures;
+		}
 		switch (next.phase) {
-			case "review": {
-				const ruleFiles = await this.seat.ruleFiles();
-				if (generation !== this.generation) return;
-				const reviewerSessions: Partial<Record<ReviewerVendor, string>> = {};
-				for (const vendor of REVIEWER_VENDORS) {
-					reviewerSessions[vendor] = this.createSession(next, { role: reviewerRole(vendor), reviewer: vendor });
+			case "review":
+				await this.beginReview(next, newCheckFailures, generation);
+				return;
+			case "design": {
+				const plan = this.seat.readPlan(next.planPath);
+				if (plan === undefined) {
+					this.seat.notify(`/build paused: cannot read the plan ${next.planPath}`, "error");
+					return;
 				}
-				const reviewState: DelegatedState = { ...next, reviewerSessions };
-				this.seat.enterPhase(reviewState);
-				const prompt = reviewPrompt(next.planPath, next.baseCommit, ruleFiles, next.issue, next.planIssue);
-				this.beginStage(reviewState, () => prompt);
+				const stoppedGeneration = await this.stopProcesses();
+				if (stoppedGeneration !== this.generation) return;
+				this.beginDesign(next, plan);
 				return;
 			}
 			case "implement": {
@@ -739,7 +759,9 @@ export class BuildOrchestrator {
 				const changeState: DelegatedState = { ...next, implementers: this.assignCrew(next, next.implementers ?? [], plan) };
 				this.seat.enterPhase(changeState);
 				const assignments = streamAssignments(changeState.implementers ?? [], plan);
-				this.beginStage(changeState, (seat) => planChangePrompt(next.planPath, plan, next.planIssue, stageAnswer, assignments.get(seat.role)));
+				const briefFor = this.implementationBriefFor;
+				this.implementationBriefFor = undefined;
+				this.beginStage(changeState, (seat) => briefFor?.(assignments.get(seat.role)) ?? implementationBrief(next.planPath, plan, [], next.issue, next.planIssue, assignments.get(seat.role), next.baseCommit));
 				return;
 			}
 			case "fix": {
@@ -750,15 +772,109 @@ export class BuildOrchestrator {
 			}
 			case "re-review":
 				this.seat.enterPhase(next);
-				this.beginStage(next, () => reReviewPrompt(next.baseCommit, this.latestFixReplies()));
+				this.beginStage(next, () => reReviewPrompt(next.baseCommit, this.latestFixReplies(), newCheckFailures));
 				return;
 			case "review-failed":
 				await this.finishRun(previous, next, "the re-review still has findings, and the fix round is used up");
 				return;
-			case "awaiting-pr":
-			case "awaiting-ship":
-				await this.finishRun(previous, next, "both reviewers passed it");
+			case "cleanup":
+				this.cleanupTask = this.cleanAndVerify(next);
+				await this.cleanupTask;
 				return;
+		}
+	}
+
+	private async checkImplementersWork(
+		state: Extract<DelegatedState, { phase: "implement" | "fix" }>,
+		generation: number,
+	): Promise<{ kind: "fixing" } | { kind: "stale" } | { kind: "proceed"; newFailures: string }> {
+		const signal = new AbortController().signal;
+		let newFailures = "";
+		try {
+			const checkRun = await this.seat.runChecks(signal);
+			if (generation !== this.generation) return { kind: "stale" };
+			if (checkRun.kind === "untrusted") {
+				this.seat.notify("Checks after the implementers skipped: the project is not trusted", "info");
+				return { kind: "proceed", newFailures };
+			}
+			if (checkRun.kind === "no-checks") return { kind: "proceed", newFailures };
+			const changedFiles = await this.seat.changedFiles(state.baseCommit, signal);
+			if (generation !== this.generation) return { kind: "stale" };
+			const failures = findNewCheckFailures(state.checkBaseline ?? [], checkRun.results, changedFiles);
+			newFailures = describeNewCheckFailures(failures);
+			if (failures.length === 0) return { kind: "proceed", newFailures };
+			const checkNames = failures.map((failure) => failure.name).join(", ");
+			if (state.checksFixRequested) {
+				this.seat.notify(`Checks still fail after the fix round (${checkNames}); the reviewers see them`, "warning");
+				return { kind: "proceed", newFailures };
+			}
+			const plan = this.seat.readPlan(state.planPath);
+			const assignments = streamAssignments(state.implementers ?? [], plan ?? "");
+			const fixState = { ...state, checksFixRequested: true };
+			this.seat.enterPhase(fixState);
+			this.seat.notify(`New check failures since the run began (${checkNames}); the implementers fix them before the review`, "info");
+			this.beginStage(fixState, (seat) => checkFailuresFixPrompt(newFailures, assignments.get(seat.role)));
+			return { kind: "fixing" };
+		} catch (error) {
+			if (generation !== this.generation) return { kind: "stale" };
+			this.seat.notify(`Could not run the checks after the implementers: ${(error as Error).message}; the review starts without them`, "warning");
+			return { kind: "proceed", newFailures: "" };
+		}
+	}
+
+	private async beginReview(state: Extract<DelegatedState, { phase: "review" }>, newCheckFailures = "", expectedGeneration = this.generation): Promise<void> {
+		const ruleFiles = await this.seat.ruleFiles();
+		if (expectedGeneration !== this.generation) return;
+		const lineup = this.seat.reviewerLineup();
+		if (!lineup.ok) {
+			// Sessions of an earlier review round must not be resumed as if this review had started.
+			const { reviewerSessions: _earlierReviewers, ...pausedReview } = state;
+			this.seat.enterPhase(pausedReview);
+			this.seat.callUser(`/build paused before the review: ${lineup.error}. /build implement starts the review once a reviewer model is available.`);
+			return;
+		}
+		const reviewerSessions: Partial<Record<ReviewerVendor, string>> = {};
+		for (const vendor of lineup.vendors) {
+			reviewerSessions[vendor] = this.createSession(state, { role: reviewerRole(vendor), reviewer: vendor });
+		}
+		const reviewState: DelegatedState = { ...state, reviewerSessions };
+		this.seat.enterPhase(reviewState);
+		const prompt = reviewPrompt(state.planPath, state.baseCommit, ruleFiles, state.issue, state.planIssue, newCheckFailures);
+		this.beginStage(reviewState, () => prompt);
+	}
+
+	retryCleanup(): ActionRefusal {
+		const state = this.seat.state();
+		if (state.phase !== "cleanup" && state.phase !== "cleanup-failed") return "No contract cleanup to retry";
+		if (this.cleanupController) return "Contract cleanup is already running";
+		this.cleanupTask = this.cleanAndVerify(state);
+		return undefined;
+	}
+
+	private async cleanAndVerify(work: FeatureWork): Promise<void> {
+		const controller = new AbortController();
+		this.cleanupController = controller;
+		// Enter the gate before awaiting pane shutdown: shipping remains disabled throughout.
+		const next: FeatureState = { phase: "cleanup", ...featureWorkOf(work) };
+		this.seat.enterPhase(next);
+		const generation = await this.stopProcesses(false);
+		try {
+			if (generation !== this.generation || controller.signal.aborted) return;
+			const failure = await this.seat.finalizeContracts(work, controller.signal);
+			if (generation !== this.generation || controller.signal.aborted) return;
+			if (failure) {
+				this.seat.enterPhase({ phase: "cleanup-failed", ...featureWorkOf(work), failure });
+				this.seat.callUser(`Contract cleanup blocked shipping: ${failure}. /build implement retries; /build implement retries, sends it to a fix round or reviews again.`);
+				return;
+			}
+			await this.finishRun(next, releaseStateOf(work), "every reviewer passed; temporary contracts removed and checks passed");
+		} catch (error) {
+			if (generation !== this.generation || controller.signal.aborted) return;
+			const failure = error instanceof Error ? error.message : String(error);
+			this.seat.enterPhase({ phase: "cleanup-failed", ...featureWorkOf(work), failure });
+			this.seat.callUser(`Contract cleanup failed: ${failure}. /build implement retries.`);
+		} finally {
+			if (this.cleanupController === controller) this.cleanupController = undefined;
 		}
 	}
 

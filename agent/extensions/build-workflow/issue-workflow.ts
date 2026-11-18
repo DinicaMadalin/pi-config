@@ -3,9 +3,10 @@
  * planning; after a passing review, /issue pr commits, pushes and opens a draft PR that fixes the issue.
  */
 import type { ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
-import { createIssueBranch, fetchIssue, openDraftPullRequest, parseIssueArgument } from "./github-issue.ts";
+import { type BranchElsewhere, createIssueBranch, fetchIssue, openDraftPullRequest, parseIssueArgument } from "./github-issue.ts";
 import { useAutoModel } from "./planner-model.ts";
 import type { PlannerSession } from "./planner-session.ts";
+import { createRunWorktree } from "./run-worktree.ts";
 import { issueInvestigationPrompt } from "./workflow-prompts.ts";
 
 export const ISSUE_USAGE = "Usage: /issue <github issue url | #123 | 123> | /issue pr";
@@ -22,14 +23,24 @@ export async function startIssueWorkflow(session: PlannerSession, issueText: str
 		return;
 	}
 	if (!(await useAutoModel(session.pi, ctx))) return;
-	const issueRef = await createIssueBranch(session.run, issue.value);
+	const run = session.runInSessionDir;
+	const herdr = session.herdr;
+	const inWorktree: BranchElsewhere | undefined = herdr
+		? async (branch, startPoint) => {
+				const created = await createRunWorktree(run, herdr, { name: branch, startPoint, newBranch: branch });
+				return created.ok ? { ok: true, value: { worktree: created.value } } : created;
+			}
+		: undefined;
+	const issueRef = await createIssueBranch(run, issue.value, inWorktree);
 	if (!issueRef.ok) {
 		ctx.ui.notify(issueRef.error, "error");
 		return;
 	}
-	ctx.ui.notify(`On new branch ${issueRef.value.branch} from origin/${issueRef.value.baseBranch}`, "info");
+	const { branch, baseBranch, worktree } = issueRef.value;
+	const where = worktree ? ` in worktree ${worktree.path} (herdr workspace ${worktree.workspaceId})` : "";
+	ctx.ui.notify(`On new branch ${branch} from origin/${baseBranch}${where}`, "info");
 	session.enterPhase({ phase: "plan", task: `Fix issue #${issue.value.number}: ${issue.value.title}`, issue: issueRef.value });
-	session.pi.sendUserMessage(issueInvestigationPrompt(issue.value, issueRef.value.branch));
+	session.pi.sendUserMessage(issueInvestigationPrompt(issue.value, branch, worktree?.path));
 }
 
 /** Prefills /issue pr, so opening the PR is one Enter away but still your decision. */
@@ -40,7 +51,11 @@ export function promptForPullRequest(session: PlannerSession): void {
 	session.notify(`Review passed. Press Enter to commit, push ${workflow.issue.branch} and open a draft PR fixing #${workflow.issue.number}.`, "info");
 }
 
-export async function openPullRequest(session: PlannerSession, ctx: ExtensionCommandContext, endRun: (summary: string) => void): Promise<void> {
+export async function openPullRequest(
+	session: PlannerSession,
+	ctx: ExtensionCommandContext,
+	endRun: (summary: string, isWorkReleased: boolean) => void,
+): Promise<void> {
 	const workflow = session.workflow;
 	if (workflow.phase !== "awaiting-pr") {
 		ctx.ui.notify("No reviewed issue fix to open a PR for; /issue <issue> starts one", "warning");
@@ -53,5 +68,5 @@ export async function openPullRequest(session: PlannerSession, ctx: ExtensionCom
 		ctx.ui.notify(`${pullRequest.error}. Fix it and run /issue pr again.`, "error");
 		return;
 	}
-	endRun(`draft PR opened: ${pullRequest.value}`);
+	endRun(`draft PR opened: ${pullRequest.value}`, true);
 }

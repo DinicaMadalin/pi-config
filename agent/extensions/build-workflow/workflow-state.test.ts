@@ -4,8 +4,8 @@ import {
 	canEditFiles,
 	canPlannerEditFiles,
 	type FeatureWork,
+	featureWorkOf,
 	findCrew,
-	findLastRunPlan,
 	findPlannerWorkflowState,
 	findWorkflowState,
 	mergeReviews,
@@ -22,11 +22,12 @@ import {
 
 const work = { planPath: "/repo/.scratch/handoffs/plan.md", baseCommit: "abc123" };
 
-test("plans and reviews on the expert tier; implementing and fixing are routed by difficulty", () => {
+test("plans on the expert tier, reviews on the complex tier; implementing and fixing are routed by difficulty", () => {
 	const expert = { route: "tier", tier: "expert" };
+	const complex = { route: "tier", tier: "complex" };
 	assert.deepEqual(routeForPhase("plan"), expert);
-	assert.deepEqual(routeForPhase("review"), expert);
-	assert.deepEqual(routeForPhase("re-review"), expert);
+	assert.deepEqual(routeForPhase("review"), complex);
+	assert.deepEqual(routeForPhase("re-review"), complex);
 	assert.deepEqual(routeForPhase("implement"), { route: "difficulty" });
 	assert.deepEqual(routeForPhase("fix"), { route: "difficulty" });
 	assert.deepEqual(routeForPhase("idle"), { route: "normal" });
@@ -52,15 +53,6 @@ test("a stored state with a bad shape reads as idle instead of breaking the run"
 	const broken = [{ type: "custom", customType: WORKFLOW_STATE_ENTRY_TYPE, data: { phase: "implement" } }];
 	assert.deepEqual(findWorkflowState(broken), { phase: "idle" });
 	assert.deepEqual(findWorkflowState([{ type: "custom", customType: WORKFLOW_STATE_ENTRY_TYPE, data: { phase: "dancing" } }]), { phase: "idle" });
-});
-
-test("the last agreed plan of the session is found after the run went idle", () => {
-	const entries = [
-		{ type: "custom", customType: WORKFLOW_STATE_ENTRY_TYPE, data: { phase: "awaiting-implementation", task: "x", planPath: "/p.md" } },
-		{ type: "custom", customType: WORKFLOW_STATE_ENTRY_TYPE, data: { phase: "idle" } },
-	];
-	assert.deepEqual(findLastRunPlan(entries), { task: "x", planPath: "/p.md" });
-	assert.equal(findLastRunPlan([]), undefined);
 });
 
 test("a finished implementation goes to review", () => {
@@ -101,10 +93,10 @@ test("the last marker wins and markdown around it is ignored", () => {
 	assert.equal(stepAfterTurn({ phase: "implement", ...work }, "Done.\n`IMPLEMENTATION: done`").kind, "advance");
 });
 
-test("a passing review waits for the user to ship", () => {
+test("a passing review goes to the contract cleanup gate before shipping", () => {
 	assert.deepEqual(stepAfterTurn({ phase: "review", ...work }, "All good.\nREVIEW_VERDICT: pass"), {
 		kind: "advance",
-		next: { phase: "awaiting-ship", ...work },
+		next: { phase: "cleanup", ...work },
 	});
 	assert.deepEqual(routeForPhase("awaiting-ship"), { route: "normal" });
 });
@@ -113,6 +105,21 @@ test("the plan issue is carried to the next phase", () => {
 	const planIssue = { number: 7, title: "Add export", url: "https://github.com/o/r/issues/7" };
 	const next = stepAfterTurn({ phase: "implement", ...work, planIssue }, "IMPLEMENTATION: done");
 	assert.deepEqual(next, { kind: "advance", next: { phase: "review", ...work, planIssue } });
+});
+
+test("a finished design goes to the implementers; a blocked or unmarked one asks the planner", () => {
+	assert.deepEqual(stepAfterTurn({ phase: "design", ...work }, "Stubs and tests written.\nDESIGN: done"), { kind: "advance", next: { phase: "implement", ...work } });
+	const question = "DESIGN: blocked: should totals round per line?";
+	assert.deepEqual(stepAfterTurn({ phase: "design", ...work }, question), { kind: "ask-planner", implementerAnswer: question });
+	assert.equal(stepAfterTurn({ phase: "design", ...work }, "Still writing tests").kind, "ask-planner");
+});
+
+test("the designer may edit files, and a plan change during cleanup goes through a change round", () => {
+	assert.equal(canEditFiles("design"), true);
+	assert.equal(canEditFiles("cleanup"), false);
+	assert.equal(planChangeReaction("design"), "tell-implementer");
+	assert.equal(planChangeReaction("cleanup"), "change-round");
+	assert.equal(planChangeReaction("cleanup-failed"), "change-round");
 });
 
 test("review findings get exactly one fix round and a re-review", () => {
@@ -137,10 +144,10 @@ test("a review without a verdict waits instead of guessing", () => {
 
 const issue = { number: 42, title: "Crash on empty cart", url: "https://github.com/o/r/issues/42", branch: "issue-42-crash-on-empty-cart", baseBranch: "main" };
 
-test("a passing review of issue work waits for the user to open the PR", () => {
+test("a passing review of issue work also goes through contract cleanup, keeping its issue", () => {
 	assert.deepEqual(stepAfterTurn({ phase: "review", ...work, issue }, "REVIEW_VERDICT: pass"), {
 		kind: "advance",
-		next: { phase: "awaiting-pr", ...work, issue },
+		next: { phase: "cleanup", ...work, issue },
 	});
 	assert.equal(stepAfterTurn({ phase: "re-review", ...work, issue }, "REVIEW_VERDICT: pass").kind, "advance");
 });
@@ -176,9 +183,9 @@ test("a plan saved again reacts to the phase the run is in", () => {
 	assert.equal(planChangeReaction("idle"), "offer-new-run");
 });
 
-test("a plan change held for after the review sends the work back to the implementer, whatever the verdict", () => {
+test("a plan change held for after the review sends the work back to the designer, whatever the verdict", () => {
 	const step = stepAfterTurn({ phase: "review", ...work, planChangeAfterReview: true }, "REVIEW_VERDICT: pass");
-	assert.deepEqual(step, { kind: "advance", next: { phase: "implement", ...work } });
+	assert.deepEqual(step, { kind: "advance", next: { phase: "design", ...work } });
 });
 
 test("each plan change counts a new revision", () => {
@@ -213,9 +220,9 @@ test("a reviewer without a verdict holds the review even when the other passed",
 	assert.equal(stepAfterTurn({ phase: "review", ...work }, merged).kind, "wait");
 });
 
-test("each reviewer routes to the expert tier with its own vendor's models first", () => {
-	assert.deepEqual(reviewerRoute("openai"), { route: "tier", tier: "expert", preferredProvider: "openai" });
-	assert.deepEqual(reviewerRoute("anthropic"), { route: "tier", tier: "expert", preferredProvider: "anthropic" });
+test("each reviewer routes to the complex tier with its own vendor's models first", () => {
+	assert.deepEqual(reviewerRoute("openai"), { route: "tier", tier: "complex", preferredProvider: "openai" });
+	assert.deepEqual(reviewerRoute("anthropic"), { route: "tier", tier: "complex", preferredProvider: "anthropic" });
 });
 
 const stateEntry = (data: unknown) => ({ type: "custom", customType: WORKFLOW_STATE_ENTRY_TYPE, data });
@@ -257,4 +264,10 @@ test("each implementer gets its own section of the planner's fix steps", () => {
 	assert.equal(fixStepsFor(steps, "Implementer 2"), "1. b.ts:9 add the test");
 	assert.match(fixStepsFor(steps, "Implementer 3"), /no fix steps for you/);
 	assert.equal(fixStepsFor("1. a.ts:3 use >=\n### Notes\nx", "Implementer"), "1. a.ts:3 use >=\n### Notes\nx", "unnamed sections go to everyone");
+});
+
+test("the run's check baseline lasts across phases; one-stage flags do not", () => {
+	const checkBaseline = [{ name: "lint", command: "npm run lint", passed: false, outputTail: "old.ts: e1" }];
+	const implementing = { phase: "implement" as const, ...work, checkBaseline, checksFixRequested: true };
+	assert.deepEqual(featureWorkOf(implementing), { ...work, checkBaseline });
 });

@@ -11,7 +11,7 @@ export const ROUTED_THINKING_LEVELS = ["off", "minimal", "low", "medium", "high"
 export type RoutedThinkingLevel = (typeof ROUTED_THINKING_LEVELS)[number];
 
 export interface TierPolicy {
-	/** Preferred models as "provider/id", best first. Unavailable ones are skipped. */
+	/** Allowed models as "provider/id", tried in order; unavailable entries are skipped, and no other catalog models are considered. */
 	models: string[];
 	/** Used only when Jev cannot rate thinking depth, and for compaction summaries. */
 	thinkingLevel: RoutedThinkingLevel;
@@ -104,48 +104,28 @@ function canReadImages(model: Model<Api>): boolean {
 	return model.input.includes("image");
 }
 
-/** The provider's models first, in their tier order, then the tier's other models as fallbacks. */
+/** The provider's configured models first, in their tier order, then the tier's remaining configured models. */
 export function preferProvider(policy: TierPolicy, provider: string): TierPolicy {
 	const isFromProvider = (key: string) => key.startsWith(`${provider}/`);
 	const models = [...policy.models.filter(isFromProvider), ...policy.models.filter((key) => !isFromProvider(key))];
 	return { ...policy, models };
 }
 
-/** Price per million output tokens; the best available proxy for capability across providers. */
-function outputPrice(model: Model<Api>): number {
-	return model.cost?.output ?? 0;
-}
-
-/**
- * Fallback when no preferred model of a tier is logged in: rank the logged-in models by price
- * and take the one at the tier's position (trivial = cheapest, expert = most expensive).
- */
-function pickByPriceRank(candidates: readonly Model<Api>[], tier: DifficultyTier): Model<Api> | undefined {
-	if (candidates.length === 0) return undefined;
-	const byPrice = [...candidates].sort((left, right) => outputPrice(left) - outputPrice(right));
-	const tierPosition = DIFFICULTY_TIERS.indexOf(tier) / (DIFFICULTY_TIERS.length - 1);
-	return byPrice[Math.round(tierPosition * (byPrice.length - 1))];
-}
-
 export interface ModelChoice {
 	model: Model<Api>;
-	/** "preferred" when it came from the tier list, "price-rank" when the fallback picked it. */
-	source: "preferred" | "price-rank";
 }
 
-/** First logged-in preferred model of the tier, else the price-ranked fallback. */
+/** First logged-in model explicitly listed for the tier; never falls back to the provider's broader catalog. */
 export function pickModelForTier(
 	availableModels: readonly Model<Api>[],
 	policy: TierPolicy,
-	tier: DifficultyTier,
 	needsImageInput: boolean,
 ): ModelChoice | undefined {
 	const usable = needsImageInput ? availableModels.filter(canReadImages) : availableModels;
 	const usableByKey = new Map(usable.map((model) => [modelKey(model), model]));
-	for (const preferredKey of policy.models) {
-		const preferred = usableByKey.get(preferredKey);
-		if (preferred) return { model: preferred, source: "preferred" };
+	for (const configuredModelKey of policy.models) {
+		const configuredModel = usableByKey.get(configuredModelKey);
+		if (configuredModel) return { model: configuredModel };
 	}
-	const ranked = pickByPriceRank(usable, tier);
-	return ranked ? { model: ranked, source: "price-rank" } : undefined;
+	return undefined;
 }

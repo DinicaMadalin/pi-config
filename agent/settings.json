@@ -1,5 +1,5 @@
 {
-  "lastChangelogVersion": "1.5.0",
+  "lastChangelogVersion": "1.5.2",
   "defaultProvider": "auto",
   "defaultModel": "auto",
   "showHardwareCursor": true,
@@ -10,19 +10,17 @@
   "theme": "system",
   "packages": [
     "npm:billion-context",
-    "npm:pi-subagents",
     "npm:pi-jev",
-    "npm:@aliou/pi-guardrails",
-    "npm:@earendil-works/pi-voice",
-    "npm:@rahularya01/pi-cursor"
+    "npm:@aliou/pi-guardrails"
   ],
   "fullscreenScrollbar": "hidden",
   "fullscreenWheelScrollLines": "auto",
   "treeFilterMode": "default",
   "defaultProjectTrust": "ask",
   "extensionChangelogVersions": {
-    "{\"source\":\"npm:pi-subagents\",\"scope\":\"user\"}": "0.84.0",
     "{\"source\":\"npm:pi-jev\",\"scope\":\"user\"}": "0.8.0",
-    "{\"source\":\"npm:@rahularya01/pi-cursor\",\"scope\":\"user\"}": "1.4.39"
-  }
+    "{\"source\":\"npm:@aliou/pi-guardrails\",\"scope\":\"user\"}": "0.23.0"
+  },
+  "deviceId": "84055466-d789-4406-a6e4-43b517d96328",
+  "hideThinkingBlock": true
 }

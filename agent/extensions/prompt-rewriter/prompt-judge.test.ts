@@ -21,6 +21,7 @@ test("without Jev the rewriter decides whether to ask", () => {
 
 test("each failed fidelity check names its problem; unanswered checks pass", () => {
 	assert.deepEqual(fidelityProblems({ keepsEverything: 0.9, addsNothing: 0.2 }), ["may have added something you did not ask for"]);
+	assert.deepEqual(fidelityProblems({ isReadyToSend: 0.2 }), ["may explain or summarize the request instead of rewriting it as a message to the agent"]);
 	assert.deepEqual(fidelityProblems({ keepsEverything: 0.4, addsNothing: 0.9, keepsStance: 0.1 }), [
 		"may have dropped a request or detail",
 		"may have turned a maybe or a question into an order",

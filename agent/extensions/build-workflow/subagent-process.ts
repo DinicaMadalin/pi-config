@@ -9,7 +9,7 @@ import { readFileSync, writeFileSync } from "node:fs";
 import { ROUTE_DECISION_ENTRY_TYPE } from "../auto-model/route-decision.ts";
 import { AgentTracker, type AssistantMessageLike } from "./agent-activity.ts";
 import { type DifficultyTier, MAX_TIER_ENV_VAR } from "../auto-model/difficulty-tiers.ts";
-import { SUBAGENT_ENV_VAR } from "./workflow-state.ts";
+import { PROJECT_TRUST_ENV_VAR, SUBAGENT_ENV_VAR } from "./workflow-state.ts";
 
 const SESSION_FORMAT_VERSION = 3;
 const STOP_GRACE_MS = 3000;
@@ -25,13 +25,19 @@ export interface SubagentDialogs {
 export interface SubagentOptions {
 	/** Shown in dialogs and errors, e.g. "Implementer". */
 	name: string;
+	/** The role as a herdr agent name, e.g. "implementer-2"; herdr shows "pi" for every agent without one. */
+	agentName?: string;
 	cwd: string;
 	sessionPath: string;
 	dialogs: SubagentDialogs;
 	/** The strongest tier its model may come from; unset routes it freely. */
 	maxTier?: DifficultyTier;
+	/** Your trust decision for the project; the subagent takes it over instead of asking in its worktree. */
+	isProjectTrusted: boolean;
 	onSettled: (lastAnswer: string, isAborted: boolean) => void;
 	onExit: (reason: string) => void;
+	/** A herdr subagent shows a dialog in its own pane; this tells you it waits there. */
+	onWaitingForUser?: () => void;
 }
 
 interface SessionCustomEntry {
@@ -61,6 +67,19 @@ export function createSubagentSessionFile(
 	writeFileSync(sessionPath, `${lines.join("\n")}\n`, { flag: "wx" });
 }
 
+/**
+ * Points the session's header at the folder the subagent now works in. A seat's session outlives a run, and the
+ * run's worktree may be gone by the next one; Pi would then stop at a "session cwd does not exist" prompt.
+ */
+export function moveSessionToCwd(sessionPath: string, cwd: string): void {
+	const content = readFileSync(sessionPath, "utf8");
+	const headerEnd = content.indexOf("\n");
+	const header = parseJsonLine(headerEnd === -1 ? content : content.slice(0, headerEnd)) as { type?: string; cwd?: string } | undefined;
+	if (header?.type !== "session" || header.cwd === cwd) return;
+	const rest = headerEnd === -1 ? "\n" : content.slice(headerEnd);
+	writeFileSync(sessionPath, JSON.stringify({ ...header, cwd }) + rest);
+}
+
 /** A JSON line, or undefined when it is not one, e.g. a line the child is still writing. */
 function parseJsonLine(line: string): unknown {
 	try {
@@ -72,7 +91,7 @@ function parseJsonLine(line: string): unknown {
 }
 
 /** The auto model's latest route reason in a session file; undefined when it never routed there. */
-function readRouteReason(sessionPath: string): string | undefined {
+export function readRouteReason(sessionPath: string): string | undefined {
 	let content: string;
 	try {
 		content = readFileSync(sessionPath, "utf8");
@@ -90,10 +109,20 @@ function readRouteReason(sessionPath: string): string | undefined {
 	return undefined;
 }
 
-/** The same Pi binary and version as the parent: its runtime and entry script. */
-function piCommand(): { command: string; args: string[] } {
-	const entryScript = process.argv[1];
-	return entryScript ? { command: process.execPath, args: [entryScript] } : { command: "pi", args: [] };
+// A Bun-compiled binary reports its embedded entry as argv[1] ("/$bunfs/root/pi", "B:/~BUN/root/pi.exe" on
+// Windows); passed back to the binary, it is read as the first prompt and sent to the subagent.
+const BUN_EMBEDDED_ENTRY = /^(\/\$bunfs\/|[A-Z]:[\\/]~BUN[\\/])/;
+
+/** The same Pi binary and version as the parent: its runtime, plus its entry script when it runs as a script. */
+export function piCommand(): { command: string; args: string[] } {
+	return piCommandFor(process.argv, process.execPath);
+}
+
+export function piCommandFor(argv: readonly string[], execPath: string): { command: string; args: string[] } {
+	const entryScript = argv[1];
+	if (!entryScript) return { command: "pi", args: [] };
+	if (BUN_EMBEDDED_ENTRY.test(entryScript)) return { command: execPath, args: [] };
+	return { command: execPath, args: [entryScript] };
 }
 
 interface UiRequest {
@@ -118,12 +147,20 @@ export interface Subagent {
 	sendUserMessage(text: string): void;
 	abortTurn(): void;
 	stop(): Promise<void>;
+	/** Set for a subagent in a herdr pane: the pane and herdr's view of the agent in it. */
+	readonly pane?: SubagentPane;
+}
+
+export interface SubagentPane {
+	id: string;
+	/** herdr's state of the agent: working, blocked (a dialog waits for you), idle, … */
+	status: string;
 }
 
 export type LaunchSubagent = (options: SubagentOptions) => Subagent;
 
-function subagentEnvironment(maxTier: DifficultyTier | undefined): NodeJS.ProcessEnv {
-	const env: NodeJS.ProcessEnv = { ...process.env, [SUBAGENT_ENV_VAR]: "1" };
+export function subagentEnvironment(maxTier: DifficultyTier | undefined, isProjectTrusted: boolean): NodeJS.ProcessEnv {
+	const env: NodeJS.ProcessEnv = { ...process.env, [SUBAGENT_ENV_VAR]: "1", [PROJECT_TRUST_ENV_VAR]: isProjectTrusted ? "1" : "0" };
 	if (maxTier) env[MAX_TIER_ENV_VAR] = maxTier;
 	else delete env[MAX_TIER_ENV_VAR];
 	return env;
@@ -162,7 +199,7 @@ export class SubagentProcess implements Subagent {
 		const { command, args } = piCommand();
 		const child = spawn(command, [...args, "--mode", "rpc", "--session", this.sessionPath, "--model", "auto/auto"], {
 			cwd: this.options.cwd,
-			env: subagentEnvironment(this.maxTier),
+			env: subagentEnvironment(this.maxTier, this.options.isProjectTrusted),
 			stdio: ["pipe", "pipe", "pipe"],
 		});
 		this.child = child;

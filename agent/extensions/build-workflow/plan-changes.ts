@@ -7,7 +7,7 @@ import type { BuildOrchestrator } from "./build-orchestrator.ts";
 import { planTitle, updatePlanIssue } from "./github-issue.ts";
 import type { PlannerSession } from "./planner-session.ts";
 import type { StartDialog } from "./start-dialog.ts";
-import { findLastRunPlan, isFeatureState, planChangeReaction, type WorkflowState } from "./workflow-state.ts";
+import { IDLE_WORKFLOW, isFeatureState, planChangeReaction, type WorkflowState } from "./workflow-state.ts";
 
 const REVIEW_CHANGE_CHOICES = {
 	afterReview: "Let the review finish, then the implementer applies the change together with its findings",
@@ -50,7 +50,7 @@ export class PlanChanges {
 	}
 
 	/**
-	 * Opens the run's plan in an editor (Alt+A, p). Saving a changed plan is a plan change like the planner
+	 * Opens the run's plan in an editor (/build plan). Saving a changed plan is a plan change like the planner
 	 * saving it; while the planner works, it is handled when its turn settles.
 	 */
 	async editPlanByHand(isPlannerIdle: boolean): Promise<void> {
@@ -96,7 +96,7 @@ export class PlanChanges {
 				await this.askAboutRunningReview();
 				return;
 			case "change-round":
-				this.report(await this.orchestrator.startChangeRound(), "Plan changed: the implementer applies it, then both reviewers review again");
+				this.report(await this.orchestrator.startChangeRound(), "Plan changed: the implementer applies it, then every reviewer reviews again");
 				await this.updatePlanIssue();
 				return;
 			case "offer-new-run":
@@ -116,14 +116,12 @@ export class PlanChanges {
 		await this.updatePlanIssue();
 	}
 
-	/** No run is on: a plan saved after a /build run in this session may start a new run. */
+	/** No run is on: a plan saved in a normal chat offers to start a build on it. */
 	private async offerNewRun(planPath: string): Promise<void> {
-		if (!this.session.hasUI || !findLastRunPlan(this.session.context.sessionManager.getBranch())) return;
+		if (!this.session.hasUI || this.session.workflow.phase !== "idle") return;
 		const plan = this.session.readPlan(planPath);
 		if (plan === undefined) return;
-		const isStarting = await this.session.context.ui.confirm("Plan saved", `${planPath}\n\nStart a new /build run from this plan?`);
-		if (!isStarting || this.session.workflow.phase !== "idle") return;
-		this.session.enterPhase({ phase: "awaiting-implementation", task: planTitle(plan), planPath });
+		this.session.enterPhase({ phase: "awaiting-implementation", task: planTitle(plan), planPath, startedFromChat: true });
 		await this.startDialog.ask();
 	}
 
