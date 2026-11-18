@@ -44,7 +44,7 @@ export class BuildSpace {
 		}
 	}
 
-	/** Opens the run's Diff tab and draws its next frame; called on each Diff tab tick. */
+	/** Opens the run's Diff tab and draws its next frame; called on each Diff tab tick once the review passed. */
 	refreshDiff(view: ScreenView): void {
 		const worktree = this.currentWorktree();
 		if (!worktree) return;
@@ -59,6 +59,12 @@ export class BuildSpace {
 		} catch (error) {
 			this.reportError(`Could not draw the Diff tab: ${(error as Error).message}`);
 		}
+	}
+
+	/** Closes the Diff tab while the run is not past its review, e.g. after a failed cleanup went back to a fix round. */
+	hideDiff(): void {
+		if (this.diffTab.workspaceId === undefined) return;
+		this.diffTab.close().catch((error: unknown) => this.reportError(`Could not close the Diff tab: ${(error as Error).message}`));
 	}
 
 	/** Pi reloads or quits: stop serving the tabs; their clients wait for the next planner. */

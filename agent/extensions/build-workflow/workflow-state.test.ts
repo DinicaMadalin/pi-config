@@ -15,6 +15,7 @@ import {
 	reviewerRoute,
 	routeForPhase,
 	fixStepsFor,
+	hasPassedReview,
 	stepAfterTurn,
 	WORKFLOW_STATE_ENTRY_TYPE,
 	withPlanRevision,
@@ -22,12 +23,11 @@ import {
 
 const work = { planPath: "/repo/.scratch/handoffs/plan.md", baseCommit: "abc123" };
 
-test("plans on the expert tier, reviews on the complex tier; implementing and fixing are routed by difficulty", () => {
+test("plans and reviews on the expert tier; implementing and fixing are routed by difficulty", () => {
 	const expert = { route: "tier", tier: "expert" };
-	const complex = { route: "tier", tier: "complex" };
 	assert.deepEqual(routeForPhase("plan"), expert);
-	assert.deepEqual(routeForPhase("review"), complex);
-	assert.deepEqual(routeForPhase("re-review"), complex);
+	assert.deepEqual(routeForPhase("review"), expert);
+	assert.deepEqual(routeForPhase("re-review"), expert);
 	assert.deepEqual(routeForPhase("implement"), { route: "difficulty" });
 	assert.deepEqual(routeForPhase("fix"), { route: "difficulty" });
 	assert.deepEqual(routeForPhase("idle"), { route: "normal" });
@@ -220,9 +220,9 @@ test("a reviewer without a verdict holds the review even when the other passed",
 	assert.equal(stepAfterTurn({ phase: "review", ...work }, merged).kind, "wait");
 });
 
-test("each reviewer routes to the complex tier with its own vendor's models first", () => {
-	assert.deepEqual(reviewerRoute("openai"), { route: "tier", tier: "complex", preferredProvider: "openai" });
-	assert.deepEqual(reviewerRoute("anthropic"), { route: "tier", tier: "complex", preferredProvider: "anthropic" });
+test("the reviewer routes to the expert tier with its vendor's models first", () => {
+	assert.deepEqual(reviewerRoute("openai"), { route: "tier", tier: "expert", preferredProvider: "openai" });
+	assert.deepEqual(reviewerRoute("anthropic"), { route: "tier", tier: "expert", preferredProvider: "anthropic" });
 });
 
 const stateEntry = (data: unknown) => ({ type: "custom", customType: WORKFLOW_STATE_ENTRY_TYPE, data });
@@ -270,4 +270,9 @@ test("the run's check baseline lasts across phases; one-stage flags do not", () 
 	const checkBaseline = [{ name: "lint", command: "npm run lint", passed: false, outputTail: "old.ts: e1" }];
 	const implementing = { phase: "implement" as const, ...work, checkBaseline, checksFixRequested: true };
 	assert.deepEqual(featureWorkOf(implementing), { ...work, checkBaseline });
+});
+
+test("the review counts as passed only from the cleanup on, never after a failed re-review", () => {
+	for (const phase of ["cleanup", "cleanup-failed", "awaiting-pr", "awaiting-ship"] as const) assert.equal(hasPassedReview(phase), true, phase);
+	for (const phase of ["idle", "plan", "awaiting-implementation", "design", "implement", "review", "fix", "re-review", "review-failed"] as const) assert.equal(hasPassedReview(phase), false, phase);
 });

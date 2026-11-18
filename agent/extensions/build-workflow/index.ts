@@ -1,6 +1,6 @@
 /**
  * /build: the expert plans with you in this session; saving an agreed plan in a normal chat opens the start dialog.
- * Then a designer prepares contracts, implementers build, and one complex-tier reviewer per available vendor reviews it.
+ * Then a designer prepares contracts, implementers build, and one expert-tier reviewer reviews it.
  * fix round and a re-review. You stay in this session the whole time.
  *
  * - /build <task>: the expert investigates and plans; nothing is edited until you agree and it saves the plan.
@@ -325,7 +325,7 @@ export default function (pi: ExtensionAPI) {
 
 	pi.registerCommand("build", {
 		description:
-			"Plan (expert) -> designer -> implementers -> complex-tier reviewer(s) for available vendors -> ship: /build <task> | implement | plan | ship | status | stop | here | back",
+			"Plan (expert) -> designer -> implementers -> expert-tier reviewer -> ship: /build <task> | implement | plan | ship | status | stop | here | back",
 		handler: async (args, ctx) => {
 			const argument = args.trim();
 			const workflow = session.workflow;

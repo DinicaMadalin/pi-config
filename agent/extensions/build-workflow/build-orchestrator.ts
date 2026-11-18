@@ -1,6 +1,6 @@
 /**
  * Runs the delegated part of a /build run: the implementers (one per work stream of the plan, building in parallel)
- * and one complex-tier reviewer per available vendor (Claude and/or OpenAI) is a subagent process, the planner
+ * and one expert-tier reviewer is a subagent process, the planner
  * stays in your session. Moves the run along when every subagent of a stage is done, sends the implementers'
  * questions to the planner one at a time and each answer back to the one that asked, applies plan changes, lets
  * you stop, restart or message each agent, and posts a report when the run ends. The implementers stay with the

@@ -603,12 +603,12 @@ test("only the vendor with a usable complex model reviews, and its pass is enoug
 
 test("without any usable reviewer model the run pauses before the review, and resuming starts it once one is there", async () => {
 	const run = startedRun();
-	run.recorded.lineup = { ok: false, error: "No complex-tier reviewer model is available" };
+	run.recorded.lineup = { ok: false, error: "No expert-tier reviewer model is available" };
 	run.agent("Implementer").settle("Added it.\nIMPLEMENTATION: done");
 	await settleAsync();
 	assert.equal(phaseOf(run.recorded), "review");
 	assert.ok(!run.launched.some((subagent) => subagent.name.endsWith("reviewer")), "no reviewer started");
-	assert.ok(run.recorded.notices.some((notice) => notice.includes("No complex-tier reviewer model is available") && notice.includes("/build implement")));
+	assert.ok(run.recorded.notices.some((notice) => notice.includes("No expert-tier reviewer model is available") && notice.includes("/build implement")));
 	run.recorded.lineup = { ok: true, vendors: ["anthropic"] };
 	assert.equal(run.orchestrator.resume(), undefined);
 	await settleAsync();

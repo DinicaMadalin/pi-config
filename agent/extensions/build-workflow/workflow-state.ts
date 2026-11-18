@@ -1,6 +1,6 @@
 /**
  * Pure state machine of the /build workflow: plan (expert, in your session) -> implement (a subagent, model
- * picked by difficulty) -> review (one complex-tier reviewer per vendor with a usable model) -> at
+ * picked by difficulty) -> review (one expert-tier reviewer) -> at
  * most one fix (the implementer again) and re-review (both reviewers again). The implementer's questions go to
  * the planner, which answers or asks you. A re-review that still has findings waits for your decision.
  * Work started from a GitHub issue (/issue) waits for the user to open a draft PR after a passing review;
@@ -171,6 +171,11 @@ export function isFeatureState(state: WorkflowState): state is FeatureState {
 	return isDelegatedState(state) || state.phase === "cleanup" || isAwaitingUser(state.phase);
 }
 
+/** The reviewers passed the work: it is being cleaned up or waits to ship. */
+export function hasPassedReview(phase: WorkflowPhase): boolean {
+	return phase === "cleanup" || phase === "cleanup-failed" || phase === "awaiting-pr" || phase === "awaiting-ship";
+}
+
 /** The run waits for you: a decision after a failed re-review, a draft PR for /issue, shipping for /build. */
 export function isAwaitingUser(phase: WorkflowPhase): phase is "cleanup-failed" | "review-failed" | "awaiting-pr" | "awaiting-ship" {
 	return phase === "cleanup-failed" || phase === "review-failed" || phase === "awaiting-pr" || phase === "awaiting-ship";
@@ -179,13 +184,13 @@ export function isAwaitingUser(phase: WorkflowPhase): phase is "cleanup-failed" 
 /** Route of a subagent's session: the reviewer uses the expert; Jev picks the implementer's model by difficulty. */
 export function routeForPhase(phase: WorkflowPhase): RoutePin {
 	if (phase === "implement" || phase === "fix") return { route: "difficulty" };
-	if (phase === "review" || phase === "re-review") return { route: "tier", tier: "complex" };
+	if (phase === "review" || phase === "re-review") return { route: "tier", tier: "expert" };
 	return plannerRouteForPhase(phase);
 }
 
-/** A reviewer's route: the complex tier with its vendor's configured models first. */
+/** A reviewer's route: the expert tier with its vendor's configured models first. */
 export function reviewerRoute(vendor: ReviewerVendor): RoutePin {
-	return { route: "tier", tier: "complex", preferredProvider: vendor };
+	return { route: "tier", tier: "expert", preferredProvider: vendor };
 }
 
 /** Route of the planner's session: the expert for the whole run, since it answers the implementer's questions. */

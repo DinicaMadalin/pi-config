@@ -24,7 +24,7 @@ export type TierPolicies = Record<DifficultyTier, TierPolicy>;
 /** Defaults tuned to the providers logged in on this machine; override in ~/.pi/agent/auto-model.json. */
 export const DEFAULT_TIER_POLICIES: TierPolicies = {
 	trivial: {
-		models: ["opencode-go/deepseek-v4.1-flash", "opencode-go/glm-5.3-flash"],
+		models: ["opencode-go/deepseek-v4.1-flash", "opencode-go/glm-5.3-flash", "opencode/deepseek-v4.1-flash-free"],
 		thinkingLevel: "medium",
 		minThinkingLevel: "medium",
 	},

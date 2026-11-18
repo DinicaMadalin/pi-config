@@ -232,9 +232,9 @@ export function implementationBrief(
 ): string {
 	return [
 		"[/build: IMPLEMENT] You are the implementer: a senior engineer who owns this change end to end.",
-		`An expert planned it with me and I agreed to the plan below (saved at ${planPath}). Afterwards one complex-tier`,
-		"reviewer per available AI vendor reviews your work against the plan, independently, and they verify every claim you make.",
-		"Your goal: every reviewer passes it on the first round. That takes correct code, tests that prove it, and an honest report,",
+		`An expert planned it with me and I agreed to the plan below (saved at ${planPath}). Afterwards an expert-tier`,
+		"reviewer reviews your work against the plan, independently, and verifies every claim you make.",
+		"Your goal: the reviewer passes it on the first round. That takes correct code, tests that prove it, and an honest report,",
 		"not speed.",
 		"",
 		...issueLine(issue),
@@ -356,10 +356,9 @@ export function reviewPrompt(
 			]
 		: [];
 	return [
-		"[/build: REVIEW] You are a complex-tier code reviewer and the last gate before this work ships. The",
+		"[/build: REVIEW] You are an expert-tier code reviewer and the last gate before this work ships. The",
 		"implementer says it is done. Assume the work has bugs until you have looked; your job is to find every real",
-		"problem, and to block only on real problems. Other configured vendors may review the same work in parallel:",
-		"review on your own.",
+		"problem, and to block only on real problems. You are the only reviewer: nobody else checks this work after you.",
 		`Review it against ${planSource}.`,
 		"",
 		...issueLine(issue),
@@ -495,7 +494,7 @@ export function reReviewPrompt(
 			]
 		: [];
 	return [
-		"[/build: RE-REVIEW] You are the complex-tier reviewer again. The implementer answered the must-fix findings of the review",
+		"[/build: RE-REVIEW] You are the expert-tier reviewer again. The implementer answered the must-fix findings of the review",
 		"and any other reviewer's: each is fixed or rejected with reasons.",
 		"",
 		...fixReplyLines(fixReplies),
@@ -602,7 +601,7 @@ export function planChangePrompt(
 		`[/build: PLAN CHANGED] I agreed to a change of the plan (saved at ${planPath}${planIssue ? `, and in issue #${planIssue.number}` : ""}).`,
 		"Bring the implementation in line with the updated plan below: change what the update changes, keep the work that",
 		"still matches it. Follow the same rules and code style as in your original brief, do not commit, and rerun the",
-		"typecheck, lint and test commands. Then every available reviewer reviews the work against the new plan.",
+		"typecheck, lint and test commands. Then the reviewer reviews the work against the new plan.",
 		"",
 		...assignmentLines(assignment),
 		"## Updated plan",
