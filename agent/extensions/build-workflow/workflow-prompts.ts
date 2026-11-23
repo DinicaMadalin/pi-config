@@ -599,7 +599,7 @@ export function planChangePrompt(
 			]
 		: [];
 	return [
-		`[/build: PLAN CHANGED] I agreed to a change of the plan (saved at ${planPath}${planIssue ? `, and in issue #${planIssue.number}` : ""}).`,
+		`[/build: PLAN CHANGED] I agreed to a change of the plan (saved at ${planPath}${planIssue ? `; its public summary is issue #${planIssue.number}` : ""}).`,
 		"Bring the implementation in line with the updated plan below: change what the update changes, keep the work that",
 		"still matches it. Follow the same rules and code style as in your original brief, do not commit, and rerun the",
 		"typecheck, lint and test commands. Then the reviewer reviews the work against the new plan.",

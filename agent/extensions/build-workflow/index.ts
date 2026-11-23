@@ -5,7 +5,8 @@
  *
  * - /build <task>: the expert investigates and plans; nothing is edited until you agree and it saves the plan.
  * - Once the plan is saved you choose: post it as a GitHub issue and start, start without an issue, or keep
- *   planning (start-dialog.ts). With an issue, the implementer and the reviewers read the plan from it.
+ *   planning (start-dialog.ts). The agents work from the local plan file; the issue holds its public summary,
+ *   and they read only the comments added to it later.
  * - The implementer and reviewers run as subagents (build-orchestrator.ts). The implementer's questions come to
  *   the planner here, which answers them or asks you.
  * - Ask the planner to change the plan at any time; it saves the plan again and the run follows (plan-changes.ts).
@@ -37,6 +38,7 @@ import { phaseLabel, PlannerSession } from "./planner-session.ts";
 import { Shipping } from "./shipping.ts";
 import { StartDialog } from "./start-dialog.ts";
 import { planningPrompt } from "./workflow-prompts.ts";
+import { STOP_TOOL_NAME, stopBuildFromChat } from "./stop-build.ts";
 import {
 	canEditFiles,
 	canPlannerEditFiles,
@@ -307,6 +309,29 @@ export default function (pi: ExtensionAPI) {
 		parameters: Type.Object({}),
 		async execute() {
 			const outcome = await shipping.confirmAndShip();
+			return { content: [{ type: "text", text: outcome }], details: { outcome } };
+		},
+	});
+
+	pi.registerTool({
+		name: STOP_TOOL_NAME,
+		label: "Stop /build run",
+		description:
+			"End the open /build run, like /build stop: its agents stop, routing returns to normal, and the worktree keeps its uncommitted changes. " +
+			"A run that only waits on the user stops at once; while agents still work, the user confirms in a dialog first.",
+		promptSnippet: "Stop the open /build run when the user asks to stop or cancel it",
+		promptGuidelines: [
+			`When the user asks to stop, cancel or end the /build run, call ${STOP_TOOL_NAME} instead of telling them to type /build stop.`,
+		],
+		parameters: Type.Object({}),
+		async execute(_toolCallId, _params, _signal, _onUpdate, ctx) {
+			const outcome = await stopBuildFromChat({
+				phase: session.workflow.phase,
+				hasUI: ctx.hasUI,
+				confirmStop: (phase) =>
+					ctx.ui.confirm("Stop the /build run?", `Agents are still working (${phase} phase). Stopping ends them; the changes so far stay uncommitted.`),
+				endRun: () => endRun("stopped"),
+			});
 			return { content: [{ type: "text", text: outcome }], details: { outcome } };
 		},
 	});

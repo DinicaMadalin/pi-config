@@ -88,7 +88,7 @@ export interface FeatureWork {
 	/** HEAD when implementation started; the reviewer diffs against it. Undefined outside a git repo. */
 	baseCommit?: string;
 	issue?: IssueRef;
-	/** The issue /build posted the agreed plan to; the implementer and reviewer read the plan from it. */
+	/** The issue /build posted the plan's public summary to; the agents read only its later comments. */
 	planIssue?: TrackedIssue;
 	/**
 	 * The implementers, one per work stream of the plan, with their session files: a reload resumes them with
@@ -418,7 +418,7 @@ export function openRunNote(state: WorkflowState): string | undefined {
 		...(failureNote ? [failureNote] : []),
 		`Its plan: ${state.planPath}.`,
 		...(worktreeNote ? [worktreeNote] : []),
-		`Next step: ${phaseInstructions.nextStep}; /build stop ends the run; its changes stay uncommitted.`,
+		`Next step: ${phaseInstructions.nextStep}; when the user asks to stop or cancel the run, call stop_build (the same as /build stop); its changes stay uncommitted.`,
 		"While this run is open, do not design or implement in this chat: no contracts, no hand_off_implementation, no file edits. Point the user to the commands above. To change this run's work or start a new task, save the agreed plan with save_agreed_plan: the user is then asked whether it changes this run's work or is a new task.",
 	].join("\n");
 }

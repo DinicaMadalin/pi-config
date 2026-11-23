@@ -323,3 +323,9 @@ test("a plan change updates the plan issue's public body and comments briefly", 
 	assert.deepEqual(await updatePlanIssue(failing, planIssue, changedPlan, ["/r"]), { ok: false, error: "Failed to update issue #7 (exit 1): gone" });
 	assert.equal(failingCalls.length, 1, "no comment after a failed edit");
 });
+
+test("a repo root is made relative only where a path starts, not inside a longer path", () => {
+	const plan = "# Paths\n\n## Approach\nEdit /r/src/a.ts and (/r/src/b.ts), keep /mnt/backup/r/src/c.ts and /r-old/d.ts.";
+	const { body } = publicPlanText(plan, ["/r"]);
+	assert.equal(body, "## Proposed change\n\nEdit src/a.ts and (src/b.ts), keep /mnt/backup/r/src/c.ts and /r-old/d.ts.");
+});

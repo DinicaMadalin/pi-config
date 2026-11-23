@@ -248,7 +248,23 @@ function withRepoRelativePaths(text: string, repoRoots: readonly string[]): stri
 		.map((root) => root.replace(/\/+$/, ""))
 		.filter((root) => root.length > 0)
 		.sort((left, right) => right.length - left.length);
-	return normalizedRepoRoots.reduce((relativeText, root) => relativeText.replaceAll(`${root}/`, ""), text);
+	return normalizedRepoRoots.reduce((relativeText, root) => withoutRootPrefix(relativeText, `${root}/`), text);
+}
+
+/** A path character right before the root means the root is only the tail of another path, like "/mnt/backup/r/". */
+const PATH_CHARACTER_PATTERN = /[\w.~/-]/;
+
+function withoutRootPrefix(text: string, rootWithSlash: string): string {
+	let relativeText = "";
+	let searchFrom = 0;
+	for (let matchAt = text.indexOf(rootWithSlash); matchAt !== -1; matchAt = text.indexOf(rootWithSlash, matchAt + 1)) {
+		if (matchAt < searchFrom) continue;
+		const characterBefore = text[matchAt - 1];
+		if (characterBefore !== undefined && PATH_CHARACTER_PATTERN.test(characterBefore)) continue;
+		relativeText += text.slice(searchFrom, matchAt);
+		searchFrom = matchAt + rootWithSlash.length;
+	}
+	return relativeText + text.slice(searchFrom);
 }
 
 function withoutLocalLines(text: string): { text: string; droppedLines: string[] } {

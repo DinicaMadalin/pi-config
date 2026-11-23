@@ -2,7 +2,8 @@
  * Shipping a reviewed /build run after one confirmation: a new branch from HEAD, one commit, a normal push. Never
  * a merge or force push. A failed push keeps the commit; /build ship then only pushes.
  */
-import { listFilesToShip, planTitle, shipBranchName, shipCommitMessage, shipWork } from "./github-issue.ts";
+import { listFilesToShip, publicPlanText, shipBranchName, shipCommitMessage, shipWork } from "./github-issue.ts";
+import { findPlanRepoRoots } from "./repo-files.ts";
 import type { PlannerSession } from "./planner-session.ts";
 
 const MAX_SHIP_FILES_LISTED = 15;
@@ -44,7 +45,9 @@ export class Shipping {
 		const workflow = this.session.workflow;
 		if (workflow.phase !== "awaiting-ship") return notReadyToShip(workflow.phase);
 		const { run, context } = this.session;
-		const title = planTitle(this.session.readPlan(workflow.planPath) ?? "");
+		// The commit is pushed to GitHub, so its subject is the plan's public title, without local paths.
+		const repoRoots = await findPlanRepoRoots(this.session.runInSessionDir, run);
+		const { title } = publicPlanText(this.session.readPlan(workflow.planPath) ?? "", repoRoots);
 		const files = await listFilesToShip(run);
 		const branch = workflow.committedBranch
 			? { ok: true as const, value: workflow.committedBranch }
