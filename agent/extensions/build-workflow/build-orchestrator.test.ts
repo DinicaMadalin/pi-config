@@ -360,6 +360,23 @@ test("resuming a review after a reload asks only the reviewer that had not answe
 	assert.equal(recorded.finished.at(-1)?.next.phase, "awaiting-ship");
 });
 
+test("fix steps the planner writes after a reload still reach the implementer", async () => {
+	const { orchestrator, recorded, launch, agent } = startedRun();
+	agent("Implementer").settle("IMPLEMENTATION: done");
+	await settleAsync();
+	agent("Claude reviewer").settle("a.ts:3 off by one\nREVIEW_VERDICT: fix");
+	agent("OpenAI reviewer").settle("REVIEW_VERDICT: pass");
+	await settleAsync();
+	orchestrator.handlePlannerReply("Should n = 0 count?\nIMPLEMENTER_ANSWER: needs-user");
+	assert.equal(phaseOf(recorded), "fix");
+	orchestrator.stop();
+	const reloaded = new BuildOrchestrator(fakeSeat(recorded), launch);
+	assert.ok(reloaded.isWaitingForPlanner, "the saved run still waits for the fix steps");
+	reloaded.handlePlannerReply("1. Use <= in a.ts:3\nIMPLEMENTER_ANSWER: ready");
+	assert.equal(recorded.state.phase === "fix" && recorded.state.fixSteps, "1. Use <= in a.ts:3");
+	assert.ok(agent("Implementer").prompts.at(-1)?.includes("Use <= in a.ts:3"));
+});
+
 test("a stopped implementer restarts on /build implement", async () => {
 	const { orchestrator, agent } = startedRun();
 	const stopped = agent("Implementer");

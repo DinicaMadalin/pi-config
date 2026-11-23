@@ -182,7 +182,6 @@ export class BuildOrchestrator {
 	private askingRole: SubagentRole | undefined;
 	private readonly queuedQuestions: PlannerQuestion[] = [];
 	/** The fix round waiting for the planner's fix steps; no implementer works until they arrive. */
-	private isWaitingForFixSteps = false;
 	/** Bumped by stop(): a step of a stopped run that was waiting on I/O sees the change and drops out. */
 	private generation = 0;
 	private implementationBriefFor: ((assignment: StreamAssignment | undefined) => string) | undefined;
@@ -208,6 +207,15 @@ export class BuildOrchestrator {
 	/** The subagents of the current stage: the implementers, or every reviewer available for the run. */
 	liveStages(): LiveStage[] {
 		return [...this.agents.values()];
+	}
+
+	/**
+	 * The fix round waits for the planner's fix steps. Read from the saved run state, not kept in memory, so a reload
+	 * between the planner's question and the user's answer still passes the steps on to the implementers.
+	 */
+	private get isWaitingForFixSteps(): boolean {
+		const state = this.seat.state();
+		return state.phase === "fix" && state.findings !== undefined && state.fixSteps === undefined;
 	}
 
 	get isWaitingForPlanner(): boolean {
@@ -244,7 +252,7 @@ export class BuildOrchestrator {
 		const state = this.seat.state();
 		if (state.phase === "cleanup" || state.phase === "cleanup-failed") return this.retryCleanup();
 		if (!isDelegatedState(state)) return "No subagent stage to resume";
-		if (this.agents.size > 0 || this.isWaitingForFixSteps) return "The run is already going; /build status shows its phase";
+		if (this.agents.size > 0) return "The run is already going; /build status shows its phase";
 		if (state.phase === "fix" && state.findings !== undefined && state.fixSteps === undefined) {
 			this.requestFixSteps(state, state.findings);
 			return undefined;
@@ -557,7 +565,6 @@ export class BuildOrchestrator {
 
 	/** The reviewers asked for fixes: the planner checks the findings and writes the steps the implementers follow. */
 	private requestFixSteps(state: FixState, findings: string): void {
-		this.isWaitingForFixSteps = true;
 		const crew = (state.implementers ?? []).map((seat) => ({ implementerName: SUBAGENT_NAMES[seat.role], streamName: seat.stream }));
 		this.seat.notify("The reviewers asked for fixes; the planner checks the findings and writes the fix steps", "info");
 		this.seat.askPlanner(fixStepsPrompt(findings, crew));
@@ -571,7 +578,6 @@ export class BuildOrchestrator {
 			this.seat.callUser("The fix round waits for you: answer the planner's question, then it writes the fix steps");
 			return;
 		}
-		this.isWaitingForFixSteps = false;
 		const state = this.seat.state();
 		if (state.phase !== "fix" || state.findings === undefined) return;
 		const next: FixState = { ...state, fixSteps: plannerAnswer.answer };
@@ -616,7 +622,6 @@ export class BuildOrchestrator {
 	private clearQuestions(): void {
 		this.askingRole = undefined;
 		this.queuedQuestions.length = 0;
-		this.isWaitingForFixSteps = false;
 	}
 
 	private liveStageOf(stage: DelegatedPhase, seat: StageSeat, subagent: Subagent): LiveStage {
