@@ -3,10 +3,11 @@
  * planning; after a passing review, /issue pr commits, pushes and opens a draft PR that fixes the issue.
  */
 import type { ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
-import { type BranchElsewhere, createIssueBranch, fetchIssue, openDraftPullRequest, parseIssueArgument } from "./github-issue.ts";
+import { type BranchElsewhere, createIssueBranch, droppedLinesNotice, fetchIssue, openDraftPullRequest, parseIssueArgument } from "./github-issue.ts";
 import { useAutoModel } from "./planner-model.ts";
 import type { PlannerSession } from "./planner-session.ts";
 import { createRunWorktree } from "./run-worktree.ts";
+import { findPlanRepoRoots } from "./repo-files.ts";
 import { issueInvestigationPrompt } from "./workflow-prompts.ts";
 
 export const ISSUE_USAGE = "Usage: /issue <github issue url | #123 | 123> | /issue pr";
@@ -63,10 +64,13 @@ export async function openPullRequest(
 	}
 	const plan = session.readPlan(workflow.planPath);
 	if (plan === undefined) return;
-	const pullRequest = await openDraftPullRequest(session.run, workflow.issue, plan);
+	const repoRoots = await findPlanRepoRoots(session.runInSessionDir, session.run);
+	const pullRequest = await openDraftPullRequest(session.run, workflow.issue, plan, repoRoots);
 	if (!pullRequest.ok) {
 		ctx.ui.notify(`${pullRequest.error}. Fix it and run /issue pr again.`, "error");
 		return;
 	}
-	endRun(`draft PR opened: ${pullRequest.value}`, true);
+	const droppedLinesWarning = droppedLinesNotice(pullRequest.value.droppedLines, "the draft pull request");
+	if (droppedLinesWarning) session.notify(droppedLinesWarning, "warning");
+	endRun(`draft PR opened: ${pullRequest.value.url}`, true);
 }

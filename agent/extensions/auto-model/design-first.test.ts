@@ -43,18 +43,27 @@ test("an empty or exhausted designer allowlist never widens to arbitrary catalog
 	assert.deepEqual(chooseDesignerModel([expert, complex], emptyExpert, false), { tier: "complex", model: complex });
 });
 
+const editedWithoutPlan = { hasEditedFiles: true, hasSavedPlanThisTurn: false };
+
 test("only a design task without a handoff or prior reminder is reminded", () => {
 	const task = { id: "task-1", source: "plan_implementation" } as const;
-	assert.equal(shouldRemindDesigner(task, false, false, "Done"), true);
-	assert.equal(shouldRemindDesigner(undefined, false, false, "Done"), false);
-	assert.equal(shouldRemindDesigner(task, true, false, "Done"), false);
-	assert.equal(shouldRemindDesigner(task, false, true, "Done"), false);
+	assert.equal(shouldRemindDesigner(task, false, false, "Done", editedWithoutPlan), true);
+	assert.equal(shouldRemindDesigner(undefined, false, false, "Done", editedWithoutPlan), false);
+	assert.equal(shouldRemindDesigner(task, true, false, "Done", editedWithoutPlan), false);
+	assert.equal(shouldRemindDesigner(task, false, true, "Done", editedWithoutPlan), false);
 });
 
 test("a concrete blocker or question lets the designer return control to the user", () => {
 	const task = { id: "task-1", source: "feature_build" } as const;
-	assert.equal(shouldRemindDesigner(task, false, false, "Need one decision.\nDESIGN-BLOCKED: Which API should this use?"), false);
-	assert.equal(shouldRemindDesigner(task, false, false, "  DESIGN-BLOCKED: Repository unavailable"), false);
+	assert.equal(shouldRemindDesigner(task, false, false, "Need one decision.\nDESIGN-BLOCKED: Which API should this use?", editedWithoutPlan), false);
+	assert.equal(shouldRemindDesigner(task, false, false, "  DESIGN-BLOCKED: Repository unavailable", editedWithoutPlan), false);
+});
+
+test("the reminder needs file edits in the task and never follows a turn that saved a plan", () => {
+	const task = { id: "task-1", source: "plan_implementation" } as const;
+	assert.equal(shouldRemindDesigner(task, false, false, "Done", { hasEditedFiles: false, hasSavedPlanThisTurn: false }), false);
+	assert.equal(shouldRemindDesigner(task, false, false, "Plan saved", { hasEditedFiles: true, hasSavedPlanThisTurn: true }), false);
+	assert.equal(shouldRemindDesigner(task, false, false, "Plan saved", { hasEditedFiles: false, hasSavedPlanThisTurn: true }), false);
 });
 
 test("first-answer policy describes contracts, role boundaries, review and explicit blockers", () => {
@@ -65,4 +74,13 @@ test("first-answer policy describes contracts, role boundaries, review and expli
 	assert.match(instructions, /implementer/i);
 	assert.match(instructions, /review/i);
 	assert.match(instructions, /test/i);
+});
+
+test("an agreed plan to implement is saved to offer /build; the in-chat flow is for Not now or do it here", () => {
+	const instructions = designFirstInstructions();
+	for (const fragment of ["save_agreed_plan", "Not now", "do it here", "/build implement", "/build ship", "/build stop"]) {
+		assert.ok(instructions.includes(fragment), `missing ${fragment}`);
+	}
+	const savePlanRule = instructions.indexOf("save_agreed_plan");
+	assert.ok(savePlanRule >= 0 && savePlanRule < instructions.indexOf("Before implementation, settle the design"), "the save rule comes before the in-chat design steps");
 });

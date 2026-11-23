@@ -114,7 +114,9 @@ export default function (pi: ExtensionAPI) {
 		description:
 			"Save the final plan the user agreed to as a markdown file in the repo's .scratch/handoffs/. " +
 			"Call it only after the user explicitly agrees with both the goal and the approach, before starting the work. " +
-			`The plan starts with "# <title>" and has these sections:\n${AGREED_PLAN_SECTIONS}`,
+			`The plan starts with "# <title>" and has these sections:\n${AGREED_PLAN_SECTIONS}\n` +
+				"Never name a branch, not even as a suggestion. Goal, Approach and Acceptance criteria may be posted as a public GitHub issue, " +
+				"so they must not mention this workflow, agents, models, handoffs or plan files; keep local paths in Files.",
 		promptSnippet: "Save the final plan once the user agrees with the goal and approach",
 		promptGuidelines: [
 			`After discussing a task, when the user clearly agrees with the goal and how it will be done, save the agreed plan with ${SAVE_PLAN_TOOL_NAME} before implementing, then tell the user its path. Save again if the plan changes after that.`,

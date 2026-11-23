@@ -9,6 +9,7 @@ import {
 	plannerQuestionPrompt,
 	planningPrompt,
 	reReviewPrompt,
+	RUN_FINISHED_REPLY_PROMPT,
 	reviewPrompt,
 	runReport,
 } from "./workflow-prompts.ts";
@@ -97,12 +98,17 @@ test("issue prompts carry the issue to the investigator, implementer and reviewe
 	assert.ok(!reviewPrompt("/p.md", "abc", []).includes("GitHub issue"));
 });
 
-test("with a plan issue, the implementer and reviewer read the plan from GitHub", () => {
+test("with a plan issue, the local plan stays the source of truth and the issue is read only for later comments", () => {
 	const planIssue = { number: 9, title: "Add CSV export", url: "https://github.com/acme/shop/issues/9" };
 	const brief = implementationBrief("/p.md", "# Add CSV export", [], undefined, planIssue);
-	assert.ok(brief.includes("`gh issue view 9 --json title,body,comments`"));
-	assert.ok(brief.includes("# Add CSV export"), "keeps the plan inline for when gh is unavailable");
-	assert.ok(reviewPrompt("/p.md", "abc", [], undefined, planIssue).includes("Review it against GitHub issue #9"));
+	assert.ok(brief.includes("The plan below (saved at /p.md) is the source of truth."), brief);
+	assert.ok(brief.includes("`gh issue view 9 --json comments`"), brief);
+	assert.ok(!brief.includes("title,body"), "agents do not read the issue body");
+	assert.ok(brief.includes("# Add CSV export"), "the plan stays inline");
+	const review = reviewPrompt("/p.md", "abc", [], undefined, planIssue);
+	assert.ok(review.includes("Review it against the agreed plan at /p.md (GitHub issue #9"), review);
+	assert.ok(review.includes("`gh issue view 9 --json comments`"), review);
+	assert.ok(!review.includes("title,body"), review);
 	assert.ok(!implementationBrief("/p.md", "# plan", []).includes("gh issue view"));
 });
 
@@ -110,6 +116,15 @@ test("the planner writes the problem first and nothing secret, since the plan ma
 	const prompt = planningPrompt("add export");
 	assert.ok(prompt.includes("Goal: start with the problem"));
 	assert.ok(prompt.includes("no secrets"));
+});
+
+test("the planner never names branches and keeps the public sections about the repo", () => {
+	for (const prompt of [planningPrompt("add export"), issueInvestigationPrompt({ number: 1, title: "t", url: "u", body: "b", labels: [], comments: [] }, "issue-1")]) {
+		assert.ok(prompt.includes("Never name a branch, not even as a suggestion: the run names branches itself."), prompt);
+		assert.ok(prompt.includes("Goal, Approach and Acceptance criteria must not mention this workflow, agents, models, handoffs or plan files;"), prompt);
+		assert.ok(prompt.includes("Local paths belong in Files."), prompt);
+		assert.ok(!prompt.includes("It may be posted as a GitHub issue"), "only the public sections are posted");
+	}
 });
 
 test("the run report names each reviewer and quotes both reports of the last review", () => {
@@ -152,4 +167,12 @@ test("the review prompts do not assume two reviewers", () => {
 	for (const prompt of [reviewPrompt("p.md", "abc123", []), reReviewPrompt("abc123")]) {
 		assert.doesNotMatch(prompt, /other expert reviewer|both reviewers|two expert reviewers/i);
 	}
+});
+
+test("after the run the main chat tells the user the outcome and what was built, proposes the next step and asks", () => {
+	assert.match(RUN_FINISHED_REPLY_PROMPT, /everything passed and is okay/);
+	assert.match(RUN_FINISHED_REPLY_PROMPT, /What was implemented/);
+	assert.match(RUN_FINISHED_REPLY_PROMPT, /The next step you propose/);
+	assert.match(RUN_FINISHED_REPLY_PROMPT, /does the user agree with that next step\?/);
+	assert.match(RUN_FINISHED_REPLY_PROMPT, /Do not ship, commit, push or edit anything in this turn/);
 });

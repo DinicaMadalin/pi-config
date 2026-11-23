@@ -27,13 +27,15 @@ interface FakePi {
 }
 
 const tempDirectories: string[] = [];
+const originalHome = process.env.HOME;
+const originalTierCeiling = process.env.PI_AUTO_MODEL_MAX_TIER;
+delete process.env.PI_AUTO_MODEL_MAX_TIER;
 let loadExtension: (() => (pi: FakePi) => void) | undefined;
 
 async function bundledExtension(): Promise<(pi: FakePi) => void> {
 	if (loadExtension) return loadExtension;
 	const tempDirectory = await mkdtemp(join(tmpdir(), "auto-model-design-first-"));
 	tempDirectories.push(tempDirectory);
-	const originalHome = process.env.HOME;
 	process.env.HOME = tempDirectory;
 	await mkdir(join(tempDirectory, ".pi", "agent"), { recursive: true });
 	await writeFile(join(tempDirectory, ".pi", "agent", "auto-model.json"), JSON.stringify({
@@ -66,17 +68,16 @@ async function bundledExtension(): Promise<(pi: FakePi) => void> {
 	});
 	const modulePath = join(tempDirectory, "auto-model.mjs");
 	await writeFile(modulePath, bundled.outputFiles[0].text);
-	try {
-		const loaded = await import(pathToFileURL(modulePath).href) as { default: (pi: FakePi) => void };
-		loadExtension = loaded.default;
-		return loadExtension;
-	} finally {
-		if (originalHome === undefined) delete process.env.HOME;
-		else process.env.HOME = originalHome;
-	}
+	const loaded = await import(pathToFileURL(modulePath).href) as { default: (pi: FakePi) => void };
+	loadExtension = loaded.default;
+	return loadExtension;
 }
 
 test.after(async () => {
+	if (originalHome === undefined) delete process.env.HOME;
+	else process.env.HOME = originalHome;
+	if (originalTierCeiling === undefined) delete process.env.PI_AUTO_MODEL_MAX_TIER;
+	else process.env.PI_AUTO_MODEL_MAX_TIER = originalTierCeiling;
 	await Promise.all(tempDirectories.map((directory) => rm(directory, { recursive: true, force: true })));
 });
 
@@ -296,7 +297,7 @@ test("a premature design finish gets one reminder and persists a task-scoped gua
 		type: "custom",
 		customType: "pi.virtual-model-state",
 		data: { provider: "auto", modelId: "auto", state: { tier: "expert", modelKey: "openai/gpt-6-astra", designTask: { id: "design-1", source: "feature_build" } } satisfies AutoRouteState },
-	});
+	}, { type: "message", message: { role: "toolResult", toolName: "edit", isError: false } });
 	const event: any = {
 		outcome: "completed",
 		continue: false,
@@ -325,4 +326,76 @@ test("a design blocker and an existing handoff do not trigger the initial-design
 	assert.equal(await handler?.(event("DESIGN-BLOCKED: Which API?"), harness.context), undefined);
 	harness.branch.splice(0, harness.branch.length, stateEntry({ phase: "reviewing", designer: { tier: "expert", modelKey: "openai/gpt-6-astra" }, handoffCount: 1 }));
 	assert.equal(await handler?.(event("Implemented"), harness.context), undefined);
+});
+
+function designTaskEntry(handoff?: AutoRouteState["handoff"]) {
+	return {
+		type: "custom",
+		customType: "pi.virtual-model-state",
+		data: { provider: "auto", modelId: "auto", state: { tier: "expert", modelKey: "openai/gpt-6-astra", designTask: { id: "design-1", source: "plan_implementation" }, handoff } satisfies AutoRouteState },
+	};
+}
+
+function settledEvent(answer: string): any {
+	return { outcome: "completed", continue: false, entries: [], context: { contextEntries: [{ messages: [{ role: "assistant", content: [{ type: "text", text: answer }] }] }] } };
+}
+
+test("a designer that edited no file is not reminded to hand off", async () => {
+	const harness = setup();
+	await harness.initialize();
+	harness.branch.push(designTaskEntry(), { type: "message", message: { role: "user", content: "implement the plan" } });
+	assert.equal(await harness.handler("agent_before_settle")?.(settledEvent("Here is how I would do it."), harness.context), undefined);
+});
+
+test("a turn that saved the agreed plan is not reminded to hand off, even after edits", async () => {
+	const harness = setup();
+	await harness.initialize();
+	harness.branch.push(
+		designTaskEntry(),
+		{ type: "message", message: { role: "toolResult", toolName: "edit", isError: false } },
+		{ type: "message", message: { role: "user", content: "okay, this is the plan, let's implement it" } },
+		{ type: "message", message: { role: "toolResult", toolName: "save_agreed_plan", isError: false } },
+	);
+	assert.equal(await harness.handler("agent_before_settle")?.(settledEvent("Plan saved; you are asked whether to start /build."), harness.context), undefined);
+});
+
+const designerAfterTakeOver: AutoRouteState = {
+	tier: "expert",
+	modelKey: "openai/gpt-6-astra",
+	thinkingLevel: "high",
+	designTask: { id: "design-1", source: "plan_implementation" },
+	handoff: { phase: "taking-over", designer: { tier: "expert", modelKey: "openai/gpt-6-astra", thinkingLevel: "high" }, handoffCount: 1 },
+};
+
+function requestAfterImplementer(reason: "continuation" | "user", state: AutoRouteState): any {
+	return {
+		reason,
+		state,
+		thinkingLevel: "medium",
+		previous: { model: standardModel, thinkingLevel: "medium" },
+		messages: [
+			{ role: "assistant", content: [{ type: "text", text: "Reading the contracts." }] },
+			{ role: "toolResult", toolName: "read", isError: false },
+		],
+	};
+}
+
+test("a continuation after the designer took over stays with the designer, not the implementer's model", async () => {
+	const harness = setup();
+	await harness.initialize();
+	const continued = await harness.route(requestAfterImplementer("continuation", designerAfterTakeOver), harness.context);
+	assert.equal(continued.model, expertModel);
+	const reviewing: AutoRouteState = { ...designerAfterTakeOver, handoff: { ...designerAfterTakeOver.handoff!, phase: "reviewing" } };
+	const steered = await harness.route(requestAfterImplementer("user", reviewing), harness.context);
+	assert.equal(steered.model, expertModel);
+});
+
+test("when the designer's model is gone, failover picks a designer fallback, never the implementer's model", async () => {
+	const harness = setup({ taskKind: "other", tier: "standard" }, [complexModel, standardModel]);
+	await harness.initialize();
+	const continued = await harness.route(requestAfterImplementer("continuation", designerAfterTakeOver), harness.context);
+	assert.equal(continued.model, complexModel);
+	assert.equal(continued.state.tier, "complex");
+	assert.equal(continued.state.designTask.id, "design-1");
+	assert.equal(continued.state.handoff.phase, "taking-over");
 });

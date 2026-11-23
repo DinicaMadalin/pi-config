@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
@@ -54,6 +54,27 @@ test("a failure the run added blocks shipping and names only the new lines", asy
 	assert.ok(failure?.startsWith("New check failures since the run began:"), failure);
 	assert.ok(failure?.includes("src/a.ts: e2"));
 	assert.ok(!failure?.includes("old.ts: e1"));
+});
+
+test("without configured checks the contracts are removed and the run finishes with a notice", async () => {
+	const repo = mkdtempSync(join(tmpdir(), "contract-verification-"));
+	git(repo, "init", "-q");
+	git(repo, "config", "user.email", "test@example.com");
+	git(repo, "config", "user.name", "Test");
+	mkdirSync(join(repo, "src"));
+	writeFileSync(join(repo, "src", "a.ts"), "export const a = 1;\n");
+	git(repo, "add", ".");
+	git(repo, "commit", "-q", "-m", "base");
+	const baseCommit = spawnSync("git", ["rev-parse", "HEAD"], { cwd: repo, encoding: "utf8" }).stdout.trim();
+	const contracted = ["// @handoff-contract" + " begin", "// a is 2.", "// @handoff-contract" + " end", "export const a = 2;", ""].join("\n");
+	writeFileSync(join(repo, "src", "a.ts"), contracted);
+	const notices: string[] = [];
+	const failure = await finalizeBuildContracts(realExec, repo, baseCommit, undefined, new AbortController().signal, (notice) => notices.push(notice));
+	assert.equal(failure, undefined);
+	assert.equal(readFileSync(join(repo, "src", "a.ts"), "utf8"), "export const a = 2;\n");
+	assert.equal(notices.length, 1, notices.join("\n"));
+	assert.match(notices[0], /Removed temporary contracts from 1 files; no project checks are configured/);
+	assert.match(notices[0], /post-cleanup checks were skipped/);
 });
 
 test("without a baseline every failing check blocks shipping", async () => {

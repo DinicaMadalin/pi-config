@@ -14,6 +14,7 @@ import {
 	implementerBrief,
 	implementerToolRefusal,
 	MAX_HANDOFFS_PER_TASK,
+	readDesignTaskProgress,
 	readImplementerWork,
 	removeContractBlocks,
 	reviewRequest,
@@ -42,9 +43,9 @@ test("finds the latest auto model router state on the branch", () => {
 test("only a complex or expert model outside /build may hand off", () => {
 	assert.equal(handoffRefusal(expertState, false), undefined);
 	assert.equal(handoffRefusal({ ...expertState, tier: "complex" }, false), undefined);
-	assert.match(handoffRefusal({ ...expertState, tier: "standard" }, false) ?? "", /cheaper tier/);
+	assert.match(handoffRefusal({ ...expertState, tier: "standard" }, false) ?? "", /Only the designer hands off/);
 	assert.match(handoffRefusal(expertState, true) ?? "", /off in this session/);
-	assert.match(handoffRefusal(undefined, false) ?? "", /cheaper tier/);
+	assert.match(handoffRefusal(undefined, false) ?? "", /Only the designer hands off/);
 });
 
 test("the implementer cannot hand off again and cannot approve", () => {
@@ -183,4 +184,58 @@ test("the brief and the review tell the models not to waste the hand-off", () =>
 	assert.match(brief, /changes no file counts as not done/);
 	assert.match(reviewRequest(), /do not send the same brief again/);
 	assert.match(takeOverRequest(), /Do not call hand_off_implementation again/);
+});
+
+test("the take-over makes an implementer's reported blocker the designer's to resolve", () => {
+	const takeOver = takeOverRequest();
+	assert.match(takeOver, /reported a blocker/);
+	assert.match(takeOver, /yours to resolve/);
+	assert.match(takeOver, /DESIGN-BLOCKED:/);
+	assert.match(takeOver, /Do not call hand_off_implementation again/);
+	const implementingState: AutoRouteState = {
+		tier: "standard",
+		modelKey: "openai/gpt-6-luna",
+		handoff: { phase: "implementing", designer: { tier: "expert", modelKey: "openai/gpt-6-astra" }, handoffCount: 1 },
+	};
+	assert.equal(handoffTransition([{ role: "assistant", content: "Blocked." }, { role: "user", content: takeOver }], implementingState), "take-over");
+});
+
+function designStateEntry(taskId: string) {
+	return {
+		type: "custom",
+		customType: "pi.virtual-model-state",
+		data: { provider: "auto", modelId: "auto", state: { tier: "expert", modelKey: "openai/gpt-6-astra", designTask: { id: taskId, source: "plan_implementation" } } },
+	};
+}
+
+function toolResultEntry(toolName: string, isError = false) {
+	return { type: "message", message: { role: "toolResult", toolName, isError } };
+}
+
+const userEntry = { type: "message", message: { role: "user" } };
+
+test("design task progress counts successful file edits since the task began", () => {
+	assert.deepEqual(readDesignTaskProgress([designStateEntry("task-1"), userEntry, toolResultEntry("edit")], "task-1"), { hasEditedFiles: true, hasSavedPlanThisTurn: false });
+	assert.equal(readDesignTaskProgress([userEntry, toolResultEntry("write"), designStateEntry("task-1"), toolResultEntry("read")], "task-1").hasEditedFiles, false, "an edit before the task does not count");
+	assert.equal(readDesignTaskProgress([designStateEntry("task-1"), toolResultEntry("edit", true)], "task-1").hasEditedFiles, false, "a failed edit does not count");
+	assert.equal(readDesignTaskProgress([designStateEntry("task-1"), toolResultEntry("write")], "task-1").hasEditedFiles, true);
+});
+
+test("design task progress sees a plan saved after the latest user message only", () => {
+	assert.equal(readDesignTaskProgress([designStateEntry("task-1"), userEntry, toolResultEntry("save_agreed_plan")], "task-1").hasSavedPlanThisTurn, true);
+	assert.equal(readDesignTaskProgress([designStateEntry("task-1"), toolResultEntry("save_agreed_plan")], "task-1").hasSavedPlanThisTurn, true, "the task's first turn");
+	assert.equal(readDesignTaskProgress([designStateEntry("task-1"), toolResultEntry("save_agreed_plan"), userEntry, toolResultEntry("edit")], "task-1").hasSavedPlanThisTurn, false);
+	assert.equal(readDesignTaskProgress([designStateEntry("task-1"), userEntry, toolResultEntry("save_agreed_plan", true)], "task-1").hasSavedPlanThisTurn, false);
+	const reminder = { type: "custom_message", customType: "auto-model-design-reminder" };
+	assert.equal(readDesignTaskProgress([designStateEntry("task-1"), userEntry, toolResultEntry("save_agreed_plan"), reminder], "task-1").hasSavedPlanThisTurn, true, "a custom message is not a user message");
+});
+
+test("design task progress of an unknown task is empty", () => {
+	assert.deepEqual(readDesignTaskProgress([designStateEntry("other"), userEntry, toolResultEntry("edit"), toolResultEntry("save_agreed_plan")], "task-1"), { hasEditedFiles: false, hasSavedPlanThisTurn: false });
+});
+
+test("hand-off prompts say what happened without naming model cost", () => {
+	const prompts = [designerNote(), implementerBrief("Fill src/a.ts"), reviewRequest(), takeOverRequest()];
+	for (const prompt of prompts) assert.doesNotMatch(prompt, /cheap|expensive/i);
+	assert.match(takeOverRequest(), /^\[auto-model: hand-off produced no change\] The implementer ended its turn without changing any file/);
 });

@@ -7,6 +7,7 @@
  */
 import type { DifficultyTier, RoutedThinkingLevel } from "./difficulty-tiers.ts";
 import type { DesignTask } from "./design-first.ts";
+import { SAVE_PLAN_TOOL_NAME } from "../project-memory/agreed-plan-files.ts";
 
 export const HANDOFF_TOOL_NAME = "hand_off_implementation";
 export const APPROVE_TOOL_NAME = "approve_implementation";
@@ -27,7 +28,7 @@ export const TAKE_OVER_MESSAGE_TYPE = "auto-model-take-over";
 export const DESIGNER_NOTE_MESSAGE_TYPE = "auto-model-designer-note";
 /** Leading tags let the router recognize these extension messages among the user-role messages of a request. */
 const REVIEW_REQUEST_TAG = "[auto-model: review the implementation]";
-const TAKE_OVER_TAG = "[auto-model: the implementer changed nothing]";
+const TAKE_OVER_TAG = "[auto-model: hand-off produced no change]";
 const DESIGNER_NOTE_TAG = "[auto-model: you are the designer]";
 
 /**
@@ -98,9 +99,9 @@ export function findAutoRouteState(branchEntries: readonly SessionEntryLike[]): 
 export function handoffRefusal(state: AutoRouteState | undefined, isRoutingRestricted: boolean): string | undefined {
 	if (isRoutingRestricted) return "Hand-off is off in this session (a /build phase or a tier ceiling decides the models); implement it yourself.";
 	if (state?.handoff?.phase === "implementing") return "You are the implementer: write the bodies yourself and report; the reviewer checks your work afterwards.";
-	if (!state || !DESIGNER_TIERS.has(state.tier)) return "You already run on a cheaper tier: implement the change yourself.";
+	if (!state || !DESIGNER_TIERS.has(state.tier)) return "Only the designer hands off: implement the change yourself.";
 	if (state.handoff?.phase === "taking-over") {
-		return `The cheaper implementer changed no file after the last hand-off: implement it yourself, then call ${APPROVE_TOOL_NAME}.`;
+		return `The last hand-off changed no file, so hand-off is off for this task: implement it yourself, then call ${APPROVE_TOOL_NAME}.`;
 	}
 	const handoffCount = state.handoff?.handoffCount ?? 0;
 	if (handoffCount >= MAX_HANDOFFS_PER_TASK) {
@@ -145,6 +146,48 @@ export function readImplementerWork(branchEntries: readonly MessageEntryLike[]):
 	const fingerprintAtHandoff = typeof details?.workTreeFingerprint === "string" ? details.workTreeFingerprint : undefined;
 	const fileWriteCount = branchEntries.slice(handoffIndex + 1).filter((entry) => isToolResult(entry, FILE_WRITING_TOOLS)).length;
 	return { fingerprintAtHandoff, fileWriteCount };
+}
+
+/** What the designer of a design-first task did so far; decides whether it gets the hand-off reminder. */
+export interface DesignTaskProgress {
+	/** A successful edit or write tool result since the task's first routed request. */
+	hasEditedFiles: boolean;
+	/** A successful save_agreed_plan tool result since the latest user message: the turn offered /build instead. */
+	hasSavedPlanThisTurn: boolean;
+}
+
+interface DesignBranchEntry {
+	type: string;
+	customType?: string;
+	data?: unknown;
+	message?: { role?: string; toolName?: string; isError?: boolean };
+}
+
+export function readDesignTaskProgress(branchEntries: readonly DesignBranchEntry[], designTaskId: string): DesignTaskProgress {
+	const taskStartIndex = branchEntries.findIndex((entry) => {
+		if (entry.type !== "custom" || entry.customType !== VIRTUAL_MODEL_STATE_ENTRY_TYPE) return false;
+		const storedState = entry.data as { provider?: unknown; modelId?: unknown; state?: unknown } | undefined;
+		const routeState = storedState?.state as { designTask?: { id?: unknown } } | undefined;
+		return storedState?.provider === "auto" && storedState.modelId === "auto" && routeState?.designTask?.id === designTaskId;
+	});
+	if (taskStartIndex < 0) return { hasEditedFiles: false, hasSavedPlanThisTurn: false };
+
+	const taskEntries = branchEntries.slice(taskStartIndex + 1);
+	const lastUserIndex = taskEntries.findLastIndex((entry) => entry.type === "message" && entry.message?.role === "user");
+	const isSuccessfulToolResult = (entry: DesignBranchEntry, toolName: string): boolean =>
+		entry.type === "message" &&
+		entry.message?.role === "toolResult" &&
+		entry.message.toolName === toolName &&
+		entry.message.isError !== true;
+	const hasEditedFiles = taskEntries.some((entry) => {
+		const toolName = entry.message?.toolName;
+		return toolName !== undefined && FILE_WRITING_TOOLS.has(toolName) && isSuccessfulToolResult(entry, toolName);
+	});
+
+	return {
+		hasEditedFiles,
+		hasSavedPlanThisTurn: taskEntries.slice(lastUserIndex + 1).some((entry) => isSuccessfulToolResult(entry, SAVE_PLAN_TOOL_NAME)),
+	};
 }
 
 /**
@@ -224,8 +267,8 @@ const CONTRACT_EXAMPLE = [
 /** Hidden note for a complex or expert model, sent after its first tool turn on a task. */
 export function designerNote(): string {
 	return [
-		`${DESIGNER_NOTE_TAG} You run on an expensive model. Design, do not type out the code: a cheaper model writes it.`,
-		"If this task needs real code (more than a few lines), once the design is settled:",
+		`${DESIGNER_NOTE_TAG} Design the change; an implementer writes the code.`,
+		"If the task needs more than a few lines of code, once the design is settled:",
 		"1. Write the design into the files: each new or changed function with its exact signature (the project's real",
 		"   types) and a stub body, under a contract block of whole comment lines in the file's comment syntax:",
 		...CONTRACT_EXAMPLE,
@@ -233,15 +276,15 @@ export function designerNote(): string {
 		"   every decision there (where data comes from, error messages); the implementer must not design anything.",
 		"2. Name or write the tests that prove it, and the check commands.",
 		`3. Call ${HANDOFF_TOOL_NAME} with the brief: the files and functions to fill, constraints, and the checks to run.`,
-		"   Then stop: the next turns run on the cheaper model, and you review its work afterwards.",
+		"   Then end your turn: the implementer works next, and you review its work afterwards.",
 		"For a question, a plan, or a tiny edit, ignore this note and just answer.",
 	].join("\n");
 }
 
-/** The hand-off tool's result: the first thing the cheaper implementer reads. */
+/** The hand-off tool's result: the first thing the implementer reads. */
 export function implementerBrief(brief: string): string {
 	return [
-		"Handed off. You are now the implementer, on a cheaper model; the designer reviews your work when you finish.",
+		"Handed off. You are now the implementer; the designer reviews your work when you finish.",
 		"",
 		"## Brief from the designer",
 		"",
@@ -253,8 +296,8 @@ export function implementerBrief(brief: string): string {
 		"- Write or finish the tests the brief names, then run the checks and fix what fails.",
 		"- If a contract is wrong, unclear or contradicts the code, do not redesign it: stop and say what you found (file:line).",
 		`- Start on the code at once. Do not call context or delegation tools (${[...IMPLEMENTER_BLOCKED_TOOLS].join(", ")}): they are blocked while you implement.`,
-		"- Do not end your turn before you edited the files and ran the checks. A turn that changes no file counts as not done:",
-		"  the task goes back to the designer, who then writes it on the expensive model.",
+		"- Do not end your turn before you edited the files and ran the checks. A turn that changes no file counts as not done",
+		"  and the task goes back to the designer.",
 		"- Finish with a short report: what you implemented, the commands you ran with their real results, open doubts.",
 	].join("\n");
 }
@@ -262,24 +305,25 @@ export function implementerBrief(brief: string): string {
 /** Sent when the implementer settles: the designer takes over again as reviewer. */
 export function reviewRequest(): string {
 	return [
-		`${REVIEW_REQUEST_TAG} The cheaper implementer finished (its report is above). You are the reviewer now.`,
+		`${REVIEW_REQUEST_TAG} The implementer finished; its report is above. Review its work:`,
 		"1. Read the changed code against each contract block and the user's request; run the tests and checks yourself.",
 		`2. If anything is wrong or missing, call ${HANDOFF_TOOL_NAME} again with exact fix steps (file, function, the`,
 		"   change, the test that proves it). Keep the contract blocks while fixes are pending.",
 		`3. If the user must decide something, ask them and keep the contract blocks. Otherwise, once the code is correct,`,
 		`   call ${APPROVE_TOOL_NAME}: it deletes the contract blocks. Then rerun the checks and report to the user.`,
-		`4. If the implementer left part of the brief untouched, do not send the same brief again: write that part yourself.`,
+		"4. If the implementer left part of the brief undone, do not send the same brief again: write that part yourself.",
 	].join("\n");
 }
 
 /** Sent instead of the review request when the implementer changed no file: the designer finishes the work. */
 export function takeOverRequest(): string {
 	return [
-		`${TAKE_OVER_TAG} The cheaper implementer ended its turn without changing any file, so the hand-off failed.`,
-		`You are the designer again. Do not call ${HANDOFF_TOOL_NAME} again: it is refused for this task.`,
+		`${TAKE_OVER_TAG} The implementer ended its turn without changing any file: the brief was not implemented.`,
+		`Do not call ${HANDOFF_TOOL_NAME} again: it is refused for this task.`,
+		"If the implementer reported a blocker (a wrong or unclear contract, a failing prerequisite, or a missing decision), that blocker is yours to resolve first: fix the contract from repository evidence and continue, or, when only the user can decide, ask them and end with a line starting DESIGN-BLOCKED: that names the question, keeping the contract blocks.",
 		"1. Implement the brief yourself: fill the stubs as their contract blocks say, write the tests, run the checks.",
-		`2. Then call ${APPROVE_TOOL_NAME} to delete the contract blocks, rerun the checks, and tell the user that the`,
-		"   hand-off changed nothing and you wrote the code yourself.",
+		`2. Call ${APPROVE_TOOL_NAME} to delete the contract blocks, rerun the checks, and tell the user that the`,
+		"   implementer changed nothing and you wrote the code yourself.",
 	].join("\n");
 }
 

@@ -15,7 +15,6 @@ export async function finalizeBuildContracts(
 	notify: (message: string) => void,
 ): Promise<string | undefined> {
 	const checks = findProjectChecks(cwd);
-	if (checks.checks.length === 0) return "No verification commands found; agree .pi/checks.json checks with the planner before retrying";
 	const git = async (args: string[]): Promise<string> => {
 		signal.throwIfAborted();
 		const result = await pi.exec("git", args, { cwd, signal, timeout: 30_000 });
@@ -31,6 +30,10 @@ export async function finalizeBuildContracts(
 	signal.throwIfAborted();
 	const edits = prepareContractCleanup(root, paths);
 	applyContractCleanup(edits);
+	if (checks.checks.length === 0) {
+		notify(`Removed temporary contracts from ${edits.length} files; no project checks are configured (.pi/checks.json, package.json or Makefile), so post-cleanup checks were skipped: the reviewer ran the plan's checks`);
+		return undefined;
+	}
 	notify(`Removed temporary contracts from ${edits.length} files; verifying the clean work`);
 	const results = await runEveryProjectCheck(abortableCheckExecutor(pi, signal), checks, (check) => notify(`Post-cleanup check: ${check.name}`));
 	signal.throwIfAborted();

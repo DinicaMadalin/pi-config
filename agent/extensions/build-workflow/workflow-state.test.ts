@@ -9,6 +9,7 @@ import {
 	findPlannerWorkflowState,
 	findWorkflowState,
 	mergeReviews,
+	openRunNote,
 	planChangeReaction,
 	plannerRouteForPhase,
 	readPlannerAnswer,
@@ -119,7 +120,7 @@ test("the designer may edit files, and a plan change during cleanup goes through
 	assert.equal(canEditFiles("cleanup"), false);
 	assert.equal(planChangeReaction("design"), "tell-implementer");
 	assert.equal(planChangeReaction("cleanup"), "change-round");
-	assert.equal(planChangeReaction("cleanup-failed"), "change-round");
+	assert.equal(planChangeReaction("cleanup-failed"), "ask-change-or-new-task");
 });
 
 test("review findings get exactly one fix round and a re-review", () => {
@@ -164,11 +165,11 @@ test("issue work whose re-review still fails waits for your decision instead of 
 	assert.equal(step.kind === "advance" && step.next.phase, "review-failed");
 });
 
-test("reviewed work waiting for you is not edited behind the reviewers' back: changes go through a plan change", () => {
+test("reviewed work waiting for you is not edited behind the reviewers' back: a saved plan asks change or new task", () => {
 	for (const phase of ["review-failed", "awaiting-pr", "awaiting-ship"] as const) {
 		assert.equal(canEditFiles(phase), false, phase);
 		assert.equal(canPlannerEditFiles(phase), false, phase);
-		assert.equal(planChangeReaction(phase), "change-round", phase);
+		assert.equal(planChangeReaction(phase), "ask-change-or-new-task", phase);
 	}
 	assert.deepEqual(routeForPhase("awaiting-pr"), { route: "normal" });
 });
@@ -275,4 +276,32 @@ test("the run's check baseline lasts across phases; one-stage flags do not", () 
 test("the review counts as passed only from the cleanup on, never after a failed re-review", () => {
 	for (const phase of ["cleanup", "cleanup-failed", "awaiting-pr", "awaiting-ship"] as const) assert.equal(hasPassedReview(phase), true, phase);
 	for (const phase of ["idle", "plan", "awaiting-implementation", "design", "implement", "review", "fix", "re-review", "review-failed"] as const) assert.equal(hasPassedReview(phase), false, phase);
+});
+
+const issueRef = { number: 42, title: "Totals", url: "https://github.com/o/r/issues/42", branch: "fix-42", baseBranch: "main" };
+
+test("the main chat gets no open-run note unless a finished run waits for the user", () => {
+	assert.equal(openRunNote({ phase: "idle" }), undefined);
+	assert.equal(openRunNote({ phase: "plan", task: "t" }), undefined);
+	assert.equal(openRunNote({ phase: "awaiting-implementation", task: "t", planPath: work.planPath }), undefined);
+	assert.equal(openRunNote({ phase: "implement", ...work }), undefined);
+	assert.equal(openRunNote({ phase: "review", ...work }), undefined);
+	assert.equal(openRunNote({ phase: "cleanup", ...work }), undefined);
+});
+
+test("a run waiting to ship tells the chat its state and points to /build instead of designing", () => {
+	const note = openRunNote({ phase: "awaiting-ship", ...work, worktree: { path: "/tmp/run-worktree", workspaceId: "w1", rootPaneId: "p1" } }) ?? "";
+	assert.ok(note.startsWith("## Open /build run"), note);
+	for (const fragment of [work.planPath, "/tmp/run-worktree", "/build ship", "/build stop", "hand_off_implementation", "save_agreed_plan"]) {
+		assert.ok(note.includes(fragment), `missing ${fragment}`);
+	}
+});
+
+test("each waiting phase names its own next step", () => {
+	assert.match(openRunNote({ phase: "awaiting-pr", ...work, issue: issueRef }) ?? "", /\/issue pr/);
+	assert.match(openRunNote({ phase: "review-failed", ...work, findings: "x" }) ?? "", /\/build implement/);
+	const cleanupNote = openRunNote({ phase: "cleanup-failed", ...work, failure: "New check failures since the run began:\nlint: src/a.ts" }) ?? "";
+	assert.match(cleanupNote, /\/build implement/);
+	assert.match(cleanupNote, /New check failures since the run began:/);
+	assert.ok(!cleanupNote.includes("lint: src/a.ts"), "only the failure's first line");
 });

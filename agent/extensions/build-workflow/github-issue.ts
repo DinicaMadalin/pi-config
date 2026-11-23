@@ -80,12 +80,9 @@ export function planSection(plan: string, heading: string): string | undefined {
 }
 
 /** "Fixes #N" makes GitHub close the issue when the PR merges. */
-export function pullRequestBody(issueNumber: number, plan: string): string {
-	const sections = ["Goal", "Approach"]
-		.map((heading) => [heading, planSection(plan, heading)] as const)
-		.filter((section): section is readonly [string, string] => section[1] !== undefined)
-		.map(([heading, text]) => `## ${heading}\n\n${text}`);
-	return [`Fixes #${issueNumber}`, ...sections, "Planned and reviewed by the expert model with /issue."].join("\n\n");
+export function pullRequestBody(issueNumber: number, publicBody: string): string {
+	const issueFooter = `Fixes #${issueNumber}`;
+	return publicBody.trim() ? `${issueFooter}\n\n${publicBody}` : issueFooter;
 }
 
 export function commandError(action: string, result: CommandResult): string {
@@ -170,8 +167,19 @@ export async function createIssueBranch(run: RunCommand, issue: GithubIssue, bra
 	return { ok: true, value: issueRef };
 }
 
-/** Commits everything on the issue branch, pushes it, and opens a draft PR; returns the PR URL. */
-export async function openDraftPullRequest(run: RunCommand, issue: IssueRef, plan: string): Promise<StepResult<string>> {
+export interface OpenedPullRequest {
+	url: string;
+	/** Plan lines left out of the PR body because they named local material. */
+	droppedLines: string[];
+}
+
+/** Commits everything on the issue branch, pushes it, and opens a draft PR with the plan's public text. */
+export async function openDraftPullRequest(
+	run: RunCommand,
+	issue: IssueRef,
+	plan: string,
+	repoRoots: readonly string[],
+): Promise<StepResult<OpenedPullRequest>> {
 	const currentBranch = await run("git", ["branch", "--show-current"]);
 	if (currentBranch.stdout.trim() !== issue.branch) {
 		return { ok: false, error: `Expected to be on branch ${issue.branch}, but HEAD is ${currentBranch.stdout.trim() || "detached"}` };
@@ -186,6 +194,7 @@ export async function openDraftPullRequest(run: RunCommand, issue: IssueRef, pla
 	const push = await run("git", ["push", "--set-upstream", "origin", issue.branch]);
 	if (push.code !== 0) return { ok: false, error: commandError(`push ${issue.branch}`, push) };
 
+	const publicPlan = publicPlanText(plan, repoRoots);
 	const create = await run("gh", [
 		"pr",
 		"create",
@@ -197,10 +206,13 @@ export async function openDraftPullRequest(run: RunCommand, issue: IssueRef, pla
 		"--title",
 		pullRequestTitle(issue),
 		"--body",
-		pullRequestBody(issue.number, plan),
+		pullRequestBody(issue.number, publicPlan.body),
 	]);
 	if (create.code !== 0) return { ok: false, error: commandError("open the draft pull request", create) };
-	return { ok: true, value: create.stdout.trim().split("\n").at(-1) ?? "" };
+	return {
+		ok: true,
+		value: { url: create.stdout.trim().split("\n").at(-1) ?? "", droppedLines: publicPlan.droppedLines },
+	};
 }
 
 const ISSUE_NUMBER_IN_URL_PATTERN = /\/issues\/(\d+)\s*$/;
@@ -213,29 +225,115 @@ export function planTitle(plan: string): string {
 	return heading?.slice(2).trim() || UNTITLED_PLAN;
 }
 
-/** The issue is the plan itself: its sections already state the problem, the steps and how to verify. */
-export function planIssueText(plan: string): { title: string; body: string } {
-	const title = planTitle(plan);
-	const body = plan
+/** Text that names this machine or the build flow's own files; a line holding one never goes to GitHub. */
+const LOCAL_MATERIAL_MARKERS = [".scratch/", "/home/", "/Users/", "~/"] as const;
+/** The plan sections GitHub shows, under the headings a reader of the repo expects. */
+const PUBLIC_SECTIONS = [
+	{ planHeading: "Goal", publicHeading: "Problem" },
+	{ planHeading: "Approach", publicHeading: "Proposed change" },
+	{ planHeading: "Acceptance criteria", publicHeading: "Acceptance criteria" },
+] as const;
+const MAX_NOTICE_LINE_LENGTH = 80;
+
+/** The plan as GitHub shows it: the problem and the change for the repo, without local paths or the build flow's files. */
+export interface PublicPlanText {
+	title: string;
+	body: string;
+	/** Lines left out because they still named local material after repo paths were made relative, in plan order. */
+	droppedLines: string[];
+}
+
+function withRepoRelativePaths(text: string, repoRoots: readonly string[]): string {
+	const normalizedRepoRoots = repoRoots
+		.map((root) => root.replace(/\/+$/, ""))
+		.filter((root) => root.length > 0)
+		.sort((left, right) => right.length - left.length);
+	return normalizedRepoRoots.reduce((relativeText, root) => relativeText.replaceAll(`${root}/`, ""), text);
+}
+
+function withoutLocalLines(text: string): { text: string; droppedLines: string[] } {
+	const keptLines: string[] = [];
+	const droppedLines: string[] = [];
+	let previousLineWasBlank = false;
+	for (const line of text.split("\n")) {
+		if (LOCAL_MATERIAL_MARKERS.some((marker) => line.includes(marker))) {
+			droppedLines.push(line.trim());
+			continue;
+		}
+		const lineIsBlank = line.trim().length === 0;
+		if (lineIsBlank && previousLineWasBlank) continue;
+		keptLines.push(line);
+		previousLineWasBlank = lineIsBlank;
+	}
+	return { text: keptLines.join("\n").trim(), droppedLines };
+}
+
+export function publicPlanText(plan: string, repoRoots: readonly string[]): PublicPlanText {
+	const originalTitle = planTitle(plan);
+	const rewrittenTitle = withRepoRelativePaths(originalTitle, repoRoots);
+	const titleContainsLocalMaterial = LOCAL_MATERIAL_MARKERS.some((marker) => rewrittenTitle.includes(marker));
+	const title = titleContainsLocalMaterial ? UNTITLED_PLAN : rewrittenTitle;
+	const droppedLines = titleContainsLocalMaterial ? [rewrittenTitle.trim()] : [];
+	const publicBodies: string[] = [];
+	let hasPublicSections = false;
+
+	for (const { planHeading, publicHeading } of PUBLIC_SECTIONS) {
+		const planSectionText = planSection(plan, planHeading);
+		if (planSectionText === undefined) continue;
+		hasPublicSections = true;
+		const publicSection = withoutLocalLines(withRepoRelativePaths(planSectionText, repoRoots));
+		droppedLines.push(...publicSection.droppedLines);
+		if (publicSection.text) publicBodies.push(`## ${publicHeading}\n\n${publicSection.text}`);
+	}
+
+	if (hasPublicSections) return { title, body: publicBodies.join("\n\n"), droppedLines };
+
+	const fallbackBody = plan
 		.split("\n")
-		.filter((line) => line.trim() !== `# ${title}`)
-		.join("\n")
-		.trim();
-	return { title, body: `${body}\n\n---\nPlanned with /build; an implementer agent works from this issue.` };
+		.filter((line) => line.trim() !== `# ${originalTitle}`)
+		.join("\n");
+	const publicFallback = withoutLocalLines(withRepoRelativePaths(fallbackBody, repoRoots));
+	droppedLines.push(...publicFallback.droppedLines);
+	return { title, body: publicFallback.text, droppedLines };
+}
+
+export function droppedLinesNotice(droppedLines: readonly string[], destination: string): string | undefined {
+	if (droppedLines.length === 0) return undefined;
+	const quotedDroppedLines = droppedLines.map((line) => {
+		const shortened = line.length > MAX_NOTICE_LINE_LENGTH ? `${line.slice(0, MAX_NOTICE_LINE_LENGTH - 1)}…` : line;
+		return `"${shortened}"`;
+	});
+	const droppedLineCount = droppedLines.length;
+	const lineNoun = droppedLineCount === 1 ? "line" : "lines";
+	const pronoun = droppedLineCount === 1 ? "it" : "they";
+	const verb = droppedLineCount === 1 ? "names" : "name";
+	return `Left ${droppedLineCount} ${lineNoun} out of ${destination} because ${pronoun} ${verb} local files: ${quotedDroppedLines.join("; ")}`;
 }
 
 export async function isGithubRepo(run: RunCommand): Promise<boolean> {
 	return (await currentRepo(run)).ok;
 }
 
-export async function createPlanIssue(run: RunCommand, plan: string): Promise<StepResult<TrackedIssue>> {
-	const { title, body } = planIssueText(plan);
-	const result = await run("gh", ["issue", "create", "--title", title, "--body", body]);
+export interface PostedPlanIssue {
+	issue: TrackedIssue;
+	/** Plan lines left out of the issue because they named local material. */
+	droppedLines: string[];
+}
+
+export async function createPlanIssue(run: RunCommand, plan: string, repoRoots: readonly string[]): Promise<StepResult<PostedPlanIssue>> {
+	const publicPlan = publicPlanText(plan, repoRoots);
+	const result = await run("gh", ["issue", "create", "--title", publicPlan.title, "--body", publicPlan.body]);
 	if (result.code !== 0) return { ok: false, error: commandError("create the GitHub issue", result) };
 	const url = result.stdout.trim().split("\n").at(-1) ?? "";
 	const numberMatch = ISSUE_NUMBER_IN_URL_PATTERN.exec(url);
 	if (!numberMatch) return { ok: false, error: `Created the issue, but gh printed no issue URL: ${url || "(empty)"}` };
-	return { ok: true, value: { number: Number(numberMatch[1]), title, url } };
+	return {
+		ok: true,
+		value: {
+			issue: { number: Number(numberMatch[1]), title: publicPlan.title, url },
+			droppedLines: publicPlan.droppedLines,
+		},
+	};
 }
 
 /**
@@ -334,13 +432,23 @@ export async function shipWork(run: RunCommand, request: ShipRequest): Promise<S
 	return { kind: "shipped", branch: request.branch };
 }
 
-/** After a plan change: the plan issue shows the new plan, and a comment tells its readers it changed. */
-export async function updatePlanIssue(run: RunCommand, planIssue: TrackedIssue, plan: string, planRevision: number): Promise<StepResult<void>> {
-	const { body } = planIssueText(plan);
-	const edit = await run("gh", ["issue", "edit", String(planIssue.number), "--body", body]);
+export interface UpdatedPlanIssue {
+	/** Plan lines left out of the issue because they named local material. */
+	droppedLines: string[];
+}
+
+/** After a plan change: the plan issue shows the new plan's public text, and a short comment says it changed. */
+export async function updatePlanIssue(
+	run: RunCommand,
+	planIssue: TrackedIssue,
+	plan: string,
+	repoRoots: readonly string[],
+): Promise<StepResult<UpdatedPlanIssue>> {
+	const publicPlan = publicPlanText(plan, repoRoots);
+	const edit = await run("gh", ["issue", "edit", String(planIssue.number), "--body", publicPlan.body]);
 	if (edit.code !== 0) return { ok: false, error: commandError(`update issue #${planIssue.number}`, edit) };
-	const note = `The plan changed (revision ${planRevision}); the issue body now holds the updated plan.`;
+	const note = "Plan updated.";
 	const comment = await run("gh", ["issue", "comment", String(planIssue.number), "--body", note]);
 	if (comment.code !== 0) return { ok: false, error: commandError(`comment on issue #${planIssue.number}`, comment) };
-	return { ok: true, value: undefined };
+	return { ok: true, value: { droppedLines: publicPlan.droppedLines } };
 }

@@ -350,9 +350,16 @@ export function stepAfterTurn(state: DelegatedState, stageAnswer: string): Workf
  * - tell-implementer: the implementer gets the change right away
  * - ask-about-review: the reviewers check the old plan; you choose to stop them or apply the change after them
  * - change-round: the work was reviewed; the implementer applies the change and both reviewers review again
+ * - ask-change-or-new-task: the finished run waits for you; you say whether the plan changes its work or is a new task
  * - offer-new-run: no run is on; you may start a new one from the saved plan
  */
-export type PlanChangeReaction = "ask-to-start" | "tell-implementer" | "ask-about-review" | "change-round" | "offer-new-run";
+export type PlanChangeReaction =
+	| "ask-to-start"
+	| "tell-implementer"
+	| "ask-about-review"
+	| "change-round"
+	| "ask-change-or-new-task"
+	| "offer-new-run";
 
 export function planChangeReaction(phase: WorkflowPhase): PlanChangeReaction {
 	switch (phase) {
@@ -367,14 +374,53 @@ export function planChangeReaction(phase: WorkflowPhase): PlanChangeReaction {
 		case "re-review":
 			return "ask-about-review";
 		case "cleanup":
+			return "change-round";
 		case "cleanup-failed":
 		case "review-failed":
 		case "awaiting-pr":
 		case "awaiting-ship":
-			return "change-round";
+			return "ask-change-or-new-task";
 		case "idle":
 			return "offer-new-run";
 	}
+}
+
+/** System prompt section of the main chat while a finished run waits for the user (openRunNote). */
+export const OPEN_RUN_SECTION_KEY = "build_workflow_open_run";
+
+export function openRunNote(state: WorkflowState): string | undefined {
+	if (!isAwaitingUser(state.phase)) return undefined;
+
+	const phaseInstructions = {
+		"awaiting-ship": {
+			waitingFor: "the review passed and the work waits to be shipped",
+			nextStep: "/build ship ships it (or call ship_build when the user asks to ship)",
+		},
+		"awaiting-pr": {
+			waitingFor: "the review passed and the work waits for its draft PR",
+			nextStep: "/issue pr opens the draft PR",
+		},
+		"review-failed": {
+			waitingFor: "the re-review still has findings and waits for the user's decision",
+			nextStep: "/build implement asks what to do next",
+		},
+		"cleanup-failed": {
+			waitingFor: "the contract cleanup or its checks failed and wait for the user's decision",
+			nextStep: "/build implement asks what to do next",
+		},
+	}[state.phase];
+	const worktreeNote = state.worktree ? `Its work is in ${state.worktree.path}.` : undefined;
+	const failureNote = state.phase === "cleanup-failed" ? `Failure: ${state.failure.split(/\r?\n/, 1)[0]}` : undefined;
+
+	return [
+		"## Open /build run",
+		`A /build run is open: ${phaseInstructions.waitingFor}.`,
+		...(failureNote ? [failureNote] : []),
+		`Its plan: ${state.planPath}.`,
+		...(worktreeNote ? [worktreeNote] : []),
+		`Next step: ${phaseInstructions.nextStep}; /build stop ends the run; its changes stay uncommitted.`,
+		"While this run is open, do not design or implement in this chat: no contracts, no hand_off_implementation, no file edits. Point the user to the commands above. To change this run's work or start a new task, save the agreed plan with save_agreed_plan: the user is then asked whether it changes this run's work or is a new task.",
+	].join("\n");
 }
 
 /** The run's state once a plan change was counted. */

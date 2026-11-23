@@ -29,10 +29,10 @@ function listRuleFiles(ruleFilePaths: readonly string[]): string {
 /** Steps 3 to 5 of planning: agreement, then a plan the implementer can follow without this conversation. */
 const AGREE_AND_SAVE_PLAN_STEPS = [
 	"3. Discuss with me until I explicitly agree with both the goal and the approach. Do not edit any file in this phase.",
-	`4. Once I agree, call ${SAVE_PLAN_TOOL_NAME}. The plan is the implementers' only brief, and they run on cheaper models`,
-	"   that follow instructions well but should not have to design anything. So you do the thinking: write the plan",
-	"   implementation-ready, for a capable developer who has never seen this repo. It may be posted as a GitHub issue,",
-	"   so it must stand on its own and hold no secrets, tokens or personal data:",
+	`4. Once I agree, call ${SAVE_PLAN_TOOL_NAME}. The plan is the implementers' only brief: they follow`,
+	"   instructions well but should not have to design anything. So you do the thinking: write the plan",
+	"   implementation-ready, for a capable developer who has never seen this repo. Only Goal, Approach and Acceptance",
+	"   criteria may be posted as a public GitHub issue; the plan must stand on its own and hold no secrets, tokens or personal data:",
 	"   - Goal: start with the problem (what is wrong or missing, why it matters, how to see it), then the result we want.",
 	"   - Approach: small numbered steps in order, each one change an implementer can make and check on its own. Each",
 	"     step names the file, the exact functions or types to add or change with their full signatures, the data shapes,",
@@ -44,6 +44,9 @@ const AGREE_AND_SAVE_PLAN_STEPS = [
 	"     test style), each with an existing file to copy the style from.",
 	"   - Acceptance criteria: the observable behavior plus the exact typecheck, lint and test commands.",
 	"   - Files: every file to create or change, one line each.",
+	"   - Never name a branch, not even as a suggestion: the run names branches itself.",
+	"   - Goal, Approach and Acceptance criteria must not mention this workflow, agents, models, handoffs or plan files;",
+	"     write them for a reader of the repo: the problem and the change. Local paths belong in Files.",
 	`   - Work streams (optional): up to ${MAX_IMPLEMENTERS} implementers can build in parallel, in the same folder. When the work`,
 	`     splits into parts that touch different files, add a \`${WORK_STREAMS_HEADING}\` section with one \`### <short name>\``,
 	"     subsection per part: the files it owns and its Approach steps. No file may be in two streams. Use one stream",
@@ -107,16 +110,15 @@ function issueLine(issue: IssueRef | undefined): string[] {
 	return [`This fixes GitHub issue #${issue.number} (${issue.url}): ${issue.title}`, ""];
 }
 
-function readPlanIssueCommand(planIssue: TrackedIssue): string {
-	return `\`gh issue view ${planIssue.number} --json title,body,comments\``;
+function readPlanIssueCommentsCommand(planIssue: TrackedIssue): string {
+	return `\`gh issue view ${planIssue.number} --json comments\``;
 }
 
 function planSourceLines(planPath: string, planIssue: TrackedIssue | undefined): string[] {
 	if (!planIssue) return [];
 	return [
-		`The plan is GitHub issue #${planIssue.number} (${planIssue.url}). Read it first with ${readPlanIssueCommand(planIssue)}:`,
-		"it is the source of truth, including comments added after planning. The text below is the plan as agreed, also",
-		`saved at ${planPath}, for when gh is unavailable.`,
+		`The plan below (saved at ${planPath}) is the source of truth. GitHub issue #${planIssue.number} (${planIssue.url}) holds its public summary;`,
+		`read only the comments added after planning, with ${readPlanIssueCommentsCommand(planIssue)}, and follow them where they change the plan.`,
 		"",
 	];
 }
@@ -192,7 +194,7 @@ export function designPrompt(planPath: string, plan: string, baseCommit?: string
 		"[/build: DESIGN] You are the expert designer. Work in this run's checkout, not the planner's checkout.",
 		`Read the agreed plan at ${planPath} and the repo rules. The plan is also included below:`,
 		"", plan.trim(), "",
-		"Prepare the files for cheaper implementers; do not implement the production function bodies.",
+		"Prepare the files for the implementers; do not implement the production function bodies.",
 		"1. Inspect the current code and callers. Create exact signatures, domain types and stub bodies for new functions.",
 		"   For existing functions, preserve working bodies and unrelated behavior; annotate the changes they need.",
 		"2. Put each temporary behavior contract immediately above its function, using standalone comment lines:",
@@ -341,7 +343,7 @@ export function reviewPrompt(
 	newCheckFailures?: string,
 ): string {
 	const planSource = planIssue
-		? `GitHub issue #${planIssue.number} (${planIssue.url}; read it with ${readPlanIssueCommand(planIssue)}, local copy at ${planPath})`
+		? `the agreed plan at ${planPath} (GitHub issue #${planIssue.number} (${planIssue.url}) holds its public summary; read comments added later with ${readPlanIssueCommentsCommand(planIssue)})`
 		: `the agreed plan at ${planPath}`;
 	const issueCheck = issue
 		? [`- Issue: the change fixes issue #${issue.number}'s root cause, and a test reproduces the issue and now passes.`]
@@ -402,8 +404,8 @@ export interface FixCrewMember {
 }
 
 /**
- * Sent to the planner when the reviewers ask for fixes: the implementers run on cheap models, so the planner checks
- * the findings and writes the exact steps they follow.
+ * Sent to the planner when the reviewers ask for fixes: the planner checks the findings and writes the exact steps
+ * the implementers follow.
  */
 export function fixStepsPrompt(reviewReport: string, crew: readonly FixCrewMember[]): string {
 	const isSeveral = crew.length > 1;
@@ -416,8 +418,7 @@ export function fixStepsPrompt(reviewReport: string, crew: readonly FixCrewMembe
 		: ["4. Write the steps as one ordered list for the implementer."];
 	return [
 		"[/build: FIX STEPS] Reviewers reviewed the implementation and asked for fixes; their reports are below.",
-		"The implementers run on cheaper models: they follow your fix steps exactly and design nothing themselves, so the",
-		"thinking is yours.",
+		"The implementers follow your fix steps exactly and design nothing themselves, so the thinking is yours.",
 		"",
 		reviewReport.trim(),
 		"",
@@ -654,6 +655,23 @@ function formatMinutes(durationMs: number): string {
 }
 
 /** Posted in the planner's session when a run ends: who did what, the changes, and the last review. */
+/**
+ * Hidden note after the run report: the main chat, where you started the run, answers you with a short message
+ * instead of staying silent, and asks before the next step (shipping waits for your yes).
+ */
+export const RUN_FINISHED_REPLY_PROMPT = [
+	"[/build: RUN FINISHED] The /build run just ended. Its report, with the reviewer's report, is the message above.",
+	"Write the user a short message in plain words; do not repeat the report or its table:",
+	"1. The outcome in one line: everything passed and is okay, or what is still wrong. State only what the report",
+	"   shows; never claim a check or review passed when the report does not say so.",
+	"2. What was implemented: two to five bullets in the user's terms, from the plan and the reports.",
+	"3. The next step you propose, in one or two lines. After a passed review that is usually shipping it (a new branch,",
+	`   one commit and a normal push, with ${"`ship_build`"}); for a GitHub issue run, opening the draft PR with /issue pr; when`,
+	"   findings remain, what to do about them.",
+	"4. End with one question: does the user agree with that next step?",
+	"Do not ship, commit, push or edit anything in this turn. Only once the user agrees to shipping, call ship_build.",
+].join("\n");
+
 export function runReport(summary: string, stages: readonly StageRecord[], changes: string | undefined): string {
 	const rows = stages.map((stage) => {
 		const model = stage.model ? `${stage.model}${stage.thinkingLevel ? ` · ${stage.thinkingLevel}` : ""}` : "unknown";

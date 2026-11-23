@@ -92,6 +92,7 @@ import {
 	handoffRefusal,
 	handoffTransition,
 	hasImplementerChangedFiles,
+	readDesignTaskProgress,
 	IMPLEMENTER_BLOCKED_TOOLS,
 	IMPLEMENTER_TIER,
 	implementerBrief,
@@ -169,7 +170,14 @@ function stayOn(
 	const policies = loadTierPolicies();
 	const tier = request.state?.tier ?? FALLBACK_TIER;
 	const thinkingLevel = request.state?.thinkingLevel ?? policies[tier].thinkingLevel;
-	if (memory.benchedModels.isBenched(modelKey(model), Date.now())) {
+	const previousModelKey = modelKey(model);
+	const routedModelKey = request.state?.modelKey;
+	const routeUsesDifferentModel = routedModelKey !== undefined && routedModelKey !== previousModelKey;
+	const routedModel = routeUsesDifferentModel
+		? usableModels(memory, ctx).find((availableModel) => modelKey(availableModel) === routedModelKey)
+		: undefined;
+	if (routedModel) return { model: routedModel, thinkingLevel };
+	if (routeUsesDifferentModel || memory.benchedModels.isBenched(previousModelKey, Date.now())) {
 		if (request.state?.designTask && request.state.handoff?.phase !== "implementing") {
 			const designChoice = chooseDesignerModel(usableModels(memory, ctx), policies, latestUserMessageHasImage(request.messages));
 			if (!designChoice) {
@@ -215,7 +223,7 @@ function routeToDesigner(
 	const { designer } = handoff;
 	const thinkingLevel = designer.thinkingLevel ?? policies[designer.tier].thinkingLevel;
 	const routeAction =
-		transition === "review" ? "reviews the cheaper implementer's work" : "takes over after the implementer changed no file";
+		transition === "review" ? "reviews the implementer's work" : "takes over after the implementer changed no file";
 	const needsImageInput = latestUserMessageHasImage(request.messages);
 	const available = usableModels(memory, ctx);
 	const originalDesigner = available.find((model) => modelKey(model) === designer.modelKey);
@@ -468,6 +476,7 @@ function remindDesigner(event: AgentBeforeSettleEvent, ctx: ExtensionContext): B
 		(entry) => entry.type === "custom" && entry.customType === DESIGN_REMINDER_ENTRY_TYPE &&
 			(entry.data as { taskId?: unknown } | undefined)?.taskId === state.designTask?.id,
 	);
+	const progress = readDesignTaskProgress(branch, state.designTask.id);
 	const latestAssistantText = event.context.contextEntries
 		.flatMap((entry) => entry.messages)
 		.filter((message) => message.role === "assistant")
@@ -477,7 +486,7 @@ function remindDesigner(event: AgentBeforeSettleEvent, ctx: ExtensionContext): B
 				: message.content.flatMap((block) => (block.type === "text" ? [block.text] : [])).join("\n"),
 		)
 		.at(-1) ?? "";
-	if (!shouldRemindDesigner(state.designTask, false, alreadyReminded || alreadyProposed, latestAssistantText)) return undefined;
+	if (!shouldRemindDesigner(state.designTask, false, alreadyReminded || alreadyProposed, latestAssistantText, progress)) return undefined;
 	return {
 		entries: [
 			...event.entries,
@@ -620,10 +629,10 @@ function registerHandoffTools(pi: ExtensionAPI): void {
 		name: HANDOFF_TOOL_NAME,
 		label: "Hand off implementation",
 		description:
-			"Hand the implementation of a designed change to a cheaper model on the auto model. Call it as the designer of a " +
+			"Hand the implementation of a designed change to an implementer model. Call it as the designer of a " +
 			`design-first task, after a '${DESIGNER_NOTE_MESSAGE_TYPE}' note, or as the reviewer to send fix steps. ` +
-			"The next turns run on the cheaper model; you review its work afterwards.",
-		promptSnippet: "Hand a designed change (signatures, stubs, contract blocks) to a cheaper implementer model",
+			"The implementer works next; you review its work afterwards.",
+		promptSnippet: "Hand a designed change (signatures, stubs, contract blocks) to an implementer model",
 		promptGuidelines: [
 			`Use ${HANDOFF_TOOL_NAME} as the designer of a design-first task or after the designer note, or as the reviewer for fixes; it refuses otherwise.`,
 		],

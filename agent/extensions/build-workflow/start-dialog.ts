@@ -6,9 +6,9 @@ import type { BuildOrchestrator } from "./build-orchestrator.ts";
 import { runBuildChecks } from "./build-checks.ts";
 import { currentReviewerLineup } from "./reviewer-lineup.ts";
 import { useAutoModel } from "./planner-model.ts";
-import { createPlanIssue, isGithubRepo, planTitle, shortBranchSlug } from "./github-issue.ts";
+import { createPlanIssue, droppedLinesNotice, isGithubRepo, planTitle, shortBranchSlug } from "./github-issue.ts";
 import type { PlannerSession } from "./planner-session.ts";
-import { findHeadCommit, findRuleFiles } from "./repo-files.ts";
+import { findHeadCommit, findPlanRepoRoots, findRuleFiles } from "./repo-files.ts";
 import { createRunWorktree, hasUncommittedChanges } from "./run-worktree.ts";
 import type { CheckResult } from "../quality-gate/check-baseline.ts";
 import { implementationBrief } from "./workflow-prompts.ts";
@@ -95,13 +95,17 @@ export class StartDialog {
 		if (workflow.phase !== "awaiting-implementation") return;
 		const plan = this.session.readPlan(workflow.planPath);
 		if (plan === undefined) return;
-		const planIssue = await createPlanIssue(this.session.run, plan);
-		if (!planIssue.ok) {
-			this.session.notify(`${planIssue.error}. /build implement asks again.`, "error");
+		const repoRoots = await findPlanRepoRoots(this.session.runInSessionDir, this.session.run);
+		const postedPlanIssue = await createPlanIssue(this.session.run, plan, repoRoots);
+		if (!postedPlanIssue.ok) {
+			this.session.notify(`${postedPlanIssue.error}. /build implement asks again.`, "error");
 			return;
 		}
-		this.session.notify(`Created issue #${planIssue.value.number}: ${planIssue.value.url}`, "info");
-		await this.startImplementation(planIssue.value);
+		const postedIssue = postedPlanIssue.value.issue;
+		this.session.notify(`Created issue #${postedIssue.number}: ${postedIssue.url}`, "info");
+		const droppedLinesWarning = droppedLinesNotice(postedPlanIssue.value.droppedLines, `issue #${postedIssue.number}`);
+		if (droppedLinesWarning) this.session.notify(droppedLinesWarning, "warning");
+		await this.startImplementation(postedIssue);
 	}
 
 	private async startImplementation(planIssue?: TrackedIssue): Promise<void> {

@@ -13,6 +13,11 @@ export async function findRepoRoot(run: RunCommand): Promise<string | undefined>
 	return result.code === 0 ? result.stdout.trim() : undefined;
 }
 
+export async function findPlanRepoRoots(runInSessionDir: RunCommand, runInWorkDir: RunCommand): Promise<string[]> {
+	const discoveredRoots = await Promise.all([findRepoRoot(runInSessionDir), findRepoRoot(runInWorkDir)]);
+	return [...new Set(discoveredRoots.filter((root): root is string => root !== undefined))];
+}
+
 /** The commit the reviewers diff against; undefined outside a git repo or before the first commit. */
 export async function findHeadCommit(run: RunCommand): Promise<string | undefined> {
 	const result = await run("git", ["rev-parse", "HEAD"]);

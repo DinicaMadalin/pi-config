@@ -30,7 +30,7 @@ import { createBuildSpace } from "./build-space.ts";
 import { herdrSubagentLauncher } from "./herdr-subagent.ts";
 import { launchSubagentProcess } from "./subagent-process.ts";
 import { ISSUE_USAGE, openPullRequest, promptForPullRequest, startIssueWorkflow } from "./issue-workflow.ts";
-import { PlanChanges } from "./plan-changes.ts";
+import { type FinishedRunExits, PlanChanges } from "./plan-changes.ts";
 import { restorePreviousModel, useAutoModel } from "./planner-model.ts";
 import { createPlannerSeat } from "./planner-seat.ts";
 import { phaseLabel, PlannerSession } from "./planner-session.ts";
@@ -45,16 +45,21 @@ import {
 	isAwaitingUser,
 	isDelegatedPhase,
 	isFeatureState,
+	OPEN_RUN_SECTION_KEY,
+	openRunNote,
+	planChangeReaction,
 	PROJECT_TRUST_ENV_VAR,
 	type RunWorktree,
 	runWorktreeOf,
 	SUBAGENT_ENV_VAR,
+	type WorkflowPhase,
 	type WorkflowState,
 } from "./workflow-state.ts";
 import { tooManyStreamsWarning } from "./work-streams.ts";
 
 const FILE_EDITING_TOOLS = new Set(["edit", "write"]);
 const START_OFFER_NOTE = "The user is now asked whether to start the build on this plan (designer, implementers, reviewers). End your turn now: do not implement anything in this turn.";
+const FINISHED_RUN_CHOICE_NOTE = "The user is now asked whether this plan changes the finished /build run's work or is a new task. End your turn now: do not implement anything in this turn.";
 const USAGE = "Usage: /build <task> | /build implement | /build plan | /build ship | /build status | /build stop | /build here | /build back";
 
 const REVIEW_FAILED_CHOICES = {
@@ -72,6 +77,12 @@ const CLEANUP_FAILED_CHOICES = {
 } as const;
 
 const SHIP_TOOL_NAME = "ship_build";
+
+/** Told to the planner after a plan save that opens a dialog, so it ends its turn; empty when none opens. */
+function dialogAfterSaveNote(phase: WorkflowPhase): string {
+	if (phase === "idle") return START_OFFER_NOTE;
+	return planChangeReaction(phase) === "ask-change-or-new-task" ? FINISHED_RUN_CHOICE_NOTE : "";
+}
 
 /** In a subagent's process: the run's worktree is a new folder to Pi, so it takes over your trust decision instead of asking. */
 function takeOverProjectTrust(pi: ExtensionAPI): void {
@@ -103,12 +114,15 @@ export default function (pi: ExtensionAPI) {
 	}
 	const session = new PlannerSession(pi);
 
+	/** The latest run end, so a new task waits until shipping has fully ended the finished run. */
+	let runEnding: Promise<void> = Promise.resolve();
+
 	/**
 	 * The run is over: subagents stopped (their herdr panes closed), the planner back on normal routing and on the
 	 * model you had before. Released work (shipped, PR opened) frees its worktree; otherwise the worktree stays.
 	 */
 	function endRun(summary: string, isWorkReleased = false): void {
-		void endRunAndRestoreModel(summary, isWorkReleased);
+		runEnding = endRunAndRestoreModel(summary, isWorkReleased);
 	}
 
 	async function endRunAndRestoreModel(summary: string, isWorkReleased: boolean): Promise<void> {
@@ -149,11 +163,14 @@ export default function (pi: ExtensionAPI) {
 		return undefined;
 	}
 
-	/** The subagents are done; what follows needs you. */
+	/**
+	 * The subagents are done; what follows needs you. A passed run does not open the ship dialog here: the main chat
+	 * reads the run report, tells you what was built, proposes shipping and asks first (RUN_FINISHED_REPLY_PROMPT).
+	 */
 	function handleRunFinished(next: WorkflowState, summary: string): void {
 		session.enterPhase(next);
 		if (next.phase === "awaiting-pr") promptForPullRequest(session);
-		else if (next.phase === "awaiting-ship") void shipping.confirmAndShip();
+		else if (next.phase === "awaiting-ship") return;
 		else if (next.phase === "review-failed") void askAfterFailedReview();
 		else if (next.phase === "cleanup-failed") void askAfterFailedCleanup();
 		else endRun(summary);
@@ -165,7 +182,15 @@ export default function (pi: ExtensionAPI) {
 		: launchSubagentProcess;
 	const orchestrator = new BuildOrchestrator(createPlannerSeat(session, handleRunFinished), launchSubagent);
 	const startDialog = new StartDialog(session, orchestrator);
-	const planChanges = new PlanChanges(session, orchestrator, startDialog);
+	const finishedRunExits: FinishedRunExits = {
+		ship: async () => {
+			const outcome = await shipping.confirmAndShip();
+			await runEnding;
+			return outcome;
+		},
+		stop: () => endRunAndRestoreModel("stopped for a new task; its changes stay uncommitted", false),
+	};
+	const planChanges = new PlanChanges(session, orchestrator, startDialog, finishedRunExits);
 	const shipping = new Shipping(session, endRun);
 
 	async function askAfterFailedReview(): Promise<void> {
@@ -179,8 +204,11 @@ export default function (pi: ExtensionAPI) {
 		switch (choice) {
 			case REVIEW_FAILED_CHOICES.fixAgain:
 				return orchestrator.fixAgain();
-			case REVIEW_FAILED_CHOICES.accept:
-				return orchestrator.acceptAnyway();
+			case REVIEW_FAILED_CHOICES.accept: {
+				const refusal = orchestrator.acceptAnyway();
+				if (!refusal && session.workflow.phase === "awaiting-ship") void shipping.confirmAndShip();
+				return refusal;
+			}
 			case REVIEW_FAILED_CHOICES.reReview:
 				return orchestrator.reReview();
 			default:
@@ -304,11 +332,19 @@ export default function (pi: ExtensionAPI) {
 		const planPath = planChanges.keepOnePlanFile(savedPath);
 		planChanges.notePlanSaved(planPath);
 		const streamsWarning = tooManyStreamsWarning(session.readPlan(planPath) ?? "");
-		const startNote = session.workflow.phase === "idle" && session.hasUI ? START_OFFER_NOTE : "";
+		const startNote = session.hasUI ? dialogAfterSaveNote(session.workflow.phase) : "";
 		if (planPath === savedPath && !streamsWarning && !startNote) return undefined;
 		const saved = planPath === savedPath ? `Plan saved to ${planPath}` : `Plan saved to ${planPath} (the run's plan, updated)`;
 		const message = [saved, streamsWarning, startNote].filter(Boolean).join("\n");
 		return { content: [{ type: "text", text: message }], details: { planPath } };
+	});
+
+	// While a finished run waits for you, the chat points to /build instead of starting its own design-first flow.
+	pi.on("before_agent_start", (event) => {
+		const sections = event.systemPromptOptions.sections;
+		const note = openRunNote(session.workflow);
+		if (note) sections[OPEN_RUN_SECTION_KEY] = note;
+		else delete sections[OPEN_RUN_SECTION_KEY];
 	});
 
 	pi.on("agent_settled", async (event, ctx) => {

@@ -8,6 +8,7 @@ import type { PlannerSession } from "./planner-session.ts";
 import { findRuleFiles } from "./repo-files.ts";
 import type { SubagentDialogs } from "./subagent-process.ts";
 import { loadWorkChanges } from "./work-changes.ts";
+import { RUN_FINISHED_REPLY_PROMPT } from "./workflow-prompts.ts";
 import {
 	BUILD_STAGE_ENTRY_TYPE,
 	findCrew,
@@ -64,7 +65,10 @@ export function createPlannerSeat(session: PlannerSession, finish: (next: Workfl
 			return `+${added} −${removed} in ${describeCount(files.length, "file")}`;
 		},
 		askPlanner: (prompt) => session.sendToPlanner(prompt),
-		postReport: (report) => pi.sendMessage({ customType: REPORT_MESSAGE_TYPE, content: report, display: true }),
+		postReport: (report) => {
+			pi.sendMessage({ customType: REPORT_MESSAGE_TYPE, content: report, display: true });
+			pi.sendMessage({ customType: REPORT_MESSAGE_TYPE, content: RUN_FINISHED_REPLY_PROMPT, display: false }, { triggerTurn: true, deliverAs: "followUp" });
+		},
 		notify: (message, level) => session.notify(message, level),
 		callUser: (message) => session.callUser(message),
 		isProjectTrusted: () => session.context.isProjectTrusted(),
