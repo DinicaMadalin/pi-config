@@ -83,3 +83,18 @@ test("without a baseline every failing check blocks shipping", async () => {
 	const failure = await finalizeBuildContracts(realExec, repo, baseCommit, undefined, new AbortController().signal, () => {});
 	assert.ok(failure?.includes("old.ts: e1"), failure);
 });
+
+test("in a repo with no commit yet the contracts are removed from staged and new files", async () => {
+	const repo = mkdtempSync(join(tmpdir(), "contract-verification-unborn-"));
+	git(repo, "init", "-q");
+	mkdirSync(join(repo, "src"));
+	const contracted = ["// @handoff-contract" + " begin", "// a is 2.", "// @handoff-contract" + " end", "export const a = 2;", ""].join("\n");
+	writeFileSync(join(repo, "src", "staged.ts"), contracted);
+	git(repo, "add", ".");
+	writeFileSync(join(repo, "src", "new.ts"), contracted);
+	const emptyTree = spawnSync("git", ["hash-object", "-t", "tree", "/dev/null"], { cwd: repo, encoding: "utf8" }).stdout.trim();
+	const failure = await finalizeBuildContracts(realExec, repo, emptyTree, undefined, new AbortController().signal, () => {});
+	assert.equal(failure, undefined);
+	assert.equal(readFileSync(join(repo, "src", "staged.ts"), "utf8"), "export const a = 2;\n");
+	assert.equal(readFileSync(join(repo, "src", "new.ts"), "utf8"), "export const a = 2;\n");
+});

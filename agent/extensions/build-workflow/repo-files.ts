@@ -18,10 +18,17 @@ export async function findPlanRepoRoots(runInSessionDir: RunCommand, runInWorkDi
 	return [...new Set(discoveredRoots.filter((root): root is string => root !== undefined))];
 }
 
-/** The commit the reviewers diff against; undefined outside a git repo or before the first commit. */
-export async function findHeadCommit(run: RunCommand): Promise<string | undefined> {
-	const result = await run("git", ["rev-parse", "HEAD"]);
-	return result.code === 0 ? result.stdout.trim() : undefined;
+/**
+ * What the run's changes are diffed against: HEAD, or in a repo with no commit yet the empty tree, so every file the
+ * work adds counts as changed instead of git failing on the missing HEAD. Undefined outside a git repo.
+ */
+export async function findDiffBase(run: RunCommand): Promise<string | undefined> {
+	const head = await run("git", ["rev-parse", "--verify", "--quiet", "HEAD"]);
+	if (head.code === 0) return head.stdout.trim();
+	if ((await findRepoRoot(run)) === undefined) return undefined;
+	// The empty tree's id depends on the repo's hash algorithm (SHA-1 or SHA-256), so git computes it.
+	const emptyTree = await run("git", ["hash-object", "-t", "tree", "/dev/null"]);
+	return emptyTree.code === 0 ? emptyTree.stdout.trim() : undefined;
 }
 
 /** Repo-level then directory-level rule files, then the global one: the rules Pi loads into context. */

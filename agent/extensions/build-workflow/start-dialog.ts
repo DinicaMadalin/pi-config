@@ -8,7 +8,7 @@ import { currentReviewerLineup } from "./reviewer-lineup.ts";
 import { useAutoModel } from "./planner-model.ts";
 import { createPlanIssue, droppedLinesNotice, isGithubRepo, planTitle, shortBranchSlug } from "./github-issue.ts";
 import type { PlannerSession } from "./planner-session.ts";
-import { findHeadCommit, findPlanRepoRoots, findRuleFiles } from "./repo-files.ts";
+import { findDiffBase, findPlanRepoRoots, findRuleFiles } from "./repo-files.ts";
 import { createRunWorktree, hasUncommittedChanges } from "./run-worktree.ts";
 import type { CheckResult } from "../quality-gate/check-baseline.ts";
 import { implementationBrief } from "./workflow-prompts.ts";
@@ -129,7 +129,7 @@ export class StartDialog {
 		const worktree = issue?.worktree ?? (await this.createBuildWorktree(plan));
 		const workDir = worktree?.path ?? this.session.context.cwd;
 		const ruleFiles = await findRuleFiles(this.session.run, workDir);
-		const baseCommit = await findHeadCommit(this.session.run);
+		const baseCommit = await findDiffBase(this.session.run);
 		this.session.notify("Recording the baseline checks before the designer starts…", "info");
 		let checkBaseline: CheckResult[] | undefined;
 		try {

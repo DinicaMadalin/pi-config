@@ -7,6 +7,7 @@ import type { PlannerSeat } from "./build-orchestrator.ts";
 import type { PlannerSession } from "./planner-session.ts";
 import { findRuleFiles } from "./repo-files.ts";
 import type { SubagentDialogs } from "./subagent-process.ts";
+import { findDiffBase } from "./repo-files.ts";
 import { loadWorkChanges } from "./work-changes.ts";
 import { RUN_FINISHED_REPLY_PROMPT } from "./workflow-prompts.ts";
 import {
@@ -74,10 +75,12 @@ export function createPlannerSeat(session: PlannerSession, finish: (next: Workfl
 		isProjectTrusted: () => session.context.isProjectTrusted(),
 		reviewerLineup: () => currentReviewerLineup(session.context),
 		runChecks: (signal) => runBuildChecks(pi, session.workDir, session.context.isProjectTrusted(), signal, (message) => session.notify(message, "info")),
-		changedFiles: (baseCommit, signal) => listFilesChangedSince(pi, session.workDir, baseCommit, signal),
-		finalizeContracts: (work, signal) => {
-			if (!session.context.isProjectTrusted()) return Promise.resolve("Trust the project before running post-cleanup checks");
-			return finalizeBuildContracts(pi, session.workDir, work.baseCommit, work.checkBaseline, signal, (message) => session.notify(message, "info"));
+		// Runs started before the repo had a commit stored no base; findDiffBase gives them the empty tree.
+		changedFiles: async (baseCommit, signal) => listFilesChangedSince(pi, session.workDir, baseCommit ?? (await findDiffBase(session.run)), signal),
+		finalizeContracts: async (work, signal) => {
+			if (!session.context.isProjectTrusted()) return "Trust the project before running post-cleanup checks";
+			const baseCommit = work.baseCommit ?? (await findDiffBase(session.run));
+			return finalizeBuildContracts(pi, session.workDir, baseCommit, work.checkBaseline, signal, (message) => session.notify(message, "info"));
 		},
 		finish,
 		dialogs: queuedDialogs(session),
