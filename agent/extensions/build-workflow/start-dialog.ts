@@ -6,7 +6,7 @@ import type { BuildOrchestrator } from "./build-orchestrator.ts";
 import { runBuildChecks } from "./build-checks.ts";
 import { currentReviewerLineup } from "./reviewer-lineup.ts";
 import { useAutoModel } from "./planner-model.ts";
-import { createPlanIssue, droppedLinesNotice, isGithubRepo, planTitle, shortBranchSlug } from "./github-issue.ts";
+import { createPlanIssue, droppedLinesNotice, isGithubRepo, issueBranchName, planTitle, shortBranchSlug } from "./github-issue.ts";
 import type { PlannerSession } from "./planner-session.ts";
 import { findDiffBase, findPlanRepoRoots, findRuleFiles } from "./repo-files.ts";
 import { createRunWorktree, hasUncommittedChanges } from "./run-worktree.ts";
@@ -126,7 +126,7 @@ export class StartDialog {
 			this.refuseStart(awaiting.startedFromChat, `Failed to start the build: the plan ${planPath} cannot be read`);
 			return;
 		}
-		const worktree = issue?.worktree ?? (await this.createBuildWorktree(plan));
+		const worktree = issue?.worktree ?? (await this.createBuildWorktree(plan, planIssue));
 		const workDir = worktree?.path ?? this.session.context.cwd;
 		const ruleFiles = await findRuleFiles(this.session.run, workDir);
 		const baseCommit = await findDiffBase(this.session.run);
@@ -184,11 +184,12 @@ export class StartDialog {
 	}
 
 	/** Inside herdr a /build works in a worktree of HEAD; undefined (working in place) outside herdr or when git refuses. */
-	private async createBuildWorktree(plan: string): Promise<RunWorktree | undefined> {
+	private async createBuildWorktree(plan: string, planIssue?: TrackedIssue): Promise<RunWorktree | undefined> {
 		const herdr = this.session.herdr;
 		if (!herdr) return undefined;
 		const run = this.session.runInSessionDir;
-		const name = `build-${shortBranchSlug(planTitle(plan)) || "run"}`;
+		// The plan's issue names the work, so the worktree carries the name the shipped branch will have.
+		const name = planIssue ? issueBranchName(planIssue.number) : `build-${shortBranchSlug(planTitle(plan)) || "run"}`;
 		const created = await createRunWorktree(run, herdr, { name, startPoint: "HEAD" });
 		if (!created.ok) {
 			this.session.notify(`${created.error}. The run works in your checkout instead.`, "warning");
