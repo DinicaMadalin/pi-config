@@ -1,7 +1,8 @@
 /**
  * prompt-rewriter: before a typed message goes to the model, Jev judges whether it needs a rewrite; if so a cheap
  * model rewrites it into a clear, structured prompt with the same meaning (asking you up to three questions when Jev
- * finds it ambiguous), Jev checks the rewrite kept the meaning, and you send, edit, or skip it. /build tasks get the
+ * finds it ambiguous), Jev checks the rewrite kept the meaning, and the rewrite is sent on its own. A rewrite the
+ * check still doubts is replaced by your own text, with a notice. /build tasks get the
  * same treatment (see rewrite-request.ts). The steps are in prompt-improver.ts.
  *
  * - /rewrite on|off turns it on or off (saved in ~/.pi/agent/prompt-rewriter.json); /rewrite shows the state.

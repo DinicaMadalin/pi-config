@@ -1,6 +1,7 @@
 /**
  * The steps from a typed message to the text that is sent: Jev judges whether it needs a rewrite, the cheap model
- * rewrites it (asking you first when Jev finds it ambiguous), Jev checks the rewrite kept the meaning, and you approve.
+ * rewrites it (asking you first when Jev finds it ambiguous), Jev checks the rewrite kept the meaning, and a rewrite
+ * that passed the check is sent on its own. When the check still finds a problem, your original text is sent instead.
  */
 import { basename } from "node:path";
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
@@ -27,12 +28,6 @@ function withoutJev(ctx: ExtensionContext, step: string): (error: unknown) => un
 	};
 }
 
-const PREVIEW_CHOICES = {
-	sendRewrite: "Send the rewrite",
-	edit: "Edit the rewrite",
-	sendOriginal: "Send my original",
-} as const;
-
 interface CheckedRewrite {
 	prompt: string;
 	modelName: string;
@@ -40,7 +35,7 @@ interface CheckedRewrite {
 	problems: readonly string[];
 }
 
-/** The text to send as you approved it, or cancelled; the original when it needs no rewrite or the rewrite fails. */
+/** The text to send: the rewrite when it kept your meaning, your text otherwise; cancelled only when you press Esc on a question. */
 export async function improvePrompt(ctx: ExtensionContext, original: string): Promise<RewriteOutcome> {
 	const conversation = conversationOf(ctx.sessionManager.getBranch());
 	let rewrite: CheckedRewrite | undefined;
@@ -58,7 +53,7 @@ export async function improvePrompt(ctx: ExtensionContext, original: string): Pr
 	} finally {
 		ctx.ui.setStatus(STATUS_KEY, undefined);
 	}
-	return previewRewrite(ctx, original, rewrite);
+	return sendRewriteOrOriginal(ctx, original, rewrite);
 }
 
 /** Undefined when you pressed Esc on a question. */
@@ -122,20 +117,12 @@ async function askClarifyingQuestions(ctx: ExtensionContext, questions: readonly
 	return answers;
 }
 
-async function previewRewrite(ctx: ExtensionContext, original: string, rewrite: CheckedRewrite): Promise<RewriteOutcome> {
-	const warning = rewrite.problems.length > 0 ? `\n⚠ Check: the rewrite ${rewrite.problems.join("; ")}. Compare it with your original.\n` : "";
-	const title = `Rewritten prompt (${rewrite.modelName})${warning}\n\n${rewrite.prompt}\n`;
-	const choice = await ctx.ui.select(title, Object.values(PREVIEW_CHOICES));
-	switch (choice) {
-		case PREVIEW_CHOICES.sendRewrite:
-			return { kind: "send", text: rewrite.prompt };
-		case PREVIEW_CHOICES.sendOriginal:
-			return { kind: "send", text: original };
-		case PREVIEW_CHOICES.edit: {
-			const edited = await ctx.ui.editor("Edit the rewritten prompt, then save to send it", rewrite.prompt);
-			return edited?.trim() ? { kind: "send", text: edited } : { kind: "cancelled" };
-		}
-		default:
-			return { kind: "cancelled" };
-	}
+/**
+ * Sent without asking: the rewriter has been checked, so the rewrite goes out and the original stays in the session.
+ * A rewrite the check still doubts could change what you asked, so your own text goes instead.
+ */
+function sendRewriteOrOriginal(ctx: ExtensionContext, original: string, rewrite: CheckedRewrite): RewriteOutcome {
+	if (rewrite.problems.length === 0) return { kind: "send", text: rewrite.prompt };
+	ctx.ui.notify(`Sent your prompt as typed: the rewrite ${rewrite.problems.join("; ")}`, "warning");
+	return { kind: "send", text: original };
 }
