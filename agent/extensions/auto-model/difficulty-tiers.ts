@@ -30,6 +30,7 @@ export const DEFAULT_TIER_POLICIES: TierPolicies = {
 	},
 	standard: {
 		models: [
+			"gemini-app/gemini-neon",
 			"opencode-go/gpt-6-luna",
 			"openai/gpt-6-luna",
 			"anthropic/claude-sonnet-5-5",

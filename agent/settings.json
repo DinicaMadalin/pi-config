@@ -11,7 +11,8 @@
   "packages": [
     "npm:billion-context",
     "npm:pi-jev",
-    "npm:@aliou/pi-guardrails"
+    "npm:@aliou/pi-guardrails",
+    "npm:pi-gemini-app"
   ],
   "fullscreenScrollbar": "hidden",
   "fullscreenWheelScrollLines": "auto",

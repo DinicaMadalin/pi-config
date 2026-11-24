@@ -41,7 +41,7 @@ async function bundledExtension(): Promise<(pi: FakePi) => void> {
 	await writeFile(join(tempDirectory, ".pi", "agent", "auto-model.json"), JSON.stringify({
 		tiers: {
 			trivial: { models: ["opencode-go/deepseek-v4.1-flash"], thinkingLevel: "medium" },
-			standard: { models: ["opencode-go/gpt-6-luna"], thinkingLevel: "medium" },
+			standard: { models: ["gemini-app/gemini-neon", "opencode-go/gpt-6-luna"], thinkingLevel: "medium" },
 			complex: { models: ["anthropic/claude-opus-5-5"], thinkingLevel: "high" },
 			expert: { models: ["openai/gpt-6-astra"], thinkingLevel: "high" },
 		},
@@ -87,6 +87,7 @@ function fakeModel(provider: string, id: string, input: string[] = ["text", "ima
 
 const expertModel = fakeModel("openai", "gpt-6-astra");
 const complexModel = fakeModel("anthropic", "claude-opus-5-5");
+const preferredStandardModel = fakeModel("gemini-app", "gemini-neon");
 const standardModel = fakeModel("opencode-go", "gpt-6-luna");
 const normalModels = [expertModel, complexModel, standardModel];
 
@@ -398,4 +399,36 @@ test("when the designer's model is gone, failover picks a designer fallback, nev
 	assert.equal(continued.state.tier, "complex");
 	assert.equal(continued.state.designTask.id, "design-1");
 	assert.equal(continued.state.handoff.phase, "taking-over");
+});
+
+test("a new task on the same tier switches back to the tier's first available model instead of staying on a fallback", async () => {
+	const harness = setup({ taskKind: "other", tier: "standard" }, [expertModel, complexModel, preferredStandardModel, standardModel]);
+	await harness.initialize();
+	const fallbackState: AutoRouteState = { tier: "standard", modelKey: "opencode-go/gpt-6-luna", thinkingLevel: "medium" };
+	const continued = await harness.route({
+		reason: "continuation",
+		state: fallbackState,
+		thinkingLevel: "medium",
+		previous: { model: standardModel, thinkingLevel: "medium" },
+		messages: [{ role: "user", content: "implement the brief" }, { role: "assistant", content: [{ type: "text", text: "Working." }] }],
+	}, harness.context);
+	assert.equal(continued.model, standardModel, "mid-task continuations stay on the fallback to keep the prompt cache");
+
+	await beginNewInput(harness);
+	const nextTask = await harness.route({
+		...request("implement the next plan"),
+		state: fallbackState,
+		previous: { model: standardModel, thinkingLevel: "medium" },
+	}, harness.context);
+	assert.equal(nextTask.model, preferredStandardModel);
+	assert.equal(nextTask.state.modelKey, "gemini-app/gemini-neon");
+
+	await beginNewInput(harness);
+	const samePreferred = await harness.route({
+		...request("another ordinary edit"),
+		state: nextTask.state,
+		previous: { model: preferredStandardModel, thinkingLevel: "medium" },
+	}, harness.context);
+	assert.equal(samePreferred.model, preferredStandardModel);
+	assert.equal(samePreferred.state, nextTask.state, "keeps the same state reference when tier, model and thinking did not change");
 });

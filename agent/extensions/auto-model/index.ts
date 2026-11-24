@@ -388,21 +388,16 @@ async function routeNewTask(
 	const reason = describeTierBasis(chosen.basis, chosen.tier);
 	memory.recordRouteDecision({ tier, thinkingLevel, reason: isCapped ? `${reason}, capped at ${tier}` : reason });
 
-	// Same tier as the running model: keep it instead of paying a cache miss for an equal model.
-	const previous = request.previous?.model;
-	const canKeepPrevious =
-		previous !== undefined &&
-		request.state?.tier === tier &&
-		request.state.modelKey === modelKey(previous) &&
-		!memory.benchedModels.isBenched(modelKey(previous), Date.now());
-	if (previous && canKeepPrevious && request.state) {
-		// A new task starts without the previous task's hand-off.
-		const isUnchanged =
-			request.state.thinkingLevel === thinkingLevel && request.state.handoff === undefined && request.state.designTask === undefined;
-		const state = isUnchanged ? request.state : { tier, modelKey: modelKey(previous), thinkingLevel };
-		return { model: previous, thinkingLevel, state };
-	}
-	return routeToTier(tier, thinkingLevel, policies, request, memory, ctx);
+	const route = routeToTier(tier, thinkingLevel, policies, request, memory, ctx);
+	// Reuse the previous state reference when nothing changed, so Pi does not persist a duplicate state entry.
+	const isUnchanged =
+		request.state !== undefined &&
+		request.state.tier === tier &&
+		request.state.modelKey === route.state?.modelKey &&
+		request.state.thinkingLevel === thinkingLevel &&
+		request.state.handoff === undefined &&
+		request.state.designTask === undefined;
+	return isUnchanged ? { ...route, state: request.state } : route;
 }
 
 async function routeRequest(
