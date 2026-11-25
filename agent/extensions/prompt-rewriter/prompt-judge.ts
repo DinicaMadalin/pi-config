@@ -1,14 +1,12 @@
 /**
- * Jev's two judgments around a rewrite: whether a message needs one at all (and may need questions), and whether a
- * rewrite kept the meaning. Undefined from either means Jev was unavailable; the rewriter then decides alone.
+ * Jev's two judgments around a rewrite: whether the rewriter may ask questions, and whether a rewrite kept the
+ * meaning. Undefined from either means Jev was unavailable; the rewriter then decides alone.
  */
 import type { ClassifierAnswer, ClassifierQuestion } from "@earendil-works/pi-ai";
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { resolveTypesafeApiKey } from "../auto-model/classify-difficulty.ts";
 import type { ConversationMessage } from "./rewriter-prompt.ts";
 
-/** Below this, "clear" is not trusted and the message is still rewritten. */
-export const MIN_CLEAR_CONFIDENCE = 0.6;
 /** From this probability of "ambiguous", the rewriter may ask questions. */
 export const MIN_AMBIGUOUS_PROBABILITY = 0.35;
 /** A fidelity check below this probability counts as failed. */
@@ -32,7 +30,7 @@ const CLARITY_CRITERIA: Record<PromptClarity, string> = {
 		"which feature, which of two options), so a wrong guess would make the agent do the wrong work.",
 };
 
-export type RewritePlan = { kind: "send-as-typed" } | { kind: "rewrite"; mayAskQuestions: boolean };
+export type RewritePlan = { kind: "rewrite"; mayAskQuestions: boolean };
 
 export interface ClarityJudgment {
 	clarity: PromptClarity;
@@ -43,7 +41,6 @@ export interface ClarityJudgment {
 /** What to do with a message given Jev's judgment; without one, the rewriter decides whether to ask. */
 export function planRewrite(judgment: ClarityJudgment | undefined): RewritePlan {
 	if (!judgment) return { kind: "rewrite", mayAskQuestions: true };
-	if (judgment.clarity === "clear" && judgment.confidence >= MIN_CLEAR_CONFIDENCE) return { kind: "send-as-typed" };
 	return { kind: "rewrite", mayAskQuestions: judgment.ambiguousProbability >= MIN_AMBIGUOUS_PROBABILITY };
 }
 

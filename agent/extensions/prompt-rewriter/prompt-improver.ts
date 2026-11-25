@@ -1,7 +1,7 @@
 /**
- * The steps from a typed message to the text that is sent: Jev judges whether it needs a rewrite, the cheap model
- * rewrites it (asking you first when Jev finds it ambiguous), Jev checks the rewrite kept the meaning, and a rewrite
- * that passed the check is sent on its own. When the check still finds a problem, your original text is sent instead.
+ * The steps from a typed message to the text that is sent: every eligible message is rewritten by the cheap model, Jev
+ * decides whether it may ask questions, and checks that the rewrite kept the meaning. A rewrite that passes is sent on
+ * its own; when the check still finds a problem, your original text is sent instead.
  */
 import { basename } from "node:path";
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
@@ -43,7 +43,6 @@ export async function improvePrompt(ctx: ExtensionContext, original: string): Pr
 		ctx.ui.setStatus(STATUS_KEY, "✎ reading your prompt…");
 		const judgment = await judgeClarity(ctx, original, conversation, AbortSignal.timeout(JUDGE_TIMEOUT_MS)).catch(withoutJev(ctx, "judge your prompt"));
 		const plan = planRewrite(judgment);
-		if (plan.kind === "send-as-typed") return { kind: "send", text: original };
 		const input: RewriteInput = { prompt: original, recentConversation: conversation, workspaceName: basename(ctx.cwd), mayAskQuestions: plan.mayAskQuestions };
 		rewrite = await rewriteWithAnswers(ctx, input);
 		if (!rewrite) return { kind: "cancelled" };
