@@ -1,12 +1,12 @@
 /**
- * prompt-rewriter: before a typed message goes to the model, Jev judges whether it needs a rewrite; if so a cheap
- * model rewrites it into a clear, structured prompt with the same meaning (asking you up to three questions when Jev
- * finds it ambiguous), Jev checks the rewrite kept the meaning, and the rewrite is sent on its own. A rewrite the
- * check still doubts is replaced by your own text, with a notice. /build tasks get the
- * same treatment (see rewrite-request.ts). The steps are in prompt-improver.ts.
+ * prompt-rewriter: before a typed message goes to the model, a cheap model rewrites every eligible message into a
+ * clear, structured prompt with the same meaning (asking you up to three questions when Jev finds it ambiguous). Jev
+ * checks the rewrite kept the meaning, and the rewrite is sent on its own. A rewrite the check still doubts is replaced
+ * by your own text, with a notice. /build tasks get the same treatment (see rewrite-request.ts). The steps are in
+ * prompt-improver.ts.
  *
  * - /rewrite on|off turns it on or off (saved in ~/.pi/agent/prompt-rewriter.json); /rewrite shows the state.
- * - Clear messages, short replies, commands and structured prompts go as typed; so does anything when the rewrite fails.
+ * - Short replies, commands and structured prompts go as typed; so does anything when the rewrite fails.
  */
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
