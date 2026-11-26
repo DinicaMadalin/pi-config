@@ -4,6 +4,8 @@
 !.gitignore
 !README.md
 !install.sh
+!package.json
+!package-lock.json
 !agent
 agent/*
 !agent/AGENTS.md

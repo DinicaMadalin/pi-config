@@ -7,7 +7,8 @@ import { test, type TestContext } from "node:test";
 import { setTimeout as delay } from "node:timers/promises";
 import { HerdrClient } from "../herdr-tools/herdr-cli.ts";
 import { ROUTE_DECISION_ENTRY_TYPE } from "../auto-model/route-decision.ts";
-import { AppendedLines, herdrSubagentLauncher, readSessionStep, subagentCommandLine } from "./herdr-subagent.ts";
+import { COMPACTION_RECOVERY_ENTRY_TYPE } from "../auto-model/compaction-recovery.ts";
+import { advanceHelperTurn, AppendedLines, herdrSubagentLauncher, readSessionStep, subagentCommandLine } from "./herdr-subagent.ts";
 import { createSubagentSessionFile, moveSessionToCwd } from "./subagent-process.ts";
 
 test("the pane's command line starts Pi on the session with the subagent marker and the tier ceiling", () => {
@@ -55,6 +56,37 @@ test("tool results, route decisions and anything else in the session file", () =
 	assert.deepEqual(readSessionStep(route), { kind: "route-reason", reason: "complex refactor" });
 	assert.deepEqual(readSessionStep(JSON.stringify({ type: "message", message: { role: "user", content: "hi" } })), { kind: "other" });
 	assert.deepEqual(readSessionStep('{"type":"mess'), { kind: "other" });
+});
+
+test("compaction recovery entries of the session file are steps with their status", () => {
+	const recovery = (data: unknown) => JSON.stringify({ type: "custom", customType: COMPACTION_RECOVERY_ENTRY_TYPE, data });
+	assert.deepEqual(readSessionStep(recovery({ status: "compacting" })), { kind: "compaction-recovery", status: "compacting" });
+	assert.deepEqual(readSessionStep(recovery({ status: "failed", reason: "boom" })), { kind: "compaction-recovery", status: "failed" });
+	assert.deepEqual(readSessionStep(recovery({ status: "unknown" })), { kind: "other" });
+});
+
+test("compaction recovery: a failed answer followed by compacting is not final, so herdr's idle in between does not settle", () => {
+	const failedAnswer = readSessionStep(JSON.stringify({ type: "message", message: { role: "assistant", stopReason: "error", content: [] } }));
+	const afterAnswer = advanceHelperTurn({ hasAnswer: false }, failedAnswer);
+	assert.deepEqual(afterAnswer, { hasAnswer: true, stopReason: "error" });
+	assert.deepEqual(advanceHelperTurn(afterAnswer, { kind: "compaction-recovery", status: "compacting" }), { hasAnswer: false });
+});
+
+test("compaction recovery: a failed recovery makes the turn final; continued waits for the next answer", () => {
+	const waiting = { hasAnswer: false };
+	assert.deepEqual(advanceHelperTurn(waiting, { kind: "compaction-recovery", status: "failed" }), { hasAnswer: true, stopReason: "error" });
+	assert.equal(advanceHelperTurn(waiting, { kind: "compaction-recovery", status: "continued" }), waiting);
+	const answer = readSessionStep(JSON.stringify({ type: "message", message: { role: "assistant", stopReason: "stop", content: [] } }));
+	assert.deepEqual(advanceHelperTurn(waiting, answer), { hasAnswer: true, stopReason: "stop" });
+});
+
+test("compaction recovery: without a turn in progress every step leaves it absent, and other steps keep the turn", () => {
+	assert.equal(advanceHelperTurn(undefined, { kind: "compaction-recovery", status: "compacting" }), undefined);
+	assert.equal(advanceHelperTurn(undefined, { kind: "compaction-recovery", status: "failed" }), undefined);
+	const turn = { hasAnswer: true, stopReason: "toolUse" };
+	assert.equal(advanceHelperTurn(turn, { kind: "tool-result", isError: false }), turn);
+	assert.equal(advanceHelperTurn(turn, { kind: "route-reason", reason: "x" }), turn);
+	assert.equal(advanceHelperTurn(turn, { kind: "other" }), turn);
 });
 
 test("appended lines come whole: a line Pi is still writing waits for the next read", (t) => {

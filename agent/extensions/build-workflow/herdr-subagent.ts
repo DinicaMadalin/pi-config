@@ -4,13 +4,23 @@
  * integration) tells when a turn settled; the model, cost, tools and last answer come from the session file,
  * which Pi appends to as it works. Dialogs show in the pane itself, and herdr reports them as "blocked".
  */
-import { closeSync, openSync, readSync, statSync } from "node:fs";
+import { closeSync, openSync, readSync } from "node:fs";
 import { HerdrCommandError, type HerdrAgentStatus, type HerdrClient, shellQuote } from "../herdr-tools/herdr-cli.ts";
 import { helperGroupOf, HelperPaneGroups, type ReportLayoutError } from "./helper-pane-groups.ts";
 import { ROUTE_DECISION_ENTRY_TYPE } from "../auto-model/route-decision.ts";
+import { type CompactionRecoveryStatus, readCompactionRecoveryEntry } from "../auto-model/compaction-recovery.ts";
 import { MAX_TIER_ENV_VAR, type DifficultyTier } from "../auto-model/difficulty-tiers.ts";
 import { AgentTracker, type AssistantMessageLike } from "./agent-activity.ts";
-import { type LaunchSubagent, moveSessionToCwd, piCommand, readRouteReason, type Subagent, type SubagentOptions, type SubagentPane } from "./subagent-process.ts";
+import {
+	type LaunchSubagent,
+	moveSessionToCwd,
+	piCommand,
+	readRouteReason,
+	sessionFileSize,
+	type Subagent,
+	type SubagentOptions,
+	type SubagentPane,
+} from "./subagent-process.ts";
 import { PROJECT_TRUST_ENV_VAR, SUBAGENT_ENV_VAR } from "./workflow-state.ts";
 
 const POLL_INTERVAL_MS = 1000;
@@ -45,20 +55,25 @@ export type SessionStep =
 	| { kind: "answer"; message: AssistantMessageLike; stopReason: string | undefined; toolCalls: { name: string; args: unknown }[] }
 	| { kind: "tool-result"; isError: boolean }
 	| { kind: "route-reason"; reason: string }
+	| { kind: "compaction-recovery"; status: CompactionRecoveryStatus }
 	| { kind: "other" };
 
 export function readSessionStep(line: string): SessionStep {
-	let entry: { type?: string; customType?: string; data?: { reason?: unknown }; message?: Record<string, unknown> };
+	let entry: unknown;
 	try {
 		entry = JSON.parse(line);
 	} catch {
 		// A line Pi is still writing: the next read gets it whole.
 		return { kind: "other" };
 	}
-	if (entry.type === "custom" && entry.customType === ROUTE_DECISION_ENTRY_TYPE && typeof entry.data?.reason === "string") {
-		return { kind: "route-reason", reason: entry.data.reason };
+	if (typeof entry !== "object" || entry === null || Array.isArray(entry)) return { kind: "other" };
+	const sessionEntry = entry as { type?: unknown; customType?: unknown; data?: { reason?: unknown }; message?: Record<string, unknown> };
+	if (sessionEntry.type === "custom" && sessionEntry.customType === ROUTE_DECISION_ENTRY_TYPE && typeof sessionEntry.data?.reason === "string") {
+		return { kind: "route-reason", reason: sessionEntry.data.reason };
 	}
-	const message = entry.type === "message" ? entry.message : undefined;
+	const recovery = readCompactionRecoveryEntry(sessionEntry);
+	if (recovery) return { kind: "compaction-recovery", status: recovery.status };
+	const message = sessionEntry.type === "message" ? sessionEntry.message : undefined;
 	if (message?.role === "toolResult") return { kind: "tool-result", isError: message.isError === true };
 	if (message?.role !== "assistant") return { kind: "other" };
 	const content = Array.isArray(message.content) ? (message.content as { type?: string; name?: unknown; arguments?: unknown }[]) : [];
@@ -75,16 +90,20 @@ const NEWLINE_BYTE = 0x0a;
  */
 export class AppendedLines {
 	private offset = 0;
+	private readonly path: string;
 
-	constructor(private readonly path: string) {}
+	// A plain field, not a parameter property: Node's type stripping (node --test) rejects parameter properties.
+	constructor(path: string) {
+		this.path = path;
+	}
 
 	/** Starts after what the file holds now: earlier turns of a resumed session are not news. */
 	skipExisting(): void {
-		this.offset = fileSize(this.path);
+		this.offset = sessionFileSize(this.path);
 	}
 
 	read(): string[] {
-		const size = fileSize(this.path);
+		const size = sessionFileSize(this.path);
 		if (size <= this.offset) return [];
 		const bytes = new Uint8Array(size - this.offset);
 		const descriptor = openSync(this.path, "r");
@@ -101,16 +120,21 @@ export class AppendedLines {
 	}
 }
 
-function fileSize(path: string): number {
-	try {
-		return statSync(path).size;
-	} catch {
-		// Pi has not written the file yet.
-		return 0;
-	}
+type Lifecycle = "starting" | "ready" | "ended";
+
+/** The turn in progress: whether it has an answer that could be final, and that answer's stop reason. */
+export interface HelperTurn {
+	hasAnswer: boolean;
+	stopReason?: string;
 }
 
-type Lifecycle = "starting" | "ready" | "ended";
+export function advanceHelperTurn(turn: HelperTurn | undefined, step: SessionStep): HelperTurn | undefined {
+	if (!turn) return undefined;
+	if (step.kind === "answer") return { hasAnswer: true, stopReason: step.stopReason };
+	if (step.kind === "compaction-recovery" && step.status === "compacting") return { hasAnswer: false };
+	if (step.kind === "compaction-recovery" && step.status === "failed") return { hasAnswer: true, stopReason: "error" };
+	return turn;
+}
 
 export class HerdrSubagent implements Subagent {
 	readonly name: string;
@@ -129,7 +153,7 @@ export class HerdrSubagent implements Subagent {
 	private paneId: string | undefined;
 	private herdrStatus: HerdrAgentStatus = "unknown";
 	/** The turn in progress: started by a prompt, or seen working (you typed in the pane). */
-	private turn: { hasAnswer: boolean; stopReason?: string } | undefined;
+	private turn: HelperTurn | undefined;
 	private lastAnswer = "";
 	private queuedPrompts: string[] = [];
 	private sending: Promise<void> = Promise.resolve();
@@ -314,11 +338,11 @@ export class HerdrSubagent implements Subagent {
 		const nowMs = Date.now();
 		for (const line of this.sessionLines.read()) {
 			const step = readSessionStep(line);
+			this.turn = advanceHelperTurn(this.turn, step);
 			switch (step.kind) {
 				case "answer":
 					this.lastAnswer = this.tracker.recordAnswer(step.message, nowMs);
 					for (const call of step.toolCalls) this.tracker.startTool(call.name, call.args, nowMs);
-					if (this.turn) this.turn = { hasAnswer: true, stopReason: step.stopReason };
 					break;
 				case "tool-result":
 					this.tracker.endTool(step.isError, nowMs);

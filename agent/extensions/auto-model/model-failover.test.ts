@@ -24,6 +24,15 @@ test("never fails over a context overflow, compaction owns that", () => {
 	assert.equal(decideFailover(failedResponse("prompt is too long"), 0, true).kind, "give-up");
 });
 
+test("never fails over a context compression failure, compaction recovery owns that", () => {
+	const compressionFailure = failedResponse(
+		'503 {"error":{"type":"server_error","code":"preflight_compress_failed","message":"context ~201038 tokens exceeds the model window 200000"}}',
+	);
+	const decision = decideFailover(compressionFailure, 0, false);
+	assert.equal(decision.kind, "give-up");
+	assert.equal(decision.kind === "give-up" && decision.reason, "compression failure is handled by compaction");
+});
+
 test("stops after the per-prompt failover limit so a broken tier cannot loop", () => {
 	assert.equal(decideFailover(failedResponse("boom"), MAX_FAILOVERS_PER_PROMPT, false).kind, "give-up");
 });

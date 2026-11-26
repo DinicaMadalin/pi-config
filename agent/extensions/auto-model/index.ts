@@ -15,6 +15,9 @@
  * - Selected thinking level is a quality bias: low = one tier cheaper, high = one tier stronger.
  * - Failover: a failed response Pi will not retry benches that model for 5 minutes and resends
  *   the request, so the router picks the next model of the tier (at most twice per prompt).
+ * - Compaction recovery (compaction-recovery.ts): a response the context-compression proxy failed with
+ *   `preflight_compress_failed` is not failed over; it is hidden, the session is compacted once the run settles, and the
+ *   turn continues (once per prompt; a failed compaction or a second such failure stops with an error).
  * - Learning: on each new prompt Jev also judges in hindsight whether the previous task got the
  *   right tier (the user complained, or it was far easier than its tier). Confident verdicts are
  *   stored as corrections that calibrate later ratings; a complaint also lifts the follow-up.
@@ -66,6 +69,14 @@ import {
 	type TierPolicies,
 } from "./difficulty-tiers.ts";
 import { BenchedModels, decideFailover } from "./model-failover.ts";
+import {
+	COMPACTION_CONTINUE_MESSAGE_TYPE,
+	COMPACTION_RECOVERY_ENTRY_TYPE,
+	type CompactionRecoveryEntryData,
+	compactionFailedError,
+	CONTINUE_AFTER_COMPACTION_PROMPT,
+	decideCompactionRecovery,
+} from "./compaction-recovery.ts";
 import {
 	correctedTierFromFit,
 	loadRoutingCorrections,
@@ -133,6 +144,10 @@ interface RouterMemory {
 	isNewTaskPending: boolean;
 	/** The designer note goes out once per task. */
 	hasSentDesignerNote: boolean;
+	/** Compactions started this prompt after a context-compression failure; bounded by MAX_COMPACTION_RECOVERIES_PER_PROMPT. */
+	compactionRecoveriesThisPrompt: number;
+	/** Set at the settle boundary of a compression failure; the compaction runs once the run has settled. */
+	isCompactionRecoveryPending: boolean;
 }
 
 function usableModels(memory: RouterMemory, ctx: ExtensionContext): Model<Api>[] {
@@ -547,6 +562,74 @@ function failOverToNextModel(
 	return { entries: [{ type: "context_edit", targetId: failed.entryId, replacement: null }], continue: true };
 }
 
+function recoverFromCompressionFailure(
+	event: AgentBeforeSettleEvent,
+	memory: RouterMemory,
+	ctx: ExtensionContext,
+): BoundaryResult | undefined {
+	if (event.outcome !== "error" || !isAutoModelSelected(ctx)) return undefined;
+	const failed = findFailedResponseEntry(event.context.contextEntries);
+	if (!failed) return undefined;
+
+	const decision = decideCompactionRecovery(failed.response, memory.compactionRecoveriesThisPrompt);
+	if (decision.kind === "not-compression-failure") return undefined;
+	if (decision.kind === "give-up") {
+		if (ctx.hasUI) ctx.ui.notify(decision.error, "error");
+		return {
+			entries: [
+				...event.entries,
+				{ type: "custom", customType: COMPACTION_RECOVERY_ENTRY_TYPE, data: { status: "failed", reason: decision.error } },
+			],
+			continue: false,
+		};
+	}
+
+	memory.compactionRecoveriesThisPrompt++;
+	memory.isCompactionRecoveryPending = true;
+	if (ctx.hasUI) ctx.ui.notify(decision.notice, "warning");
+	return {
+		entries: [
+			...event.entries,
+			{ type: "context_edit", targetId: failed.entryId, replacement: null },
+			{ type: "custom", customType: COMPACTION_RECOVERY_ENTRY_TYPE, data: { status: "compacting" } },
+		],
+		continue: false,
+	};
+}
+
+function runPendingCompactionRecovery(pi: ExtensionAPI, wasAborted: boolean, memory: RouterMemory, ctx: ExtensionContext): void {
+	if (!memory.isCompactionRecoveryPending) return;
+	memory.isCompactionRecoveryPending = false;
+	if (wasAborted) {
+		const reason = "Auto model: compaction recovery skipped because the run was aborted; run /compact, then continue";
+		pi.appendEntry<CompactionRecoveryEntryData>(COMPACTION_RECOVERY_ENTRY_TYPE, { status: "failed", reason });
+		if (ctx.hasUI) ctx.ui.notify(reason, "warning");
+		return;
+	}
+
+	let callbackStarted = false;
+	const onComplete = () => {
+		callbackStarted = true;
+		pi.appendEntry<CompactionRecoveryEntryData>(COMPACTION_RECOVERY_ENTRY_TYPE, { status: "continued" });
+		pi.sendMessage(
+			{ customType: COMPACTION_CONTINUE_MESSAGE_TYPE, content: CONTINUE_AFTER_COMPACTION_PROMPT, display: true },
+			{ triggerTurn: true },
+		);
+	};
+	const onError = (error: Error) => {
+		callbackStarted = true;
+		const reason = compactionFailedError(error);
+		pi.appendEntry<CompactionRecoveryEntryData>(COMPACTION_RECOVERY_ENTRY_TYPE, { status: "failed", reason });
+		if (ctx.hasUI) ctx.ui.notify(reason, "error");
+	};
+	try {
+		ctx.compact({ onComplete, onError });
+	} catch (error) {
+		if (callbackStarted) throw error;
+		onError(error instanceof Error ? error : new Error(String(error)));
+	}
+}
+
 function runCommandWith(pi: ExtensionAPI): RunCommand {
 	return (command, args, options) => pi.exec(command, args, options);
 }
@@ -696,6 +779,8 @@ export default function (pi: ExtensionAPI) {
 		recordRouteDecision: (decision) => pi.appendEntry<RouteDecision>(ROUTE_DECISION_ENTRY_TYPE, decision),
 		isNewTaskPending: false,
 		hasSentDesignerNote: false,
+		compactionRecoveriesThisPrompt: 0,
+		isCompactionRecoveryPending: false,
 	};
 
 	pi.registerVirtualModel<AutoRouteState>({
@@ -711,6 +796,7 @@ export default function (pi: ExtensionAPI) {
 
 	pi.on("input", (_event, ctx) => {
 		memory.failoversThisPrompt = 0;
+		memory.compactionRecoveriesThisPrompt = 0;
 		if (!ctx.isIdle()) return; // steering joins the running task
 		const branch = ctx.sessionManager.getBranch();
 		const isAnsweringDesignBlocker =
@@ -730,11 +816,14 @@ export default function (pi: ExtensionAPI) {
 		}
 	});
 	pi.on("agent_before_settle", async (event, ctx) => {
+		const recovery = recoverFromCompressionFailure(event, memory, ctx);
+		if (recovery) return recovery;
 		const failover = failOverToNextModel(event, memory, ctx);
 		if (failover) return failover;
 		const returned = await returnToDesigner(pi, event, ctx);
 		return returned ?? remindDesigner(event, ctx);
 	});
+	pi.on("agent_settled", (event, ctx) => runPendingCompactionRecovery(pi, event.aborted === true, memory, ctx));
 	pi.on("tool_call", (event, ctx) => (IMPLEMENTER_BLOCKED_TOOLS.has(event.toolName) ? blockImplementerDetours(event.toolName, ctx) : undefined));
 	pi.on("turn_end", (event, ctx) => sendDesignerNote(event, memory, ctx));
 	registerHandoffTools(pi);

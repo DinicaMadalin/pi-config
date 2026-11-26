@@ -103,6 +103,7 @@ export class AgentTracker {
 
 export interface AssistantMessageLike {
 	role: string;
+	stopReason?: string;
 	model?: string;
 	thinkingLevel?: string;
 	usage?: { cost?: { total?: number } };
