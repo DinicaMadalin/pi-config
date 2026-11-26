@@ -5,8 +5,9 @@
  */
 import { type ChildProcess, spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { readFileSync, writeFileSync } from "node:fs";
+import { readFileSync, statSync, writeFileSync } from "node:fs";
 import { ROUTE_DECISION_ENTRY_TYPE } from "../auto-model/route-decision.ts";
+import { COMPACTION_RECOVERY_ENTRY_TYPE, type CompactionRecoveryStatus, readCompactionRecoveryEntry } from "../auto-model/compaction-recovery.ts";
 import { AgentTracker, type AssistantMessageLike } from "./agent-activity.ts";
 import { type DifficultyTier, MAX_TIER_ENV_VAR } from "../auto-model/difficulty-tiers.ts";
 import { PROJECT_TRUST_ENV_VAR, SUBAGENT_ENV_VAR } from "./workflow-state.ts";
@@ -90,6 +91,16 @@ function parseJsonLine(line: string): unknown {
 	}
 }
 
+/** The current size of a session file, or zero before Pi has created it. */
+export function sessionFileSize(path: string): number {
+	try {
+		return statSync(path).size;
+	} catch {
+		// Pi has not written the file yet.
+		return 0;
+	}
+}
+
 /** The auto model's latest route reason in a session file; undefined when it never routed there. */
 export function readRouteReason(sessionPath: string): string | undefined {
 	let content: string;
@@ -105,6 +116,23 @@ export function readRouteReason(sessionPath: string): string | undefined {
 		if (!line.includes(ROUTE_DECISION_ENTRY_TYPE)) continue;
 		const entry = parseJsonLine(line) as { customType?: string; data?: { reason?: unknown } } | undefined;
 		if (entry?.customType === ROUTE_DECISION_ENTRY_TYPE && typeof entry.data?.reason === "string") return entry.data.reason;
+	}
+	return undefined;
+}
+
+export function readCompactionRecoveryStatus(sessionPath: string, runStartByte: number): CompactionRecoveryStatus | undefined {
+	let content: string;
+	try {
+		content = readFileSync(sessionPath).subarray(runStartByte).toString("utf8");
+	} catch {
+		return undefined;
+	}
+	const lines = content.split("\n");
+	for (let index = lines.length - 1; index >= 0; index--) {
+		const line = lines[index];
+		if (!line.includes(COMPACTION_RECOVERY_ENTRY_TYPE)) continue;
+		const recovery = readCompactionRecoveryEntry(parseJsonLine(line));
+		if (recovery) return recovery.status;
 	}
 	return undefined;
 }
@@ -178,7 +206,11 @@ export class SubagentProcess implements Subagent {
 	private stdoutBuffer = "";
 	private stderrTail = "";
 	private lastAnswer = "";
+	private runStartByte = 0;
+	private lastStopReason: string | undefined;
 	private isStopping = false;
+	/** The run settled on a compression failure while auto-model compacts; its settle is held until the recovery ends. */
+	private isAwaitingCompactionRecovery = false;
 
 	constructor(options: SubagentOptions) {
 		this.options = options;
@@ -290,6 +322,9 @@ export class SubagentProcess implements Subagent {
 		const tracker = this.tracker;
 		switch (record.type) {
 			case "agent_start":
+				this.isAwaitingCompactionRecovery = false;
+				this.runStartByte = sessionFileSize(this.sessionPath);
+				this.lastStopReason = undefined;
 				this.lastAnswer = "";
 				tracker.startTurn(nowMs);
 				return;
@@ -302,14 +337,30 @@ export class SubagentProcess implements Subagent {
 			case "message_end": {
 				const message = record.message as AssistantMessageLike | undefined;
 				if (message?.role !== "assistant") return;
+				this.lastStopReason = message.stopReason;
 				this.lastAnswer = tracker.recordAnswer(message, nowMs);
 				tracker.stats.routeReason ??= readRouteReason(this.sessionPath);
 				return;
 			}
 			case "agent_settled":
+				if (
+					record.aborted !== true &&
+					this.lastStopReason === "error" &&
+					readCompactionRecoveryStatus(this.sessionPath, this.runStartByte) === "compacting"
+				) {
+					this.isAwaitingCompactionRecovery = true;
+					return;
+				}
 				tracker.endTurn(nowMs);
 				tracker.stats.routeReason = readRouteReason(this.sessionPath) ?? tracker.stats.routeReason;
 				this.options.onSettled(this.lastAnswer, record.aborted === true);
+				return;
+			case "entry_appended":
+				if (!this.isAwaitingCompactionRecovery || readCompactionRecoveryEntry(record.entry)?.status !== "failed") return;
+				this.isAwaitingCompactionRecovery = false;
+				tracker.endTurn(nowMs);
+				tracker.stats.routeReason = readRouteReason(this.sessionPath) ?? tracker.stats.routeReason;
+				this.options.onSettled(this.lastAnswer, false);
 				return;
 			case "response":
 				if (record.success === false) tracker.activity.add("error", `${String(record.command)}: ${String(record.error)}`, nowMs);

@@ -62,6 +62,8 @@ each custom extension directory wholesale so files deleted upstream disappear to
 | `auto-model`, `quality-gate`, `project-memory`, `build-workflow`, `prompt-rewriter`, `herdr-tools` (yours) | Source copied from `agent/extensions/<name>/` |
 | `billion-context`, `pi-jev`, `@aliou/pi-guardrails` | Declared in `settings.json` `packages`, installed by `pi update --extensions` |
 
+To run the extension tests, run `npm install` once at the repo root; it installs only the test dev dependencies (`esbuild` and `@earendil-works/pi-tui`). Then run `node --test agent/extensions/auto-model/*.test.ts agent/extensions/build-workflow/*.test.ts`.
+
 `settings.json` sets `defaultProvider`/`defaultModel` to `auto`, which the
 auto-model extension provides; it needs the Jev key below to rate tasks.
 

@@ -4,6 +4,7 @@
  * Pure state and decisions; the Pi wiring lives in index.ts.
  */
 import type { AssistantMessage } from "@earendil-works/pi-ai";
+import { isCompressionFailure } from "./compaction-recovery.ts";
 
 /** Rides out a short outage or rate limit without locking a good model out for long. */
 export const BENCH_DURATION_MS = 5 * 60_000;
@@ -42,6 +43,7 @@ export function decideFailover(
 	isContextOverflow: boolean,
 ): FailoverDecision {
 	if (failedResponse.stopReason !== "error") return { kind: "give-up", reason: "response did not fail" };
+	if (isCompressionFailure(failedResponse)) return { kind: "give-up", reason: "compression failure is handled by compaction" };
 	if (isContextOverflow) return { kind: "give-up", reason: "context overflow is handled by compaction" };
 	if (failoversThisPrompt >= MAX_FAILOVERS_PER_PROMPT) {
 		return { kind: "give-up", reason: `already failed over ${failoversThisPrompt} times for this prompt` };

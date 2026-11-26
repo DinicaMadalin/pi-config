@@ -1,0 +1,9 @@
+{
+  "name": "pi-config",
+  "private": true,
+  "description": "Dev-only dependencies for running the extension tests; pi itself loads the extensions without them.",
+  "devDependencies": {
+    "@earendil-works/pi-tui": "1.6.1",
+    "esbuild": "0.28.2"
+  }
+}
